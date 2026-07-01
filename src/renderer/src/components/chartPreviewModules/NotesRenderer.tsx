@@ -145,8 +145,10 @@ export function NotesRenderer({
     }
   }
 
+  const groupZ = currentTick * pixelsPerTick
+
   return (
-    <group position={[offsetX, 0, 0]}>
+    <group position={[offsetX, 0, groupZ]}>
       {visibleNotes.map((note) => {
         const isKick = instrument === 'drums' && String(note.lane) === 'kick'
         const isOpen = (instrument === 'guitar' || instrument === 'bass' || instrument === 'keys') && String(note.lane) === 'open'
@@ -171,12 +173,16 @@ export function NotesRenderer({
         // Skip notes too far ahead
         if (z > STRIKE_LINE_POS + 1 && !isSustainActive) return null
 
+        // Compute local Z position relative to the moving group
+        // If sustain is active, the note head sits at the strike line (world Z = STRIKE_LINE_POS)
+        const localZ = isSustainActive ? STRIKE_LINE_POS - groupZ : STRIKE_LINE_POS - note.tick * pixelsPerTick
+
         if (isKick || isOpen) {
           if (isHeadHit) return null // no sustain, just hide
           return (
             <group key={note.id} onClick={(e) => { e.stopPropagation?.(); onNoteClick(note.id, (e as unknown as { nativeEvent?: MouseEvent }).nativeEvent) }}>
               <KickNoteBar
-                z={z}
+                z={localZ}
                 color={isOpen ? '#CC44FF' : (note.flags?.isDoubleKick ? DOUBLE_KICK_COLOR : DRUM_KICK_COLOR)}
                 assets={assets}
                 isSelected={isSelected}
@@ -196,7 +202,7 @@ export function NotesRenderer({
         const isTalkie = instrument === 'vocals' && !!(note as VocalNote).isPitchless
         if (isTalkie) {
           const barLength = Math.max(note.duration * pixelsPerTick, 0.04)
-          const barStartZ = isSustainActive ? STRIKE_LINE_POS : z
+          const barStartZ = localZ
           const actualLength = isSustainActive ? remainingSustainLength : barLength
           if (isHeadHit && !isSustainActive) return null
           return (
@@ -227,7 +233,7 @@ export function NotesRenderer({
         return (
           <group key={note.id} onClick={(e) => { e.stopPropagation?.(); onNoteClick(note.id, (e as unknown as { nativeEvent?: MouseEvent }).nativeEvent) }}>
             <NoteGem
-              position={isSustainActive ? [x, 0.01, STRIKE_LINE_POS] : [x, 0.01, z]}
+              position={[x, 0.01, localZ]}
               color={color}
               isSelected={isSelected}
               sustainLength={isSustainActive ? remainingSustainLength : totalSustainLength}

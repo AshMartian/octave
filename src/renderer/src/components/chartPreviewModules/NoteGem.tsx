@@ -1,4 +1,5 @@
 // Note Gem, Kick Note Bar, and Hit Flash Effect rendering
+import React from 'react'
 import * as THREE from 'three'
 import { TRACK_WIDTH, STRIKE_LINE_POS } from './constants'
 import type { Note } from '../../types'
@@ -80,7 +81,7 @@ function getDoubleKickBadgeTexture(): THREE.CanvasTexture {
   return doubleKickBadgeTexture
 }
 
-export function NoteGem({
+function NoteGemComponent({
   position,
   color,
   isSelected,
@@ -197,7 +198,27 @@ export function NoteGem({
   )
 }
 
-export function KickNoteBar({
+export const NoteGem = React.memo(NoteGemComponent, (prev, next) => {
+  return (
+    prev.position[0] === next.position[0] &&
+    prev.position[1] === next.position[1] &&
+    prev.position[2] === next.position[2] &&
+    prev.color === next.color &&
+    prev.isSelected === next.isSelected &&
+    prev.sustainLength === next.sustainLength &&
+    prev.sustainOffset === next.sustainOffset &&
+    prev.isHeadVisible === next.isHeadVisible &&
+    prev.assets === next.assets &&
+    prev.isCymbal === next.isCymbal &&
+    prev.fretNumber === next.fretNumber &&
+    prev.noteFlags?.isTap === next.noteFlags?.isTap &&
+    prev.noteFlags?.isHOPO === next.noteFlags?.isHOPO &&
+    prev.noteFlags?.isGhost === next.noteFlags?.isGhost &&
+    prev.noteFlags?.isAccent === next.noteFlags?.isAccent
+  )
+})
+
+function KickNoteBarComponent({
   z,
   color,
   assets,
@@ -256,6 +277,19 @@ export function KickNoteBar({
     </group>
   )
 }
+
+export const KickNoteBar = React.memo(KickNoteBarComponent, (prev, next) => {
+  return (
+    prev.z === next.z &&
+    prev.color === next.color &&
+    prev.assets === next.assets &&
+    prev.isSelected === next.isSelected &&
+    prev.sustainLength === next.sustainLength &&
+    prev.isSustainActive === next.isSustainActive &&
+    prev.showDoubleKickBadge === next.showDoubleKickBadge
+  )
+})
+
 
 export function HitFlashEffect({
   x,
