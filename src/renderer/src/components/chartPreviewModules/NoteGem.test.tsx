@@ -1,6 +1,11 @@
 import { describe, it, expect } from 'vitest'
 import * as THREE from 'three'
-import { sharedGeometries } from './NoteGem'
+import {
+  sharedGeometries,
+  getSharedNoteMaterial,
+  getSharedSustainMaterial,
+  clearMaterialCaches
+} from './NoteGem'
 
 describe('NoteGem Performance Optimization - Shared Geometries', () => {
   it('should instantiate shared geometries exactly once as static exports', () => {
@@ -41,3 +46,49 @@ describe('NoteGem Performance Optimization - Shared Geometries', () => {
     expect(size.z).toBeCloseTo(1.0)
   })
 })
+
+describe('NoteGem Performance Optimization - Shared Materials Caching', () => {
+  const dummyAssets1 = { noteMap: {} as THREE.Texture } as any
+  const dummyAssets2 = { noteMap: {} as THREE.Texture } as any
+
+  it('should cache and reuse standard note materials for identical parameters', () => {
+    clearMaterialCaches()
+    const mat1 = getSharedNoteMaterial('#FF0000', false, false, dummyAssets1)
+    const mat2 = getSharedNoteMaterial('#FF0000', false, false, dummyAssets1)
+    
+    expect(mat1).toBe(mat2) // Reuses cached material
+  })
+
+  it('should create separate standard note materials for different parameters', () => {
+    clearMaterialCaches()
+    const matRed = getSharedNoteMaterial('#FF0000', false, false, dummyAssets1)
+    const matBlue = getSharedNoteMaterial('#0000FF', false, false, dummyAssets1)
+    const matSelected = getSharedNoteMaterial('#FF0000', true, false, dummyAssets1)
+    const matGhost = getSharedNoteMaterial('#FF0000', false, true, dummyAssets1)
+
+    expect(matRed).not.toBe(matBlue)
+    expect(matRed).not.toBe(matSelected)
+    expect(matRed).not.toBe(matGhost)
+  })
+
+  it('should clean up and rebuild material cache when song assets reference changes', () => {
+    clearMaterialCaches()
+    const mat1 = getSharedNoteMaterial('#FF0000', false, false, dummyAssets1)
+    
+    // Simulating loading a different song
+    const mat2 = getSharedNoteMaterial('#FF0000', false, false, dummyAssets2)
+
+    expect(mat1).not.toBe(mat2) // Dispose-recreate occurred
+  })
+
+  it('should cache and reuse sustain materials', () => {
+    clearMaterialCaches()
+    const mat1 = getSharedSustainMaterial('#FF0000', false, dummyAssets1)
+    const mat2 = getSharedSustainMaterial('#FF0000', false, dummyAssets1)
+    const matBurning = getSharedSustainMaterial('#FF0000', true, dummyAssets1)
+
+    expect(mat1).toBe(mat2)
+    expect(mat1).not.toBe(matBurning)
+  })
+})
+

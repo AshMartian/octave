@@ -79,7 +79,143 @@ function getDoubleKickBadgeTexture(): THREE.CanvasTexture {
   ctx.fillText('2x', 64, 33)
   doubleKickBadgeTexture = new THREE.CanvasTexture(canvas)
   return doubleKickBadgeTexture
+}// Shared material caches to prevent GPU memory leaks and WebGL compilation overhead during playback
+let lastAssets: HighwayAssets | null = null
+const sharedMaterials = new Map<string, THREE.MeshStandardMaterial>()
+const sharedSustainMaterials = new Map<string, THREE.MeshStandardMaterial>()
+const sharedBurnMaterials = new Map<string, THREE.MeshBasicMaterial>()
+const sharedKickSustainMaterials = new Map<string, THREE.MeshBasicMaterial>()
+const sharedKickHeadMaterials = new Map<string, THREE.MeshStandardMaterial>()
+
+export function clearMaterialCaches(): void {
+  for (const mat of sharedMaterials.values()) mat.dispose()
+  for (const mat of sharedSustainMaterials.values()) mat.dispose()
+  for (const mat of sharedBurnMaterials.values()) mat.dispose()
+  for (const mat of sharedKickSustainMaterials.values()) mat.dispose()
+  for (const mat of sharedKickHeadMaterials.values()) mat.dispose()
+  sharedMaterials.clear()
+  sharedSustainMaterials.clear()
+  sharedBurnMaterials.clear()
+  sharedKickSustainMaterials.clear()
+  sharedKickHeadMaterials.clear()
+  lastAssets = null
 }
+
+function checkAssetsChange(assets: HighwayAssets | null): void {
+  if (assets !== lastAssets) {
+    clearMaterialCaches()
+    lastAssets = assets
+  }
+}
+
+export function getSharedNoteMaterial(
+  color: string,
+  isSelected: boolean,
+  isGhost: boolean,
+  assets: HighwayAssets | null
+): THREE.MeshStandardMaterial {
+  checkAssetsChange(assets)
+  const key = `${color}-${isSelected}-${isGhost}`
+  let mat = sharedMaterials.get(key)
+  if (!mat) {
+    mat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(color),
+      map: assets?.noteMap ?? null,
+      emissive: new THREE.Color(isSelected ? '#FFFFFF' : color),
+      emissiveMap: isSelected ? null : (assets?.noteEmission ?? null),
+      emissiveIntensity: isSelected ? 3.0 : 1.0,
+      metalness: 0.7,
+      roughness: 0.15,
+      transparent: isGhost,
+      opacity: isGhost ? 0.5 : 1,
+      toneMapped: false
+    })
+    sharedMaterials.set(key, mat)
+  }
+  return mat
+}
+
+export function getSharedSustainMaterial(
+  color: string,
+  isBurning: boolean,
+  assets: HighwayAssets | null
+): THREE.MeshStandardMaterial {
+  checkAssetsChange(assets)
+  const key = `${color}-${isBurning}`
+  let mat = sharedSustainMaterials.get(key)
+  if (!mat) {
+    mat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(color),
+      emissive: new THREE.Color(color),
+      emissiveIntensity: isBurning ? 0.9 : 0.7,
+      transparent: true,
+      opacity: 0.9,
+      toneMapped: false
+    })
+    sharedSustainMaterials.set(key, mat)
+  }
+  return mat
+}
+
+export function getSharedBurnMaterial(
+  color: string,
+  assets: HighwayAssets | null
+): THREE.MeshBasicMaterial {
+  checkAssetsChange(assets)
+  let mat = sharedBurnMaterials.get(color)
+  if (!mat) {
+    mat = new THREE.MeshBasicMaterial({
+      color: new THREE.Color(color),
+      transparent: true,
+      opacity: 0.45,
+      toneMapped: false
+    })
+    sharedBurnMaterials.set(color, mat)
+  }
+  return mat
+}
+
+export function getSharedKickSustainMaterial(
+  color: string,
+  assets: HighwayAssets | null
+): THREE.MeshBasicMaterial {
+  checkAssetsChange(assets)
+  let mat = sharedKickSustainMaterials.get(color)
+  if (!mat) {
+    mat = new THREE.MeshBasicMaterial({
+      color: new THREE.Color(color),
+      transparent: true,
+      opacity: 0.3,
+      toneMapped: false
+    })
+    sharedKickSustainMaterials.set(color, mat)
+  }
+  return mat
+}
+
+export function getSharedKickHeadMaterial(
+  color: string,
+  isSelected: boolean,
+  assets: HighwayAssets | null
+): THREE.MeshStandardMaterial {
+  checkAssetsChange(assets)
+  const key = `${color}-${isSelected}`
+  let mat = sharedKickHeadMaterials.get(key)
+  if (!mat) {
+    mat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(color),
+      map: assets?.kickMap ?? null,
+      emissive: new THREE.Color(isSelected ? '#FFFFFF' : color),
+      emissiveIntensity: isSelected ? 3.0 : 1.2,
+      metalness: 0.5,
+      roughness: 0.3,
+      toneMapped: false
+    })
+    sharedKickHeadMaterials.set(key, mat)
+  }
+  return mat
+}
+
 
 function NoteGemComponent({
   position,
@@ -133,20 +269,7 @@ function NoteGemComponent({
   return (
     <group position={position} scale={[1, noteHeightScale, 1]}>
       {isHeadVisible && (
-        <mesh geometry={geometry}>
-          <meshStandardMaterial
-            color={color}
-            map={assets?.noteMap ?? null}
-            emissive={isSelected ? '#FFFFFF' : color}
-            emissiveMap={isSelected ? null : (assets?.noteEmission ?? null)}
-            emissiveIntensity={isSelected ? 3.0 : 1.0}
-            metalness={0.7}
-            roughness={0.15}
-            transparent={!!isGhost}
-            opacity={isGhost ? 0.5 : 1}
-            toneMapped={false}
-          />
-        </mesh>
+        <mesh geometry={geometry} material={getSharedNoteMaterial(color, isSelected, !!isGhost, assets)} />
       )}
       {/* Selection ring around note head */}
       {isHeadVisible && isSelected && (
@@ -171,28 +294,17 @@ function NoteGemComponent({
           geometry={sharedGeometries.sustainUnit}
           position={[0, 0.03, sustainZ]}
           scale={[1, 1, sustainLength]}
-        >
-          <meshStandardMaterial
-            color={color}
-            emissive={color}
-            emissiveIntensity={isBurning ? 0.9 : 0.7}
-            transparent
-            opacity={0.9}
-            toneMapped={false}
-          />
-        </mesh>
+          material={getSharedSustainMaterial(color, isBurning, assets)}
+        />
       )}
 
       {/* Burn edge glow at the strike-line end of an active sustain */}
       {isBurning && (
-        <mesh geometry={sharedGeometries.burnEdge} position={[0, 0.04, 0]}>
-          <meshBasicMaterial
-            color={color}
-            transparent
-            opacity={0.45}
-            toneMapped={false}
-          />
-        </mesh>
+        <mesh
+          geometry={sharedGeometries.burnEdge}
+          position={[0, 0.04, 0]}
+          material={getSharedBurnMaterial(color, assets)}
+        />
       )}
     </group>
   )
@@ -247,23 +359,18 @@ function KickNoteBarComponent({
       {/* Sustain trail */}
       {hasSustain && (
         <group scale={[sustainScaleX / (TRACK_WIDTH / 3.27), 1, 1]} position={[0, 0, trailZ]}>
-          <mesh geometry={sharedGeometries.kickSustainUnit} scale={[1, 1, sustainLength]}>
-            <meshBasicMaterial color={color} transparent opacity={0.3} toneMapped={false} />
-          </mesh>
+          <mesh
+            geometry={sharedGeometries.kickSustainUnit}
+            scale={[1, 1, sustainLength]}
+            material={getSharedKickSustainMaterial(color, assets)}
+          />
         </group>
       )}
       {/* Bar head */}
-      <mesh geometry={assets?.kickGeo ?? sharedGeometries.kickNoteFallback}>
-        <meshStandardMaterial
-          color={color}
-          map={assets?.kickMap ?? null}
-          emissive={isSelected ? '#FFFFFF' : color}
-          emissiveIntensity={isSelected ? 3.0 : 1.2}
-          metalness={0.5}
-          roughness={0.3}
-          toneMapped={false}
-        />
-      </mesh>
+      <mesh
+        geometry={assets?.kickGeo ?? sharedGeometries.kickNoteFallback}
+        material={getSharedKickHeadMaterial(color, isSelected, assets)}
+      />
       {isSelected && (
         <mesh geometry={sharedGeometries.kickSelection} position={[0, 0.03, 0]}>
           <meshBasicMaterial color="#FFFFFF" transparent opacity={0.5} toneMapped={false} />
