@@ -108,7 +108,7 @@ export function NoteGem({
   const isGhost = noteFlags?.isGhost
   const isAccent = noteFlags?.isAccent
 
-  let geometry = sharedGeometries.noteGemFallback
+  let geometry: THREE.BufferGeometry = sharedGeometries.noteGemFallback
   if (assets) {
     if (isCymbal) geometry = assets.cymbalGeo || sharedGeometries.noteGemFallback
     else if (isTap) geometry = assets.tapGeo || sharedGeometries.noteGemFallback
