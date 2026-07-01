@@ -1,10 +1,38 @@
 import { describe, it, expect } from 'vitest'
 import * as THREE from 'three'
+
+// Inline document canvas mock for headless Node environment execution tests
+if (typeof global.document === 'undefined') {
+  global.document = {
+    createElement: () => ({
+      width: 0,
+      height: 0,
+      getContext: () => ({
+        clearRect: () => {},
+        fillStyle: '',
+        globalAlpha: 0,
+        beginPath: () => {},
+        arc: () => {},
+        fill: () => {},
+        strokeStyle: '',
+        lineWidth: 0,
+        stroke: () => {},
+        font: '',
+        textAlign: '',
+        textBaseline: '',
+        fillText: () => {},
+        roundRect: () => {}
+      })
+    })
+  } as any
+}
 import {
   sharedGeometries,
   getSharedNoteMaterial,
   getSharedSustainMaterial,
-  clearMaterialCaches
+  clearMaterialCaches,
+  NoteGem,
+  KickNoteBar
 } from './NoteGem'
 
 describe('NoteGem Performance Optimization - Shared Geometries', () => {
@@ -91,4 +119,64 @@ describe('NoteGem Performance Optimization - Shared Materials Caching', () => {
     expect(mat1).not.toBe(matBurning)
   })
 })
+
+describe('NoteGem and KickNoteBar Component Execution', () => {
+  const dummyAssets = {
+    noteMap: {} as THREE.Texture,
+    noteEmission: {} as THREE.Texture,
+    kickMap: {} as THREE.Texture,
+    kickGeo: {} as THREE.BufferGeometry
+  } as any
+
+  it('should render NoteGemComponent without throwing errors', () => {
+    expect(() => {
+      (NoteGem as any).type({
+        position: [0, 0, 0],
+        color: '#FF0000',
+        isSelected: false,
+        sustainLength: 0,
+        assets: null
+      })
+    }).not.toThrow()
+
+    expect(() => {
+      (NoteGem as any).type({
+        position: [1, 2, 3],
+        color: '#00FF00',
+        isSelected: true,
+        sustainLength: 10,
+        assets: dummyAssets,
+        isCymbal: true,
+        fretNumber: 5
+      })
+    }).not.toThrow()
+  })
+
+  it('should render KickNoteBar without throwing errors', () => {
+    expect(() => {
+      (KickNoteBar as any).type({
+        z: -10,
+        color: '#FFCC00',
+        assets: null,
+        isSelected: false,
+        sustainLength: 0,
+        isSustainActive: false,
+        showDoubleKickBadge: false
+      })
+    }).not.toThrow()
+
+    expect(() => {
+      (KickNoteBar as any).type({
+        z: -5,
+        color: '#FF00FF',
+        assets: dummyAssets,
+        isSelected: true,
+        sustainLength: 20,
+        isSustainActive: true,
+        showDoubleKickBadge: true
+      })
+    }).not.toThrow()
+  })
+})
+
 
