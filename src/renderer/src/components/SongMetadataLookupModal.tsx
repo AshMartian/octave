@@ -125,7 +125,12 @@ export function SongMetadataLookupModal({
       >
         <div className="metadata-lookup-header">
           <div>
-            <h2 id="metadata-lookup-title">Find song metadata</h2>
+            <h2 id="metadata-lookup-title">
+              <span className="metadata-lookup-title-icon" aria-hidden="true">
+                ♪
+              </span>
+              Find song metadata
+            </h2>
             <p>Search multiple music databases, choose the matching release, then apply it.</p>
           </div>
           <button
@@ -147,21 +152,21 @@ export function SongMetadataLookupModal({
           }}
         >
           <label>
-            <span>Artist</span>
+            <span>Title</span>
             <input
               autoFocus
+              value={title}
+              onChange={(event) => setTitle(event.target.value)}
+              aria-label="Title"
+            />
+          </label>
+          <label>
+            <span>Artist</span>
+            <input
               value={artist}
               onChange={(event) => setArtist(event.target.value)}
               aria-label="Artist"
               placeholder="Optional"
-            />
-          </label>
-          <label>
-            <span>Title</span>
-            <input
-              value={title}
-              onChange={(event) => setTitle(event.target.value)}
-              aria-label="Title"
             />
           </label>
           <button type="submit" disabled={isSearching || !title.trim()}>
@@ -187,17 +192,19 @@ export function SongMetadataLookupModal({
                 key={result.id}
                 onClick={() => void selectResult(result)}
               >
-                <strong>{result.title}</strong>
+                <div className="metadata-lookup-result-header">
+                  <strong>{result.title}</strong>
+                  <em>
+                    {result.sources
+                      .map((source) => (source === 'musicbrainz' ? 'MusicBrainz' : 'TheAudioDB'))
+                      .join(' + ')}
+                  </em>
+                </div>
                 <span>{result.artist}</span>
                 <small>
                   {[result.album, result.year, result.genre].filter(Boolean).join(' · ') ||
                     'Recording metadata only'}
                 </small>
-                <em>
-                  {result.sources
-                    .map((source) => (source === 'musicbrainz' ? 'MusicBrainz' : 'TheAudioDB'))
-                    .join(' + ')}
-                </em>
               </button>
             ))}
           </div>

@@ -34,8 +34,16 @@
   border-bottom: 1px solid var(--border-color);
 }
 .metadata-lookup-header h2 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   margin: 0 0 4px;
   font-size: 18px;
+}
+.metadata-lookup-title-icon {
+  color: var(--accent-color);
+  font-size: 22px;
+  line-height: 1;
 }
 .metadata-lookup-header p {
   margin: 0;
@@ -140,10 +148,24 @@
   font-size: 12px;
   color: var(--text-secondary);
 }
+.metadata-lookup-result-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+}
+.metadata-lookup-result-header strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .metadata-lookup-result small {
   color: var(--text-muted);
 }
 .metadata-lookup-result em {
+  flex: none;
   color: var(--accent-color);
   font-size: 10px;
   font-style: normal;
