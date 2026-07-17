@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { SongMetadata } from '../types'
 import type { SongMetadataSearchResult } from '../../../shared/songMetadata'
+import { publishAlbumArtUpdate } from '../utils/albumArtEvents'
 import './SongMetadataLookupModal.css'
 
 export function SongMetadataLookupModal({
@@ -14,7 +15,9 @@ export function SongMetadataLookupModal({
   onApply: (metadata: Partial<SongMetadata>, artworkApplied: boolean) => void
   onClose: () => void
 }): React.JSX.Element {
-  const [query, setQuery] = useState(`${metadata.artist} ${metadata.name}`.trim())
+  const initialArtist = /^unknown(?: artist)?$/i.test(metadata.artist.trim()) ? '' : metadata.artist
+  const [artist, setArtist] = useState(initialArtist)
+  const [title, setTitle] = useState(metadata.name)
   const [results, setResults] = useState<SongMetadataSearchResult[]>([])
   const [selected, setSelected] = useState<SongMetadataSearchResult | null>(null)
   const [artwork, setArtwork] = useState<string | null>(null)
@@ -23,25 +26,34 @@ export function SongMetadataLookupModal({
   const [isApplying, setIsApplying] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  const search = useCallback(async (searchQuery: string): Promise<void> => {
-    const trimmed = searchQuery.trim()
-    if (!trimmed) return
-    setIsSearching(true)
-    setError(null)
-    setSelected(null)
-    setArtwork(null)
-    try {
-      setResults(await window.api.searchSongMetadata(trimmed))
-    } catch (searchError) {
-      setResults([])
-      setError(searchError instanceof Error ? searchError.message : String(searchError))
-    } finally {
-      setIsSearching(false)
-    }
-  }, [])
+  const search = useCallback(
+    async (searchArtist: string, searchTitle: string): Promise<void> => {
+      const trimmedTitle = searchTitle.trim()
+      if (!trimmedTitle) return
+      setIsSearching(true)
+      setError(null)
+      setSelected(null)
+      setArtwork(null)
+      try {
+        setResults(
+          await window.api.searchSongMetadata({
+            artist: searchArtist.trim(),
+            title: trimmedTitle,
+            durationMs: metadata.song_length
+          })
+        )
+      } catch (searchError) {
+        setResults([])
+        setError(searchError instanceof Error ? searchError.message : String(searchError))
+      } finally {
+        setIsSearching(false)
+      }
+    },
+    [metadata.song_length]
+  )
 
   useEffect(() => {
-    void search(query)
+    void search(initialArtist, metadata.name)
     // Search once when the freshly opened modal mounts; subsequent searches are explicit.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -58,10 +70,10 @@ export function SongMetadataLookupModal({
     setSelected(result)
     setArtwork(null)
     setError(null)
-    if (!result.releaseGroupId) return
+    if (!result.artwork) return
     setIsLoadingArtwork(true)
     try {
-      setArtwork(await window.api.fetchMetadataArtwork(result.releaseGroupId))
+      setArtwork(await window.api.fetchMetadataArtwork(result.artwork))
     } catch (artError) {
       setError(artError instanceof Error ? artError.message : String(artError))
     } finally {
@@ -78,6 +90,7 @@ export function SongMetadataLookupModal({
       if (artwork) {
         artworkApplied = await window.api.writeAlbumArt(folderPath, artwork)
         if (!artworkApplied) throw new Error('OCTAVE could not save the selected album artwork.')
+        publishAlbumArtUpdate({ folderPath, dataUrl: artwork })
       }
       onApply(
         {
@@ -113,7 +126,7 @@ export function SongMetadataLookupModal({
         <div className="metadata-lookup-header">
           <div>
             <h2 id="metadata-lookup-title">Find song metadata</h2>
-            <p>Search MusicBrainz, choose the matching release, then apply it to this song.</p>
+            <p>Search multiple music databases, choose the matching release, then apply it.</p>
           </div>
           <button
             type="button"
@@ -130,16 +143,28 @@ export function SongMetadataLookupModal({
           className="metadata-lookup-search"
           onSubmit={(event) => {
             event.preventDefault()
-            void search(query)
+            void search(artist, title)
           }}
         >
-          <input
-            autoFocus
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            aria-label="Song search"
-          />
-          <button type="submit" disabled={isSearching || !query.trim()}>
+          <label>
+            <span>Artist</span>
+            <input
+              autoFocus
+              value={artist}
+              onChange={(event) => setArtist(event.target.value)}
+              aria-label="Artist"
+              placeholder="Optional"
+            />
+          </label>
+          <label>
+            <span>Title</span>
+            <input
+              value={title}
+              onChange={(event) => setTitle(event.target.value)}
+              aria-label="Title"
+            />
+          </label>
+          <button type="submit" disabled={isSearching || !title.trim()}>
             {isSearching ? 'Searching…' : 'Search'}
           </button>
         </form>
@@ -168,6 +193,11 @@ export function SongMetadataLookupModal({
                   {[result.album, result.year, result.genre].filter(Boolean).join(' · ') ||
                     'Recording metadata only'}
                 </small>
+                <em>
+                  {result.sources
+                    .map((source) => (source === 'musicbrainz' ? 'MusicBrainz' : 'TheAudioDB'))
+                    .join(' + ')}
+                </em>
               </button>
             ))}
           </div>
@@ -204,7 +234,7 @@ export function SongMetadataLookupModal({
         </div>
 
         <div className="metadata-lookup-footer">
-          <span>Metadata from MusicBrainz · Artwork from Cover Art Archive</span>
+          <span>MusicBrainz + TheAudioDB metadata · Cover Art Archive + TheAudioDB artwork</span>
           <div>
             <button type="button" className="secondary" onClick={onClose} disabled={isApplying}>
               Cancel

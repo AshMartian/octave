@@ -52,11 +52,20 @@
 
 .metadata-lookup-search {
   display: flex;
+  align-items: end;
   gap: 8px;
   padding: 16px 20px;
 }
-.metadata-lookup-search input {
+.metadata-lookup-search label {
   flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+.metadata-lookup-search input {
+  width: 100%;
   min-width: 0;
   padding: 9px 11px;
   color: var(--text-primary);
@@ -134,6 +143,11 @@
 .metadata-lookup-result small {
   color: var(--text-muted);
 }
+.metadata-lookup-result em {
+  color: var(--accent-color);
+  font-size: 10px;
+  font-style: normal;
+}
 .metadata-lookup-preview {
   padding: 18px;
   overflow-y: auto;
@@ -184,6 +198,10 @@
 }
 
 @media (max-width: 700px) {
+  .metadata-lookup-search {
+    align-items: stretch;
+    flex-direction: column;
+  }
   .metadata-lookup-content {
     grid-template-columns: 1fr;
   }
