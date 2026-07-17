@@ -1,7 +1,12 @@
 import { promises as fs, existsSync } from 'fs'
 import * as path from 'path'
 import { parseDta } from './dtaParser'
-import { createUniqueSongDirectory } from './importPath'
+import {
+  ImportCancelledError,
+  PartialImportError,
+  prepareSongDirectory,
+  type ImportConflictResolver
+} from './importPath'
 import { decryptMoggBuffer } from './moggDecrypt'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
@@ -264,7 +269,11 @@ function sanitizeDirName(name: string): string {
   return name.replace(/[\\/:*?"<>|]/g, '_').trim()
 }
 
-export async function importCon(conFilePath: string, libraryDir: string): Promise<string[]> {
+export async function importCon(
+  conFilePath: string,
+  libraryDir: string,
+  resolveConflict?: ImportConflictResolver
+): Promise<string[]> {
   const buffer = await fs.readFile(conFilePath)
   const parser = new StfsParser(buffer)
   const { entries } = parser.parse()
@@ -277,137 +286,159 @@ export async function importCon(conFilePath: string, libraryDir: string): Promis
   const songs = parseDta(dtaContent.toString('latin1'))
   const importedDirs: string[] = []
 
-  for (const [shortname, song] of Object.entries(songs)) {
-    const midiBuffer = findExtensionFile(entries, shortname, 'mid')
-    const moggBuffer = findExtensionFile(entries, shortname, 'mogg')
+  try {
+    for (const [shortname, song] of Object.entries(songs)) {
+      const midiBuffer = findExtensionFile(entries, shortname, 'mid')
+      const moggBuffer = findExtensionFile(entries, shortname, 'mogg')
 
-    if (!midiBuffer) {
-      throw new Error(`MIDI file not found for song: ${shortname}`)
-    }
-    if (!moggBuffer) {
-      throw new Error(`MOGG file not found for song: ${shortname}`)
-    }
+      if (!midiBuffer) {
+        throw new Error(`MIDI file not found for song: ${shortname}`)
+      }
+      if (!moggBuffer) {
+        throw new Error(`MOGG file not found for song: ${shortname}`)
+      }
 
-    const folderName = sanitizeDirName(`${song.artist || 'Unknown Artist'} - ${song.name}`)
-    const songDir = await createUniqueSongDirectory(libraryDir, folderName)
+      const folderName = sanitizeDirName(`${song.artist || 'Unknown Artist'} - ${song.name}`)
+      const directoryPlan = await prepareSongDirectory(libraryDir, folderName, resolveConflict)
+      if (!directoryPlan) continue
+      const songDir = directoryPlan.workingDir
 
-    await fs.writeFile(path.join(songDir, 'notes.mid'), midiBuffer)
-
-    const decryptedOgg = decryptMoggBuffer(moggBuffer)
-    const oggPath = path.join(songDir, 'song.ogg')
-    await fs.writeFile(oggPath, decryptedOgg)
-
-    const numChannels = decryptedOgg.readUInt8(39)
-    if (numChannels > 2) {
       try {
-        const tempOgg = path.join(songDir, 'song_temp.ogg')
-        await fs.rename(oggPath, tempOgg)
+        await fs.writeFile(path.join(songDir, 'notes.mid'), midiBuffer)
 
-        let leftFilter = ''
-        let rightFilter = ''
-        for (let c = 0; c < numChannels; c++) {
-          if (c % 2 === 0) {
-            leftFilter += (leftFilter ? '+' : '') + `c${c}`
-          } else {
-            rightFilter += (rightFilter ? '+' : '') + `c${c}`
-          }
-        }
-        const filterStr = `pan=stereo|c0=${leftFilter}|c1=${rightFilter}`
+        const decryptedOgg = decryptMoggBuffer(moggBuffer)
+        const oggPath = path.join(songDir, 'song.ogg')
+        await fs.writeFile(oggPath, decryptedOgg)
 
-        let ffmpegPath = 'ffmpeg'
-        try {
-          // eslint-disable-next-line @typescript-eslint/no-require-imports
-          const staticPath = require('ffmpeg-static') as string | null
-          if (staticPath) {
-            let resolved = staticPath
-            const pathSep = path.sep
-            if (resolved.includes(`app.asar${pathSep}`)) {
-              resolved = resolved.replace(`app.asar${pathSep}`, `app.asar.unpacked${pathSep}`)
+        const numChannels = decryptedOgg.readUInt8(39)
+        if (numChannels > 2) {
+          try {
+            const tempOgg = path.join(songDir, 'song_temp.ogg')
+            await fs.rename(oggPath, tempOgg)
+
+            let leftFilter = ''
+            let rightFilter = ''
+            for (let c = 0; c < numChannels; c++) {
+              if (c % 2 === 0) {
+                leftFilter += (leftFilter ? '+' : '') + `c${c}`
+              } else {
+                rightFilter += (rightFilter ? '+' : '') + `c${c}`
+              }
             }
-            if (existsSync(resolved)) {
-              ffmpegPath = resolved
+            const filterStr = `pan=stereo|c0=${leftFilter}|c1=${rightFilter}`
+
+            let ffmpegPath = 'ffmpeg'
+            try {
+              // eslint-disable-next-line @typescript-eslint/no-require-imports
+              const staticPath = require('ffmpeg-static') as string | null
+              if (staticPath) {
+                let resolved = staticPath
+                const pathSep = path.sep
+                if (resolved.includes(`app.asar${pathSep}`)) {
+                  resolved = resolved.replace(`app.asar${pathSep}`, `app.asar.unpacked${pathSep}`)
+                }
+                if (existsSync(resolved)) {
+                  ffmpegPath = resolved
+                }
+              }
+            } catch {
+              // Fallback to global ffmpeg
+            }
+
+            await execFileAsync(ffmpegPath, ['-y', '-i', tempOgg, '-af', filterStr, oggPath])
+            await fs.unlink(tempOgg)
+            console.log(
+              `[Importer] Successfully downmixed multitrack song.ogg (${numChannels} channels) to stereo using ffmpeg`
+            )
+          } catch (err) {
+            console.warn(
+              '[Importer] Failed to downmix multitrack song.ogg using ffmpeg, keeping original multitrack file:',
+              err
+            )
+            const tempOgg = path.join(songDir, 'song_temp.ogg')
+            try {
+              const tempExists = await fs
+                .stat(tempOgg)
+                .then(() => true)
+                .catch(() => false)
+              if (tempExists) {
+                await fs.rename(tempOgg, oggPath)
+              }
+            } catch (restoreErr) {
+              console.error(
+                '[Importer] Failed to restore original multitrack song.ogg:',
+                restoreErr
+              )
             }
           }
-        } catch {
-          // Fallback to global ffmpeg
         }
 
-        await execFileAsync(ffmpegPath, ['-y', '-i', tempOgg, '-af', filterStr, oggPath])
-        await fs.unlink(tempOgg)
-        console.log(
-          `[Importer] Successfully downmixed multitrack song.ogg (${numChannels} channels) to stereo using ffmpeg`
-        )
-      } catch (err) {
-        console.warn(
-          '[Importer] Failed to downmix multitrack song.ogg using ffmpeg, keeping original multitrack file:',
-          err
-        )
-        const tempOgg = path.join(songDir, 'song_temp.ogg')
-        try {
-          const tempExists = await fs
-            .stat(tempOgg)
-            .then(() => true)
-            .catch(() => false)
-          if (tempExists) {
-            await fs.rename(tempOgg, oggPath)
+        const allAssignedChans = new Set<number>()
+        for (const chans of Object.values(song.channels)) {
+          for (const c of chans) {
+            allAssignedChans.add(c)
           }
-        } catch (restoreErr) {
-          console.error('[Importer] Failed to restore original multitrack song.ogg:', restoreErr)
         }
+        const totalChans = song.vols.length
+        const backingChans: number[] = []
+        for (let c = 0; c < totalChans; c++) {
+          if (!allAssignedChans.has(c)) {
+            backingChans.push(c)
+          }
+        }
+
+        let ini = '[song]\n'
+        ini += `name = ${song.name}\n`
+        if (song.artist) ini += `artist = ${song.artist}\n`
+        if (song.album) ini += `album = ${song.album}\n`
+        if (song.genre) ini += `genre = ${song.genre}\n`
+        if (song.year) ini += `year = ${song.year}\n`
+        ini += `charter = C3\n`
+        ini += `preview_start_time = ${Math.round(song.previewStart * 1000)}\n`
+        ini += `diff_band = ${rankToTier(song.ranks.band)}\n`
+        ini += `diff_guitar = ${rankToTier(song.ranks.guitar)}\n`
+        ini += `diff_bass = ${rankToTier(song.ranks.bass)}\n`
+        ini += `diff_drums = ${rankToTier(song.ranks.drum)}\n`
+        ini += `diff_vocals = ${rankToTier(song.ranks.vocals)}\n`
+        ini += `diff_keys = ${rankToTier(song.ranks.keys || song.ranks.real_keys)}\n`
+
+        if (song.channels.guitar) {
+          ini += `guitar_track_chans = ${song.channels.guitar.join(' ')}\n`
+        }
+        if (song.channels.bass) {
+          ini += `bass_track_chans = ${song.channels.bass.join(' ')}\n`
+        }
+        if (song.channels.drum) {
+          ini += `drums_track_chans = ${song.channels.drum.join(' ')}\n`
+        }
+        if (song.channels.vocals) {
+          ini += `vocals_track_chans = ${song.channels.vocals.join(' ')}\n`
+        }
+        if (song.channels.keys || song.channels.real_keys) {
+          const kchans = song.channels.keys || song.channels.real_keys
+          ini += `keys_track_chans = ${kchans.join(' ')}\n`
+        }
+        if (backingChans.length > 0) {
+          ini += `song_track_chans = ${backingChans.join(' ')}\n`
+        }
+
+        await fs.writeFile(path.join(songDir, 'song.ini'), ini, 'utf-8')
+        await directoryPlan.finalize()
+        importedDirs.push(directoryPlan.destinationDir)
+      } catch (error) {
+        await directoryPlan.rollback()
+        throw error
       }
     }
-
-    const allAssignedChans = new Set<number>()
-    for (const chans of Object.values(song.channels)) {
-      for (const c of chans) {
-        allAssignedChans.add(c)
-      }
+  } catch (error) {
+    if (error instanceof ImportCancelledError) {
+      throw new ImportCancelledError([...importedDirs, ...error.importedDirs])
     }
-    const totalChans = song.vols.length
-    const backingChans: number[] = []
-    for (let c = 0; c < totalChans; c++) {
-      if (!allAssignedChans.has(c)) {
-        backingChans.push(c)
-      }
+    if (importedDirs.length > 0) {
+      const message = error instanceof Error ? error.message : String(error)
+      throw new PartialImportError(message, importedDirs, { cause: error })
     }
-
-    let ini = '[song]\n'
-    ini += `name = ${song.name}\n`
-    if (song.artist) ini += `artist = ${song.artist}\n`
-    if (song.album) ini += `album = ${song.album}\n`
-    if (song.genre) ini += `genre = ${song.genre}\n`
-    if (song.year) ini += `year = ${song.year}\n`
-    ini += `charter = C3\n`
-    ini += `preview_start_time = ${Math.round(song.previewStart * 1000)}\n`
-    ini += `diff_band = ${rankToTier(song.ranks.band)}\n`
-    ini += `diff_guitar = ${rankToTier(song.ranks.guitar)}\n`
-    ini += `diff_bass = ${rankToTier(song.ranks.bass)}\n`
-    ini += `diff_drums = ${rankToTier(song.ranks.drum)}\n`
-    ini += `diff_vocals = ${rankToTier(song.ranks.vocals)}\n`
-    ini += `diff_keys = ${rankToTier(song.ranks.keys || song.ranks.real_keys)}\n`
-
-    if (song.channels.guitar) {
-      ini += `guitar_track_chans = ${song.channels.guitar.join(' ')}\n`
-    }
-    if (song.channels.bass) {
-      ini += `bass_track_chans = ${song.channels.bass.join(' ')}\n`
-    }
-    if (song.channels.drum) {
-      ini += `drums_track_chans = ${song.channels.drum.join(' ')}\n`
-    }
-    if (song.channels.vocals) {
-      ini += `vocals_track_chans = ${song.channels.vocals.join(' ')}\n`
-    }
-    if (song.channels.keys || song.channels.real_keys) {
-      const kchans = song.channels.keys || song.channels.real_keys
-      ini += `keys_track_chans = ${kchans.join(' ')}\n`
-    }
-    if (backingChans.length > 0) {
-      ini += `song_track_chans = ${backingChans.join(' ')}\n`
-    }
-
-    await fs.writeFile(path.join(songDir, 'song.ini'), ini, 'utf-8')
-    importedDirs.push(songDir)
+    throw error
   }
 
   return importedDirs

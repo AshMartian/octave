@@ -14,6 +14,12 @@ import { packSng } from './sngPacker'
 import { packRb3con } from './conPacker'
 import { importSng } from './import/sngImporter'
 import { importCon } from './import/conImporter'
+import {
+  ImportCancelledError,
+  PartialImportError,
+  type ImportConflictPolicy,
+  type ImportConflictResolver
+} from './import/importPath'
 
 // Point fluent-ffmpeg at the bundled static binary
 try {
@@ -641,6 +647,27 @@ ipcMain.handle('dialog:importSongPackage', async () => {
 
   const failures: Array<{ filePath: string; error: string }> = []
   let importedCount = 0
+  let skippedCount = 0
+  let cancelled = false
+  let conflictPolicy: ImportConflictPolicy | null = null
+
+  const resolveConflict: ImportConflictResolver = async (destinationPath) => {
+    if (conflictPolicy) return conflictPolicy
+
+    const conflictResult = await dialog.showMessageBox({
+      type: 'question',
+      buttons: ['Skip', 'Create New', 'Overwrite', 'Cancel'],
+      defaultId: 1,
+      cancelId: 3,
+      title: 'Song Already Exists',
+      message: `A song folder named “${basename(destinationPath)}” already exists.`,
+      detail: 'Choose how to handle this and all other conflicts in the current import operation.'
+    })
+    conflictPolicy = (['skip', 'create-new', 'overwrite', 'cancel'] as const)[
+      conflictResult.response
+    ]
+    return conflictPolicy
+  }
 
   // Import sequentially to keep disk and memory pressure bounded for large packages.
   for (const selectedPath of fileResult.filePaths) {
@@ -655,15 +682,26 @@ ipcMain.handle('dialog:importSongPackage', async () => {
 
       const magic6 = magicBuffer.toString('ascii')
       const magic4 = magicBuffer.subarray(0, 4).toString('ascii')
+      let importedSongs = 0
       if (magic6 === 'SNGPKG') {
-        await importSng(selectedPath, targetLibrary)
+        importedSongs = (await importSng(selectedPath, targetLibrary, resolveConflict)) ? 1 : 0
       } else if (magic4 === 'CON ' || magic4 === 'LIVE' || magic4 === 'PIRS') {
-        await importCon(selectedPath, targetLibrary)
+        importedSongs = (await importCon(selectedPath, targetLibrary, resolveConflict)).length
       } else {
         throw new Error('Unrecognized package header')
       }
-      importedCount += 1
+      if (importedSongs > 0) importedCount += 1
+      else skippedCount += 1
     } catch (error) {
+      const partialDirs =
+        error instanceof ImportCancelledError || error instanceof PartialImportError
+          ? error.importedDirs
+          : []
+      if (partialDirs.length > 0) importedCount += 1
+      if (error instanceof ImportCancelledError) {
+        cancelled = true
+        break
+      }
       const message = error instanceof Error ? error.message : String(error)
       failures.push({ filePath: selectedPath, error: message })
       console.error(`Failed to import package file ${selectedPath}:`, error)
@@ -675,8 +713,12 @@ ipcMain.handle('dialog:importSongPackage', async () => {
     .join('\n')
   await dialog.showMessageBox({
     type: failures.length === 0 ? 'info' : importedCount > 0 ? 'warning' : 'error',
-    title: failures.length === 0 ? 'Import Complete' : 'Import Completed with Errors',
-    message: `Processed ${importedCount} of ${fileResult.filePaths.length} package${fileResult.filePaths.length === 1 ? '' : 's'} successfully.`,
+    title: cancelled
+      ? 'Import Cancelled'
+      : failures.length === 0
+        ? 'Import Complete'
+        : 'Import Completed with Errors',
+    message: `${importedCount} package${importedCount === 1 ? '' : 's'} imported${skippedCount ? `; ${skippedCount} skipped` : ''}.`,
     ...(failureDetails ? { detail: failureDetails } : {})
   })
 
@@ -1244,7 +1286,12 @@ ipcMain.handle('song:importCon', async (_event, conFilePath: string) => {
     return { success: true, targetDirs }
   } catch (error) {
     console.error('Error importing CON:', error)
-    return { success: false, error: error instanceof Error ? error.message : String(error) }
+    const targetDirs = error instanceof PartialImportError ? error.importedDirs : undefined
+    return {
+      success: false,
+      ...(targetDirs ? { targetDirs } : {}),
+      error: error instanceof Error ? error.message : String(error)
+    }
   }
 })
 

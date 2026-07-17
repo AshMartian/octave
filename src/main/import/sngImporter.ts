@@ -4,7 +4,11 @@ import * as path from 'path'
 import { Readable } from 'stream'
 import { pipeline } from 'stream/promises'
 import { SngStream, type SngHeader } from 'parse-sng'
-import { createUniqueSongDirectory } from './importPath'
+import {
+  prepareSongDirectory,
+  type ImportConflictResolver,
+  type SongDirectoryPlan
+} from './importPath'
 
 function sanitizeDirName(name: string): string {
   return name.replace(/[\\/:*?"<>|]/g, '_').trim()
@@ -29,10 +33,21 @@ export function resolveSngOutputPath(targetDir: string, fileName: string): strin
  * Import a Clone Hero `.sng` package into `libraryDir` as a song folder.
  * Uses the streaming parse-sng parser so large packages are not fully buffered in memory.
  */
-export async function importSng(sngFilePath: string, libraryDir: string): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
+export function importSng(sngFilePath: string, libraryDir: string): Promise<string>
+export function importSng(
+  sngFilePath: string,
+  libraryDir: string,
+  resolveConflict: ImportConflictResolver
+): Promise<string | null>
+export async function importSng(
+  sngFilePath: string,
+  libraryDir: string,
+  resolveConflict?: ImportConflictResolver
+): Promise<string | null> {
+  return new Promise<string | null>((resolve, reject) => {
     let settled = false
-    let targetDir: string | null = null
+    let directoryPlan: SongDirectoryPlan | null = null
+    let skipImport = false
     // Serialize file writes: parse-sng emits the next file only after nextFile() is called.
     let writeChain: Promise<void> = Promise.resolve()
 
@@ -43,7 +58,10 @@ export async function importSng(sngFilePath: string, libraryDir: string): Promis
     }
 
     const fail = (error: unknown): void => {
-      settle(() => reject(error instanceof Error ? error : new Error(String(error))))
+      if (settled) return
+      settled = true
+      const normalizedError = error instanceof Error ? error : new Error(String(error))
+      void (directoryPlan?.rollback() ?? Promise.resolve()).finally(() => reject(normalizedError))
     }
 
     const webStream = Readable.toWeb(createReadStream(sngFilePath)) as ReadableStream<Uint8Array>
@@ -53,7 +71,8 @@ export async function importSng(sngFilePath: string, libraryDir: string): Promis
       writeChain = writeChain
         .then(async () => {
           const songFolderName = getSongFolderName(header.metadata)
-          targetDir = await createUniqueSongDirectory(libraryDir, songFolderName)
+          directoryPlan = await prepareSongDirectory(libraryDir, songFolderName, resolveConflict)
+          skipImport = directoryPlan === null
         })
         .catch(fail)
     })
@@ -61,11 +80,22 @@ export async function importSng(sngFilePath: string, libraryDir: string): Promis
     sngStream.on('file', (fileName, fileStream, nextFile) => {
       writeChain = writeChain
         .then(async () => {
-          if (!targetDir) {
+          if (skipImport) {
+            for await (const chunk of Readable.fromWeb(
+              fileStream as import('stream/web').ReadableStream<Uint8Array>
+            )) {
+              // Drain skipped package data so parse-sng can continue to the next file.
+              void chunk
+            }
+            if (nextFile) nextFile()
+            else settle(() => resolve(null))
+            return
+          }
+          if (!directoryPlan) {
             throw new Error('SNG file event received before header was parsed.')
           }
 
-          const outputPath = resolveSngOutputPath(targetDir, fileName)
+          const outputPath = resolveSngOutputPath(directoryPlan.workingDir, fileName)
           await fs.mkdir(path.dirname(outputPath), { recursive: true })
 
           const nodeReadable = Readable.fromWeb(
@@ -77,7 +107,8 @@ export async function importSng(sngFilePath: string, libraryDir: string): Promis
           if (nextFile) {
             nextFile()
           } else {
-            settle(() => resolve(targetDir!))
+            await directoryPlan.finalize()
+            settle(() => resolve(directoryPlan!.destinationDir))
           }
         })
         .catch(fail)
