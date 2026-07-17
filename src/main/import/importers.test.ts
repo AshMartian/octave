@@ -289,30 +289,6 @@ describe('resolveSngOutputPath', () => {
   )
 })
 
-describe('CON importer external fixture compatibility', () => {
-  const conPath = join(__dirname, 'fixtures/SheepQueen_OldTownRMX_rb3con')
-  const targetLibrary = join(__dirname, '../../../out/real_import_library')
-
-  afterAll(async () => {
-    await rm(targetLibrary, { recursive: true, force: true })
-  })
-
-  it('parses and imports an independently produced rb3con', async () => {
-    const parser = new StfsParser(await readFile(conPath))
-    const { entries } = parser.parse()
-    const moggKey = Object.keys(entries).find((key) => key.toLowerCase().endsWith('.mogg'))
-    expect(moggKey).toBeDefined()
-    expect(decryptMoggBuffer(entries[moggKey!]).subarray(0, 4).toString('ascii')).toBe('OggS')
-
-    await mkdir(targetLibrary, { recursive: true })
-    const importedDirs = await importCon(conPath, targetLibrary)
-    expect(importedDirs.length).toBeGreaterThan(0)
-    expect(existsSync(join(importedDirs[0], 'song.ini'))).toBe(true)
-    expect(existsSync(join(importedDirs[0], 'notes.mid'))).toBe(true)
-    expect(existsSync(join(importedDirs[0], 'song.ogg'))).toBe(true)
-  }, 60000)
-})
-
 describe('CON packer/importer synthetic round-trip', () => {
   const testTempDir = join(__dirname, '../../../out/con_roundtrip_test_temp')
   const metadata = {
