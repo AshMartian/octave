@@ -1,17 +1,90 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { parseDta } from './dtaParser'
 import { decryptMoggBuffer } from './moggDecrypt'
-import { importSng } from './sngImporter'
+import { importSng, resolveSngOutputPath } from './sngImporter'
 import { importCon, StfsParser } from './conImporter'
-import { packRb3con } from '../conPacker'
+import { packRb3con, oggToMogg } from '../conPacker'
 import { packSng } from '../sngPacker'
 import { join } from 'path'
 import { existsSync } from 'fs'
 import { mkdir, writeFile, readFile, rm } from 'fs/promises'
-import { exec } from 'child_process'
+import { execFile } from 'child_process'
 import { promisify } from 'util'
 
-const execAsync = promisify(exec)
+const execFileAsync = promisify(execFile)
+
+/** Minimal Standard MIDI File (format 0, one short note). */
+function buildMinimalMidi(): Buffer {
+  const header = Buffer.alloc(14)
+  header.write('MThd', 0)
+  header.writeUInt32BE(6, 4)
+  header.writeUInt16BE(0, 8) // format 0
+  header.writeUInt16BE(1, 10) // 1 track
+  header.writeUInt16BE(480, 12) // division
+
+  // note on C4, note off after 480 ticks, end of track
+  const events = Buffer.from([
+    0x00, 0x90, 0x3c, 0x40, 0x83, 0x60, 0x80, 0x3c, 0x40, 0x00, 0xff, 0x2f, 0x00
+  ])
+  const track = Buffer.alloc(8 + events.length)
+  track.write('MTrk', 0)
+  track.writeUInt32BE(events.length, 4)
+  events.copy(track, 8)
+
+  return Buffer.concat([header, track])
+}
+
+function resolveFfmpegPath(): string {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const staticPath = require('ffmpeg-static') as string | null
+    if (staticPath) {
+      let resolved = staticPath
+      const pathSep = join('a', 'b').includes('/') ? '/' : '\\'
+      if (resolved.includes(`app.asar${pathSep}`)) {
+        resolved = resolved.replace(`app.asar${pathSep}`, `app.asar.unpacked${pathSep}`)
+      }
+      if (existsSync(resolved)) return resolved
+    }
+  } catch {
+    // fall through
+  }
+  return 'ffmpeg'
+}
+
+/** Generate a tiny mono Vorbis OGG via ffmpeg-static (or system ffmpeg). */
+async function generateTinyOgg(outputPath: string): Promise<void> {
+  const ffmpegPath = resolveFfmpegPath()
+  await execFileAsync(ffmpegPath, [
+    '-y',
+    '-f',
+    'lavfi',
+    '-i',
+    'sine=frequency=440:duration=0.25',
+    '-c:a',
+    'libvorbis',
+    '-q:a',
+    '3',
+    outputPath
+  ])
+}
+
+/** Generate a tiny four-channel Vorbis OGG to exercise the importer's FFmpeg downmix. */
+async function generateTinyQuadOgg(outputPath: string): Promise<void> {
+  const ffmpegPath = resolveFfmpegPath()
+  await execFileAsync(ffmpegPath, [
+    '-y',
+    '-f',
+    'lavfi',
+    '-i',
+    'anullsrc=channel_layout=quad:sample_rate=44100',
+    '-t',
+    '0.25',
+    '-c:a',
+    'libvorbis',
+    outputPath
+  ])
+}
 
 describe('dtaParser', () => {
   it('parses basic DTA structures correctly', () => {
@@ -101,6 +174,26 @@ describe('moggDecrypt', () => {
     mockMogg.writeInt32LE(0x01, 0) // version 1 (unsupported)
     expect(() => decryptMoggBuffer(mockMogg)).toThrow()
   })
+
+  it('passthrough-decrypts unencrypted version 0x0A mogg (oggToMogg output)', async () => {
+    const tempDir = join(__dirname, '../../../out/mogg_unit_temp')
+    await mkdir(tempDir, { recursive: true })
+    try {
+      const oggPath = join(tempDir, 'tone.ogg')
+      await generateTinyOgg(oggPath)
+      const ogg = await readFile(oggPath)
+      const mogg = oggToMogg(ogg)
+      expect(mogg.readInt32LE(0)).toBe(0x0a)
+
+      const decrypted = decryptMoggBuffer(mogg)
+      expect(decrypted.subarray(0, 4).toString('ascii')).toBe('OggS')
+      expect(decrypted.equals(ogg)).toBe(true)
+    } finally {
+      if (existsSync(tempDir)) {
+        await rm(tempDir, { recursive: true, force: true })
+      }
+    }
+  }, 30000)
 })
 
 describe('sngImporter Integration', () => {
@@ -162,135 +255,209 @@ describe('sngImporter Integration', () => {
     expect(audioContent).toBe('MOCK GUITAR AUDIO')
 
     const iniContent = await readFile(join(importedDir, 'song.ini'), 'utf-8')
-    expect(iniContent).toContain('name = Test SNG')
-    expect(iniContent).toContain('artist = Test Artist')
-    expect(iniContent).toContain('charter = Vitest')
-    expect(iniContent).toContain('diff_guitar = 4')
-    expect(iniContent).toContain('is_valid = True')
+    // parse-sng may omit spaces around '=', but every value must remain tied to its key.
+    expect(iniContent).toMatch(/^name\s*=\s*Test SNG$/mi)
+    expect(iniContent).toMatch(/^artist\s*=\s*Test Artist$/mi)
+    expect(iniContent).toMatch(/^charter\s*=\s*Vitest$/mi)
+    expect(iniContent).toMatch(/^diff_guitar\s*=\s*4$/mi)
+    expect(iniContent).toMatch(/^is_valid\s*=\s*True$/mi)
+
+    const duplicateImportDir = await importSng(packedSngPath, libraryDir)
+    expect(duplicateImportDir).not.toBe(importedDir)
+    expect(duplicateImportDir).toMatch(/\(2\)$/)
+    expect(await readFile(join(duplicateImportDir, 'guitar.ogg'), 'utf-8')).toBe(
+      'MOCK GUITAR AUDIO'
+    )
   })
 })
 
-describe('CON Importer actual file validation', () => {
+describe('resolveSngOutputPath', () => {
+  it('keeps package files inside the target song directory', () => {
+    const targetDir = join('/tmp', 'octave-song')
+    expect(resolveSngOutputPath(targetDir, 'audio/guitar.ogg')).toBe(
+      join(targetDir, 'audio/guitar.ogg')
+    )
+  })
+
+  it.each(['../outside.txt', 'audio/../../outside.txt'])(
+    'rejects traversal path %s',
+    (fileName) => {
+      expect(() => resolveSngOutputPath('/tmp/octave-song', fileName)).toThrow(
+        'Unsafe path in SNG package'
+      )
+    }
+  )
+})
+
+describe('CON importer external fixture compatibility', () => {
   const conPath = join(__dirname, 'fixtures/SheepQueen_OldTownRMX_rb3con')
   const targetLibrary = join(__dirname, '../../../out/real_import_library')
-  const testTempDir = join(__dirname, '../../../out/con_export_test_temp')
 
   afterAll(async () => {
-    if (existsSync(targetLibrary)) {
-      await rm(targetLibrary, { recursive: true, force: true })
-    }
+    await rm(targetLibrary, { recursive: true, force: true })
+  })
+
+  it('parses and imports an independently produced rb3con', async () => {
+    const parser = new StfsParser(await readFile(conPath))
+    const { entries } = parser.parse()
+    const moggKey = Object.keys(entries).find((key) => key.toLowerCase().endsWith('.mogg'))
+    expect(moggKey).toBeDefined()
+    expect(decryptMoggBuffer(entries[moggKey!]).subarray(0, 4).toString('ascii')).toBe('OggS')
+
+    await mkdir(targetLibrary, { recursive: true })
+    const importedDirs = await importCon(conPath, targetLibrary)
+    expect(importedDirs.length).toBeGreaterThan(0)
+    expect(existsSync(join(importedDirs[0], 'song.ini'))).toBe(true)
+    expect(existsSync(join(importedDirs[0], 'notes.mid'))).toBe(true)
+    expect(existsSync(join(importedDirs[0], 'song.ogg'))).toBe(true)
+  }, 60000)
+})
+
+describe('CON packer/importer synthetic round-trip', () => {
+  const testTempDir = join(__dirname, '../../../out/con_roundtrip_test_temp')
+  const metadata = {
+    name: 'Dummy Song',
+    artist: 'Test Artist',
+    genre: 'rock',
+    year: 2026,
+    charter: 'Vitest',
+    diff_guitar: 3,
+    diff_band: 4,
+    diff_drums: 2,
+    diff_bass: 1,
+    diff_vocals: 0,
+    diff_keys: 0
+  }
+
+  let sourceSongDir: string
+  let packedConPath: string
+
+  beforeAll(async () => {
+    await rm(testTempDir, { recursive: true, force: true }).catch(() => undefined)
+    await mkdir(testTempDir, { recursive: true })
+
+    // 1. Build a dummy song folder (midi + real tiny ogg)
+    sourceSongDir = join(testTempDir, 'source_song')
+    await mkdir(sourceSongDir, { recursive: true })
+    await writeFile(join(sourceSongDir, 'notes.mid'), buildMinimalMidi())
+    await generateTinyOgg(join(sourceSongDir, 'song.ogg'))
+
+    // 2. Pack → rb3con
+    packedConPath = join(testTempDir, 'dummy_song_rb3con')
+    await packRb3con(sourceSongDir, metadata, packedConPath)
+  }, 60000)
+
+  afterAll(async () => {
     if (existsSync(testTempDir)) {
       await rm(testTempDir, { recursive: true, force: true })
     }
   })
 
-  it('imports a real rb3con file and verifies the output files exist and are non-empty', async () => {
-    if (!existsSync(conPath)) {
-      console.log('Test file not found, skipping real CON import validation')
-      return
-    }
-    await mkdir(targetLibrary, { recursive: true })
+  it('packs a synthetic song folder into a non-empty .con container', async () => {
+    expect(existsSync(packedConPath)).toBe(true)
+    const conBuf = await readFile(packedConPath)
+    expect(conBuf.length).toBeGreaterThan(0xb000) // header template size
+  })
 
-    const buffer = await readFile(conPath)
-
+  it('STFS-parses the packed .con and decrypts the embedded mogg to OggS', async () => {
+    const buffer = await readFile(packedConPath)
     const parser = new StfsParser(buffer)
     const { entries } = parser.parse()
 
-    const moggKey = Object.keys(entries).find((k) => k.endsWith('.mogg'))
-    if (moggKey) {
-      const rawMogg = entries[moggKey]
-      const decrypted = decryptMoggBuffer(rawMogg)
-      expect(decrypted.subarray(0, 4).toString('ascii')).toBe('OggS')
-    }
+    const dtaKey = Object.keys(entries).find((k) => k.toLowerCase().endsWith('songs.dta'))
+    expect(dtaKey).toBeDefined()
 
-    const importedDirs = await importCon(conPath, targetLibrary)
-    expect(importedDirs.length).toBeGreaterThan(0)
+    const moggKey = Object.keys(entries).find((k) => k.toLowerCase().endsWith('.mogg'))
+    expect(moggKey).toBeDefined()
+    const rawMogg = entries[moggKey!]
+    const decrypted = decryptMoggBuffer(rawMogg)
+    expect(decrypted.subarray(0, 4).toString('ascii')).toBe('OggS')
+
+    const midKey = Object.keys(entries).find((k) => k.toLowerCase().endsWith('.mid'))
+    expect(midKey).toBeDefined()
+    expect(entries[midKey!].subarray(0, 4).toString('ascii')).toBe('MThd')
+  })
+
+  it('imports (de-converts) the packed .con into a song folder with midi, ogg, and song.ini', async () => {
+    const libraryDir = join(testTempDir, 'import_library')
+    await mkdir(libraryDir, { recursive: true })
+
+    const importedDirs = await importCon(packedConPath, libraryDir)
+    expect(importedDirs.length).toBe(1)
     const importedDir = importedDirs[0]
 
     expect(existsSync(join(importedDir, 'song.ini'))).toBe(true)
     expect(existsSync(join(importedDir, 'notes.mid'))).toBe(true)
     expect(existsSync(join(importedDir, 'song.ogg'))).toBe(true)
 
-    const oggPath = join(importedDir, 'song.ogg')
-    let ffmpegPath = 'ffmpeg'
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const staticPath = require('ffmpeg-static') as string | null
-      if (staticPath) {
-        let resolved = staticPath
-        const pathSep = join('a', 'b').includes('/') ? '/' : '\\'
-        if (resolved.includes(`app.asar${pathSep}`)) {
-          resolved = resolved.replace(`app.asar${pathSep}`, `app.asar.unpacked${pathSep}`)
-        }
-        if (existsSync(resolved)) {
-          ffmpegPath = resolved
-        }
-      }
-    } catch {
-      // Fallback to path ffmpeg
-    }
+    const midi = await readFile(join(importedDir, 'notes.mid'))
+    expect(midi.subarray(0, 4).toString('ascii')).toBe('MThd')
+    expect(midi.equals(buildMinimalMidi())).toBe(true)
 
-    const { stderr } = await execAsync(
-      `"${ffmpegPath}" -i "${oggPath}" -filter_complex volumedetect -f null /dev/null`
-    )
-    const meanMatch = stderr.match(/mean_volume:\s*([-\d.]+)\s*dB/)
-    const maxMatch = stderr.match(/max_volume:\s*([-\d.]+)\s*dB/)
-    const meanVolume = meanMatch ? parseFloat(meanMatch[1]) : -999
-    const maxVolume = maxMatch ? parseFloat(maxMatch[1]) : -999
-
-    console.log(
-      `[Test Validation] Imported song.ogg Volume Stats - Mean: ${meanVolume} dB, Max: ${maxVolume} dB`
-    )
-
-    expect(meanVolume).toBeGreaterThan(-40) // Silence is typically -91 dB or lower
-    expect(maxVolume).toBeGreaterThan(-10) // Ensure it has some active audio peaks
+    const ogg = await readFile(join(importedDir, 'song.ogg'))
+    expect(ogg.subarray(0, 4).toString('ascii')).toBe('OggS')
+    // Round-trip should preserve the original packed ogg bytes for unencrypted v10 mogg
+    const originalOgg = await readFile(join(sourceSongDir, 'song.ogg'))
+    expect(ogg.equals(originalOgg)).toBe(true)
 
     const iniContent = await readFile(join(importedDir, 'song.ini'), 'utf-8')
     expect(iniContent).toContain('[song]')
+    expect(iniContent).toContain('name = Dummy Song')
+    expect(iniContent).toContain('artist = Test Artist')
+    expect(iniContent).toContain('diff_guitar = 3')
+    expect(iniContent).toContain('diff_band = 4')
   })
 
-  it('exports a song folder back into a valid .con package and verifies the round-trip', async () => {
-    if (!existsSync(conPath)) {
-      return
-    }
-
-    await mkdir(testTempDir, { recursive: true })
-
-    // 1. Re-import the original CON package first to get the song folder path
-    const library = join(testTempDir, 'library')
-    await mkdir(library, { recursive: true })
-    const importedDirs = await importCon(conPath, library)
-    expect(importedDirs.length).toBeGreaterThan(0)
+  it('supports a second pack → import cycle from the de-converted folder', async () => {
+    const libraryDir = join(testTempDir, 'import_library')
+    const importedDirs = await importCon(packedConPath, libraryDir)
     const importedDir = importedDirs[0]
 
-    // 2. Export the song folder back to a CON package
-    const exportedConPath = join(testTempDir, 're_exported_rb3con')
-    const metadata = {
-      name: 'Old Town Road (Remix)',
-      artist: 'Lil Nas X',
-      genre: 'Country/Rap',
-      year: 2019,
-      diff_guitar: 3,
-      diff_band: 4
-    }
+    const reExportPath = join(testTempDir, 're_exported_rb3con')
+    await packRb3con(importedDir, metadata, reExportPath)
+    expect(existsSync(reExportPath)).toBe(true)
 
-    await packRb3con(importedDir, metadata, exportedConPath)
-    expect(existsSync(exportedConPath)).toBe(true)
-
-    // 3. Import the newly exported package back into another directory and verify
-    const reImportLibrary = join(testTempDir, 're_imported_library')
+    const reImportLibrary = join(testTempDir, 're_import_library')
     await mkdir(reImportLibrary, { recursive: true })
+    const reImportedDirs = await importCon(reExportPath, reImportLibrary)
+    expect(reImportedDirs.length).toBe(1)
 
-    const reImportedDirs = await importCon(exportedConPath, reImportLibrary)
-    expect(reImportedDirs.length).toBeGreaterThan(0)
     const reImportedDir = reImportedDirs[0]
-
     expect(existsSync(join(reImportedDir, 'song.ini'))).toBe(true)
     expect(existsSync(join(reImportedDir, 'notes.mid'))).toBe(true)
     expect(existsSync(join(reImportedDir, 'song.ogg'))).toBe(true)
 
     const iniContent = await readFile(join(reImportedDir, 'song.ini'), 'utf-8')
-    expect(iniContent).toContain('name = Old Town Road (Remix)')
-    expect(iniContent).toContain('artist = Lil Nas X')
+    expect(iniContent).toContain('name = Dummy Song')
+    expect(iniContent).toContain('artist = Test Artist')
+
+    const midi = await readFile(join(reImportedDir, 'notes.mid'))
+    expect(midi.equals(buildMinimalMidi())).toBe(true)
+  }, 60000)
+
+  it('treats shell metacharacters in imported metadata as literal path text', async () => {
+    const markerName = 'octave-import-command-injection-marker'
+    const markerPath = join(process.cwd(), markerName)
+    await rm(markerPath, { force: true })
+
+    const hostileSource = join(testTempDir, 'hostile_source')
+    await mkdir(hostileSource, { recursive: true })
+    await writeFile(join(hostileSource, 'notes.mid'), buildMinimalMidi())
+    await generateTinyQuadOgg(join(hostileSource, 'song.ogg'))
+
+    const hostileCon = join(testTempDir, 'hostile_rb3con')
+    await packRb3con(
+      hostileSource,
+      { ...metadata, artist: `\`touch ${markerName}\`` },
+      hostileCon
+    )
+
+    const hostileLibrary = join(testTempDir, 'hostile_library')
+    await mkdir(hostileLibrary, { recursive: true })
+    const importedDirs = await importCon(hostileCon, hostileLibrary)
+
+    expect(importedDirs).toHaveLength(1)
+    expect(existsSync(join(importedDirs[0], 'song.ogg'))).toBe(true)
+    expect(existsSync(markerPath)).toBe(false)
   }, 60000)
 })

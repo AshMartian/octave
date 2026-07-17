@@ -10,7 +10,7 @@ const api = {
     ipcRenderer.invoke('dialog:importSongPackage'),
 
   // Folder APIs
-  scanFolder: (folderPath: string): Promise<Array<{ id: string; path: string; name: string }>> =>
+  scanFolder: (folderPath: string): Promise<Array<{ id: string; path: string; name: string; addedAt: number }>> =>
     ipcRenderer.invoke('folder:scan', folderPath),
 
   // Dialog APIs

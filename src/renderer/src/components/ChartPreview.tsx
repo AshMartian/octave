@@ -103,8 +103,11 @@ function VenueCameraController({
 
     if (camera instanceof THREE.PerspectiveCamera) {
       const targetFov = CAMERA_FOV
-      camera.fov += (targetFov - camera.fov) * 0.18
-      camera.updateProjectionMatrix()
+      const diff = targetFov - camera.fov
+      if (Math.abs(diff) > 0.001) {
+        camera.fov += diff * 0.18
+        camera.updateProjectionMatrix()
+      }
     }
   })
 

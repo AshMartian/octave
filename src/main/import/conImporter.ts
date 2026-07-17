@@ -1,11 +1,12 @@
 import { promises as fs, existsSync } from 'fs'
 import * as path from 'path'
 import { parseDta } from './dtaParser'
+import { createUniqueSongDirectory } from './importPath'
 import { decryptMoggBuffer } from './moggDecrypt'
-import { exec } from 'child_process'
+import { execFile } from 'child_process'
 import { promisify } from 'util'
 
-const execAsync = promisify(exec)
+const execFileAsync = promisify(execFile)
 
 interface DirectoryEntry {
   name: string
@@ -288,8 +289,7 @@ export async function importCon(conFilePath: string, libraryDir: string): Promis
     }
 
     const folderName = sanitizeDirName(`${song.artist || 'Unknown Artist'} - ${song.name}`)
-    const songDir = path.join(libraryDir, folderName)
-    await fs.mkdir(songDir, { recursive: true })
+    const songDir = await createUniqueSongDirectory(libraryDir, folderName)
 
     await fs.writeFile(path.join(songDir, 'notes.mid'), midiBuffer)
 
@@ -332,7 +332,7 @@ export async function importCon(conFilePath: string, libraryDir: string): Promis
           // Fallback to global ffmpeg
         }
 
-        await execAsync(`"${ffmpegPath}" -y -i "${tempOgg}" -af "${filterStr}" "${oggPath}"`)
+        await execFileAsync(ffmpegPath, ['-y', '-i', tempOgg, '-af', filterStr, oggPath])
         await fs.unlink(tempOgg)
         console.log(
           `[Importer] Successfully downmixed multitrack song.ogg (${numChannels} channels) to stereo using ffmpeg`

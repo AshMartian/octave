@@ -6,7 +6,7 @@ interface ChartEditorAPI {
   importSongPackage: () => Promise<string | null>
 
   // Folder APIs
-  scanFolder: (folderPath: string) => Promise<Array<{ id: string; path: string; name: string }>>
+  scanFolder: (folderPath: string) => Promise<Array<{ id: string; path: string; name: string; addedAt: number }>>
 
   // Dialog APIs
   openAudioDialog: () => Promise<string | null>

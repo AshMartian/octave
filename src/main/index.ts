@@ -625,8 +625,12 @@ ipcMain.handle('dialog:importSongPackage', async () => {
 
   // Select the package file to import
   const fileResult = await dialog.showOpenDialog({
-    properties: ['openFile'],
-    title: 'Select Song Package File (.sng or rb3con)'
+    properties: ['openFile', 'multiSelections'],
+    title: 'Select Song Package Files (.sng or rb3con)',
+    filters: [
+      { name: 'Song Packages', extensions: ['sng', 'con', 'live', 'rb3con'] },
+      { name: 'All Files', extensions: ['*'] }
+    ]
   })
 
   if (fileResult.canceled || fileResult.filePaths.length === 0) {
@@ -635,42 +639,48 @@ ipcMain.handle('dialog:importSongPackage', async () => {
     return targetLibrary
   }
 
-  const selectedPath = fileResult.filePaths[0]
+  const failures: Array<{ filePath: string; error: string }> = []
+  let importedCount = 0
 
-  try {
-    // Read first 6 bytes to detect magic header
-    const fileHandle = await open(selectedPath, 'r')
-    const magicBuffer = Buffer.alloc(6)
-    await fileHandle.read(magicBuffer, 0, 6, 0)
-    await fileHandle.close()
+  // Import sequentially to keep disk and memory pressure bounded for large packages.
+  for (const selectedPath of fileResult.filePaths) {
+    try {
+      const fileHandle = await open(selectedPath, 'r')
+      const magicBuffer = Buffer.alloc(6)
+      try {
+        await fileHandle.read(magicBuffer, 0, 6, 0)
+      } finally {
+        await fileHandle.close()
+      }
 
-    const magic6 = magicBuffer.toString('ascii')
-    const magic4 = magicBuffer.subarray(0, 4).toString('ascii')
-
-    if (magic6 === 'SNGPKG') {
-      await importSng(selectedPath, targetLibrary)
-    } else if (magic4 === 'CON ' || magic4 === 'LIVE' || magic4 === 'PIRS') {
-      await importCon(selectedPath, targetLibrary)
-    } else {
-      throw new Error('The selected file does not have a recognized header signature.')
+      const magic6 = magicBuffer.toString('ascii')
+      const magic4 = magicBuffer.subarray(0, 4).toString('ascii')
+      if (magic6 === 'SNGPKG') {
+        await importSng(selectedPath, targetLibrary)
+      } else if (magic4 === 'CON ' || magic4 === 'LIVE' || magic4 === 'PIRS') {
+        await importCon(selectedPath, targetLibrary)
+      } else {
+        throw new Error('Unrecognized package header')
+      }
+      importedCount += 1
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      failures.push({ filePath: selectedPath, error: message })
+      console.error(`Failed to import package file ${selectedPath}:`, error)
     }
-
-    await dialog.showMessageBox({
-      type: 'info',
-      title: 'Import Success',
-      message: 'Successfully imported the song package into your current library folder.'
-    })
-
-    return targetLibrary
-  } catch (error) {
-    console.error('Failed to import package file:', error)
-    await dialog.showMessageBox({
-      type: 'error',
-      title: 'Import Failed',
-      message: `Failed to import song package:\n${error instanceof Error ? error.message : String(error)}\n\nSupported import formats:\n• Clone Hero Package (starts with SNGPKG)\n• Rock Band 3 Xbox 360 Container Package (starts with CON, LIVE, or PIRS)`
-    })
-    return targetLibrary // Return the library so it remains loaded/active
   }
+
+  const failureDetails = failures
+    .map(({ filePath, error }) => `• ${filePath.split(/[\\/]/).pop()}: ${error}`)
+    .join('\n')
+  await dialog.showMessageBox({
+    type: failures.length === 0 ? 'info' : importedCount > 0 ? 'warning' : 'error',
+    title: failures.length === 0 ? 'Import Complete' : 'Import Completed with Errors',
+    message: `Processed ${importedCount} of ${fileResult.filePaths.length} package${fileResult.filePaths.length === 1 ? '' : 's'} successfully.`,
+    ...(failureDetails ? { detail: failureDetails } : {})
+  })
+
+  return targetLibrary
 })
 
 // Open audio file dialog
@@ -897,18 +907,20 @@ ipcMain.handle('folder:scan', async (_event, folderPath: string) => {
   if (!allowedProjectPath) {
     allowedProjectPath = resolve(folderPath)
   }
-  const songs: Array<{ id: string; path: string; name: string }> = []
+  const songs: Array<{ id: string; path: string; name: string; addedAt: number }> = []
 
   try {
     // Check if the opened folder itself is a song (contains song.ini)
     const selfIniPath = join(folderPath, 'song.ini')
     try {
       await stat(selfIniPath)
+      const folderStat = await stat(folderPath)
       const folderName = folderPath.split(/[\\/]/).pop() || 'song'
       songs.push({
         id: folderName,
         path: folderPath,
-        name: folderName
+        name: folderName,
+        addedAt: folderStat.birthtimeMs || folderStat.ctimeMs
       })
     } catch {
       // Not a song folder itself — scan children
@@ -924,10 +936,12 @@ ipcMain.handle('folder:scan', async (_event, folderPath: string) => {
 
         try {
           await stat(iniPath)
+          const folderStat = await stat(songPath)
           songs.push({
             id: entry.name,
             path: songPath,
-            name: entry.name
+            name: entry.name,
+            addedAt: folderStat.birthtimeMs || folderStat.ctimeMs
           })
         } catch {
           // No song.ini, skip this folder

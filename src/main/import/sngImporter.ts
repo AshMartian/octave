@@ -1,42 +1,10 @@
+import { createReadStream, createWriteStream } from 'fs'
 import { promises as fs } from 'fs'
-import * as fsSync from 'fs'
 import * as path from 'path'
+import { Readable } from 'stream'
 import { pipeline } from 'stream/promises'
-import { Transform, TransformCallback } from 'stream'
-
-export class SngDecryptTransform extends Transform {
-  private keystream: Buffer
-  private bytesProcessed = 0
-
-  constructor(keystream: Buffer) {
-    super()
-    this.keystream = keystream
-  }
-
-  _transform(chunk: Buffer, _encoding: string, callback: TransformCallback): void {
-    for (let i = 0; i < chunk.length; i++) {
-      const fileIndex = this.bytesProcessed + i
-      chunk[i] ^= this.keystream[fileIndex % 256]
-    }
-    this.bytesProcessed += chunk.length
-    this.push(chunk)
-    callback()
-  }
-}
-
-function generateKeystream(seed: Buffer): Buffer {
-  const keystream = Buffer.alloc(256)
-  for (let i = 0; i < 256; i++) {
-    keystream[i] = seed[i % 16] ^ i
-  }
-  return keystream
-}
-
-interface FileEntry {
-  name: string
-  size: bigint
-  offset: bigint
-}
+import { SngStream, type SngHeader } from 'parse-sng'
+import { createUniqueSongDirectory } from './importPath'
 
 function sanitizeDirName(name: string): string {
   return name.replace(/[\\/:*?"<>|]/g, '_').trim()
@@ -48,98 +16,74 @@ function getSongFolderName(metadata: Record<string, string>): string {
   return sanitizeDirName(`${artist} - ${name}`)
 }
 
-function buildIniContent(metadata: Record<string, string>): string {
-  let ini = '[song]\n'
-  for (const [key, value] of Object.entries(metadata)) {
-    ini += `${key} = ${value}\n`
+export function resolveSngOutputPath(targetDir: string, fileName: string): string {
+  const root = path.resolve(targetDir)
+  const outputPath = path.resolve(root, fileName)
+  if (outputPath !== root && !outputPath.startsWith(`${root}${path.sep}`)) {
+    throw new Error(`Unsafe path in SNG package: ${fileName}`)
   }
-  return ini
+  return outputPath
 }
 
+/**
+ * Import a Clone Hero `.sng` package into `libraryDir` as a song folder.
+ * Uses the streaming parse-sng parser so large packages are not fully buffered in memory.
+ */
 export async function importSng(sngFilePath: string, libraryDir: string): Promise<string> {
-  const buffer = await fs.readFile(sngFilePath)
+  return new Promise<string>((resolve, reject) => {
+    let settled = false
+    let targetDir: string | null = null
+    // Serialize file writes: parse-sng emits the next file only after nextFile() is called.
+    let writeChain: Promise<void> = Promise.resolve()
 
-  if (buffer.length < 26) {
-    throw new Error('SNG file is too small or truncated.')
-  }
+    const settle = (fn: () => void): void => {
+      if (settled) return
+      settled = true
+      fn()
+    }
 
-  const magic = buffer.subarray(0, 6).toString('ascii')
-  if (magic !== 'SNGPKG') {
-    throw new Error('Invalid file format: Magic signature "SNGPKG" not found.')
-  }
+    const fail = (error: unknown): void => {
+      settle(() => reject(error instanceof Error ? error : new Error(String(error))))
+    }
 
-  const version = buffer.readUInt32LE(6)
-  if (version !== 1) {
-    throw new Error(`Unsupported SNG version: ${version}. Only version 1 is supported.`)
-  }
+    const webStream = Readable.toWeb(createReadStream(sngFilePath)) as ReadableStream<Uint8Array>
+    const sngStream = new SngStream(webStream, { generateSongIni: true })
 
-  const seed = buffer.subarray(10, 26)
-  const keystream = generateKeystream(seed)
-
-  let cursor = 26
-  const metaSecLen = Number(buffer.readBigUInt64LE(cursor))
-  cursor += 8
-
-  const metadataCount = Number(buffer.readBigUInt64LE(cursor))
-  let metaOffset = cursor + 8
-  const metadata: Record<string, string> = {}
-
-  for (let i = 0; i < metadataCount; i++) {
-    const keyLen = buffer.readInt32LE(metaOffset)
-    metaOffset += 4
-    const key = buffer.subarray(metaOffset, metaOffset + keyLen).toString('utf-8')
-    metaOffset += keyLen
-
-    const valLen = buffer.readInt32LE(metaOffset)
-    metaOffset += 4
-    const val = buffer.subarray(metaOffset, metaOffset + valLen).toString('utf-8')
-    metaOffset += valLen
-
-    metadata[key] = val
-  }
-  cursor += metaSecLen
-
-  buffer.readBigUInt64LE(cursor)
-  cursor += 8
-
-  const fileCount = Number(buffer.readBigUInt64LE(cursor))
-  let idxOffset = cursor + 8
-  const files: FileEntry[] = []
-
-  for (let i = 0; i < fileCount; i++) {
-    const nameLen = buffer.readUInt8(idxOffset)
-    idxOffset += 1
-    const name = buffer.subarray(idxOffset, idxOffset + nameLen).toString('utf-8')
-    idxOffset += nameLen
-
-    const size = buffer.readBigUInt64LE(idxOffset)
-    idxOffset += 8
-    const offset = buffer.readBigUInt64LE(idxOffset)
-    idxOffset += 8
-
-    files.push({ name, size, offset })
-  }
-
-  const songFolderName = getSongFolderName(metadata)
-  const targetDir = path.join(libraryDir, songFolderName)
-  await fs.mkdir(targetDir, { recursive: true })
-
-  const iniContent = buildIniContent(metadata)
-  await fs.writeFile(path.join(targetDir, 'song.ini'), iniContent, 'utf-8')
-
-  for (const file of files) {
-    const outputPath = path.join(targetDir, file.name)
-
-    const readStream = fsSync.createReadStream(sngFilePath, {
-      start: Number(file.offset),
-      end: Number(file.offset) + Number(file.size) - 1
+    sngStream.on('header', (header: SngHeader) => {
+      writeChain = writeChain
+        .then(async () => {
+          const songFolderName = getSongFolderName(header.metadata)
+          targetDir = await createUniqueSongDirectory(libraryDir, songFolderName)
+        })
+        .catch(fail)
     })
 
-    const decryptStream = new SngDecryptTransform(keystream)
-    const writeStream = fsSync.createWriteStream(outputPath)
+    sngStream.on('file', (fileName, fileStream, nextFile) => {
+      writeChain = writeChain
+        .then(async () => {
+          if (!targetDir) {
+            throw new Error('SNG file event received before header was parsed.')
+          }
 
-    await pipeline(readStream, decryptStream, writeStream)
-  }
+          const outputPath = resolveSngOutputPath(targetDir, fileName)
+          await fs.mkdir(path.dirname(outputPath), { recursive: true })
 
-  return targetDir
+          const nodeReadable = Readable.fromWeb(
+            fileStream as import('stream/web').ReadableStream<Uint8Array>
+          )
+          const writeStream = createWriteStream(outputPath)
+          await pipeline(nodeReadable, writeStream)
+
+          if (nextFile) {
+            nextFile()
+          } else {
+            settle(() => resolve(targetDir!))
+          }
+        })
+        .catch(fail)
+    })
+
+    sngStream.on('error', fail)
+    sngStream.start()
+  })
 }
