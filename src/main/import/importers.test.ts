@@ -3,13 +3,14 @@ import { parseDta } from './dtaParser'
 import { decryptMoggBuffer } from './moggDecrypt'
 import { importSng, resolveSngOutputPath } from './sngImporter'
 import { importCon, StfsParser } from './conImporter'
-import { packRb3con, oggToMogg } from '../conPacker'
+import { getBlockPatternShift0, packRb3con, oggToMogg } from '../conPacker'
 import { packSng } from '../sngPacker'
 import { join } from 'path'
 import { existsSync } from 'fs'
 import { mkdir, writeFile, readFile, rm } from 'fs/promises'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
+import { createHash } from 'crypto'
 
 const execFileAsync = promisify(execFile)
 
@@ -352,6 +353,65 @@ describe('CON packer/importer synthetic round-trip', () => {
     const midKey = Object.keys(entries).find((k) => k.toLowerCase().endsWith('.mid'))
     expect(midKey).toBeDefined()
     expect(entries[midKey!].subarray(0, 4).toString('ascii')).toBe('MThd')
+  })
+
+  it('produces valid generated L0, L1, and top-level SHA1 hash chains', async () => {
+    const hashSource = join(testTempDir, 'hash_source')
+    await mkdir(hashSource, { recursive: true })
+    await writeFile(join(hashSource, 'notes.mid'), buildMinimalMidi())
+    const generatedOgg = Buffer.alloc(171 * 0x1000)
+    generatedOgg.write('OggS')
+    await writeFile(join(hashSource, 'song.ogg'), generatedOgg)
+
+    const hashConPath = join(testTempDir, 'hash_validation_rb3con')
+    await packRb3con(hashSource, metadata, hashConPath)
+    const con = await readFile(hashConPath)
+    const headerSize = 0xb000
+    const volumeDescriptorOffset = 0x22c + 0x14d
+    const totalDataBlocks = con.readUInt32BE(volumeDescriptorOffset + 28)
+    expect(totalDataBlocks).toBeGreaterThan(170)
+
+    const pattern = getBlockPatternShift0(totalDataBlocks)
+    const physicalIndexes = new Map<string, number>()
+    pattern.forEach(({ type, logicalIndex }, physicalIndex) => {
+      physicalIndexes.set(`${type}:${logicalIndex}`, physicalIndex)
+    })
+
+    for (let logicalIndex = 0; logicalIndex < totalDataBlocks; logicalIndex++) {
+      const dataPhysicalIndex = physicalIndexes.get(`Data:${logicalIndex}`)!
+      const l0PhysicalIndex = physicalIndexes.get(`L0:${Math.floor(logicalIndex / 170)}`)!
+      const recordOffset = headerSize + l0PhysicalIndex * 0x1000 + (logicalIndex % 170) * 24
+      const dataOffset = headerSize + dataPhysicalIndex * 0x1000
+      const expected = createHash('sha1')
+        .update(con.subarray(dataOffset, dataOffset + 0x1000))
+        .digest()
+
+      expect(con.subarray(recordOffset, recordOffset + 20).equals(expected)).toBe(true)
+      expect(con[recordOffset + 20]).toBe(0x80)
+    }
+
+    const l1PhysicalIndex = physicalIndexes.get('L1:0')!
+    const l1Offset = headerSize + l1PhysicalIndex * 0x1000
+    const l0Count = Math.ceil(totalDataBlocks / 170)
+    for (let l0Index = 0; l0Index < l0Count; l0Index++) {
+      const l0PhysicalIndex = physicalIndexes.get(`L0:${l0Index}`)!
+      const l0Offset = headerSize + l0PhysicalIndex * 0x1000
+      const expected = createHash('sha1')
+        .update(con.subarray(l0Offset, l0Offset + 0x1000))
+        .digest()
+      expect(con.subarray(l1Offset + l0Index * 24, l1Offset + l0Index * 24 + 20).equals(expected)).toBe(
+        true
+      )
+    }
+
+    const expectedTopHash = createHash('sha1')
+      .update(con.subarray(l1Offset, l1Offset + 0x1000))
+      .digest()
+    expect(
+      con
+        .subarray(volumeDescriptorOffset + 8, volumeDescriptorOffset + 28)
+        .equals(expectedTopHash)
+    ).toBe(true)
   })
 
   it('imports (de-converts) the packed .con into a song folder with midi, ogg, and song.ini', async () => {

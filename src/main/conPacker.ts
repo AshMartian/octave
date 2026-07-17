@@ -184,6 +184,21 @@ export interface BlockInfo {
   logicalIndex: number
 }
 
+interface PhysicalBlockIndexes {
+  Data: number[]
+  L0: number[]
+  L1: number[]
+  L2: number[]
+}
+
+function indexPhysicalBlocks(pattern: BlockInfo[]): PhysicalBlockIndexes {
+  const indexes: PhysicalBlockIndexes = { Data: [], L0: [], L1: [], L2: [] }
+  pattern.forEach(({ type, logicalIndex }, physicalIndex) => {
+    if (type !== 'Dummy') indexes[type][logicalIndex] = physicalIndex
+  })
+  return indexes
+}
+
 export function getBlockPatternShift0(totalDataBlocks: number): BlockInfo[] {
   const pattern: BlockInfo[] = []
   let dataIndex = 0
@@ -274,24 +289,22 @@ function writeUtf16BE(str: string, buffer: Buffer, offset: number, maxLengthByte
 
 function calculateHashes(
   conBuffer: Buffer,
-  pattern: BlockInfo[],
+  indexes: PhysicalBlockIndexes,
   headerSize: number,
   totalDataBlocks: number
 ): void {
   const numL0Tables = Math.ceil(totalDataBlocks / 170)
   for (let i = 0; i < numL0Tables; i++) {
-    const l0PhysicalIndex = pattern.findIndex((b) => b.type === 'L0' && b.logicalIndex === i)
-    if (l0PhysicalIndex === -1) continue
+    const l0PhysicalIndex = indexes.L0[i]
+    if (l0PhysicalIndex === undefined) continue
     const l0Offset = headerSize + l0PhysicalIndex * 0x1000
 
     for (let j = 0; j < 170; j++) {
       const logicalDataIndex = i * 170 + j
       if (logicalDataIndex >= totalDataBlocks) break
 
-      const dataPhysicalIndex = pattern.findIndex(
-        (b) => b.type === 'Data' && b.logicalIndex === logicalDataIndex
-      )
-      if (dataPhysicalIndex === -1) continue
+      const dataPhysicalIndex = indexes.Data[logicalDataIndex]
+      if (dataPhysicalIndex === undefined) continue
 
       const dataOffset = headerSize + dataPhysicalIndex * 0x1000
       const dataBytes = conBuffer.subarray(dataOffset, dataOffset + 0x1000)
@@ -305,8 +318,8 @@ function calculateHashes(
   if (totalDataBlocks >= 170) {
     const numL1Tables = Math.ceil(numL0Tables / 170)
     for (let i = 0; i < numL1Tables; i++) {
-      const l1PhysicalIndex = pattern.findIndex((b) => b.type === 'L1' && b.logicalIndex === i)
-      if (l1PhysicalIndex === -1) continue
+      const l1PhysicalIndex = indexes.L1[i]
+      if (l1PhysicalIndex === undefined) continue
       const l1Offset = headerSize + l1PhysicalIndex * 0x1000
 
       const blocksCovered = Math.min(170 * 170, totalDataBlocks - 170 * 170 * i)
@@ -316,10 +329,8 @@ function calculateHashes(
         const l0Index = i * 170 + j
         if (l0Index >= numL0Tables) break
 
-        const l0PhysicalIndex = pattern.findIndex(
-          (b) => b.type === 'L0' && b.logicalIndex === l0Index
-        )
-        if (l0PhysicalIndex === -1) continue
+        const l0PhysicalIndex = indexes.L0[l0Index]
+        if (l0PhysicalIndex === undefined) continue
 
         const l0OffsetReal = headerSize + l0PhysicalIndex * 0x1000
         const l0Bytes = conBuffer.subarray(l0OffsetReal, l0OffsetReal + 0x1000)
@@ -334,18 +345,16 @@ function calculateHashes(
   if (totalDataBlocks >= 170 * 170) {
     const numL2Tables = Math.ceil(numL0Tables / (170 * 170))
     for (let i = 0; i < numL2Tables; i++) {
-      const l2PhysicalIndex = pattern.findIndex((b) => b.type === 'L2' && b.logicalIndex === i)
-      if (l2PhysicalIndex === -1) continue
+      const l2PhysicalIndex = indexes.L2[i]
+      if (l2PhysicalIndex === undefined) continue
       const l2Offset = headerSize + l2PhysicalIndex * 0x1000
 
       conBuffer.writeUInt32BE(totalDataBlocks, l2Offset + 0xff0)
 
       for (let j = 0; j < 170; j++) {
         const l1Index = i * 170 + j
-        const l1PhysicalIndex = pattern.findIndex(
-          (b) => b.type === 'L1' && b.logicalIndex === l1Index
-        )
-        if (l1PhysicalIndex === -1) break
+        const l1PhysicalIndex = indexes.L1[l1Index]
+        if (l1PhysicalIndex === undefined) break
 
         const l1OffsetReal = headerSize + l1PhysicalIndex * 0x1000
         const l1Bytes = conBuffer.subarray(l1OffsetReal, l1OffsetReal + 0x1000)
@@ -451,6 +460,7 @@ export async function packRb3con(
   const headerSize = 0xb000
 
   const pattern = getBlockPatternShift0(totalDataBlocks)
+  const physicalIndexes = indexPhysicalBlocks(pattern)
   const conBuffer = Buffer.alloc(headerSize + pattern.length * 0x1000)
 
   baseHeader.copy(conBuffer, 0, 0, headerSize)
@@ -498,20 +508,20 @@ export async function packRb3con(
     const l0Index = Math.floor(n / 170)
     const recordIndex = n % 170
 
-    const l0PhysicalIndex = pattern.findIndex((b) => b.type === 'L0' && b.logicalIndex === l0Index)
-    if (l0PhysicalIndex !== -1) {
+    const l0PhysicalIndex = physicalIndexes.L0[l0Index]
+    if (l0PhysicalIndex !== undefined) {
       const l0Offset = headerSize + l0PhysicalIndex * 0x1000
       const recordOffset = l0Offset + recordIndex * 24
+      // Byte 20 is allocation state for L0 data records. At L1/L2 the same byte contains
+      // level-N table flags, so higher-level hash entries must not be marked as allocated.
       conBuffer[recordOffset + 20] = 0x80
       conBuffer.writeUIntBE(next, recordOffset + 21, 3)
     }
   }
 
   const writeLogicalBlockData = (logicalIndex: number, data: Buffer): void => {
-    const physicalIndex = pattern.findIndex(
-      (b) => b.type === 'Data' && b.logicalIndex === logicalIndex
-    )
-    if (physicalIndex !== -1) {
+    const physicalIndex = physicalIndexes.Data[logicalIndex]
+    if (physicalIndex !== undefined) {
       const offset = headerSize + physicalIndex * 0x1000
       data.copy(conBuffer, offset, 0, 0x1000)
     }
@@ -537,15 +547,15 @@ export async function packRb3con(
     writeLogicalBlockData(startMogg + i, blockData)
   }
 
-  calculateHashes(conBuffer, pattern, headerSize, totalDataBlocks)
+  calculateHashes(conBuffer, physicalIndexes, headerSize, totalDataBlocks)
 
   let topTablePhysicalIndex = 0
   if (totalDataBlocks < 170) {
-    topTablePhysicalIndex = pattern.findIndex((b) => b.type === 'L0' && b.logicalIndex === 0)
+    topTablePhysicalIndex = physicalIndexes.L0[0] ?? -1
   } else if (totalDataBlocks < 170 * 170) {
-    topTablePhysicalIndex = pattern.findIndex((b) => b.type === 'L1' && b.logicalIndex === 0)
+    topTablePhysicalIndex = physicalIndexes.L1[0] ?? -1
   } else {
-    topTablePhysicalIndex = pattern.findIndex((b) => b.type === 'L2' && b.logicalIndex === 0)
+    topTablePhysicalIndex = physicalIndexes.L2[0] ?? -1
   }
 
   if (topTablePhysicalIndex !== -1) {
