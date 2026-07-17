@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
+import type { SongMetadataSearchResult } from '../shared/songMetadata'
 
 // Custom APIs for renderer
 const api = {
@@ -47,6 +48,12 @@ const api = {
 
   writeSongIni: (songPath: string, metadata: Record<string, unknown>): Promise<boolean> =>
     ipcRenderer.invoke('song:writeIni', songPath, metadata),
+
+  searchSongMetadata: (query: string): Promise<SongMetadataSearchResult[]> =>
+    ipcRenderer.invoke('song:searchMetadata', query),
+
+  fetchMetadataArtwork: (releaseGroupId: string): Promise<string | null> =>
+    ipcRenderer.invoke('song:fetchMetadataArtwork', releaseGroupId),
 
   readSongMidi: (songPath: string): Promise<{ type: 'midi' | 'chart'; data: string } | null> =>
     ipcRenderer.invoke('song:readMidi', songPath),
