@@ -953,9 +953,12 @@ ipcMain.handle('song:searchMetadata', async (_event, rawRequest: SongMetadataSea
 
   const musicBrainzRequest = async (): Promise<SongMetadataSearchResult[]> => {
     // MusicBrainz asks clients to stay at or below one request per second.
-    const waitMs = 1000 - (Date.now() - lastMusicBrainzRequestAt)
+    // Reserve the slot before sleeping so overlapping searches queue behind
+    // each other instead of firing together.
+    const slot = Math.max(Date.now(), lastMusicBrainzRequestAt + 1000)
+    lastMusicBrainzRequestAt = slot
+    const waitMs = slot - Date.now()
     if (waitMs > 0) await new Promise((resolveWait) => setTimeout(resolveWait, waitMs))
-    lastMusicBrainzRequestAt = Date.now()
     const params = new URLSearchParams({
       query: buildMusicBrainzQuery(request),
       fmt: 'json',
