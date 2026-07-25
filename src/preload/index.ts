@@ -74,16 +74,6 @@ const api = {
   ): Promise<{ success: boolean; error?: string }> =>
     ipcRenderer.invoke('song:exportCon', songPath, metadata, outputPath),
 
-  importSng: (
-    sngFilePath: string
-  ): Promise<{ success: boolean; targetDir?: string; error?: string }> =>
-    ipcRenderer.invoke('song:importSng', sngFilePath),
-
-  importCon: (
-    conFilePath: string
-  ): Promise<{ success: boolean; targetDirs?: string[]; error?: string }> =>
-    ipcRenderer.invoke('song:importCon', conFilePath),
-
   fileExists: (filePath: string): Promise<boolean> =>
     ipcRenderer.invoke('fs:fileExists', filePath),
 

@@ -35,12 +35,6 @@ interface ChartEditorAPI {
     metadata: Record<string, unknown>,
     outputPath: string
   ) => Promise<{ success: boolean; error?: string }>
-  importSng: (
-    sngFilePath: string
-  ) => Promise<{ success: boolean; targetDir?: string; error?: string }>
-  importCon: (
-    conFilePath: string
-  ) => Promise<{ success: boolean; targetDirs?: string[]; error?: string }>
   fileExists: (filePath: string) => Promise<boolean>
 
   // Album art APIs

@@ -1,16 +1,16 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { parseDta } from './dtaParser'
-import { decryptMoggBuffer } from './moggDecrypt'
+import { decryptBytes, decryptMoggBuffer } from './moggDecrypt'
 import { importSng, resolveSngOutputPath } from './sngImporter'
 import { importCon, StfsParser } from './conImporter'
 import { getBlockPatternShift0, packRb3con, oggToMogg } from '../conPacker'
 import { packSng } from '../sngPacker'
-import { join } from 'path'
+import { join, resolve } from 'path'
 import { existsSync } from 'fs'
 import { mkdir, writeFile, readFile, rm } from 'fs/promises'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
-import { createHash } from 'crypto'
+import { createCipheriv, createHash } from 'crypto'
 
 const execFileAsync = promisify(execFile)
 
@@ -274,7 +274,9 @@ describe('sngImporter Integration', () => {
 
 describe('resolveSngOutputPath', () => {
   it('keeps package files inside the target song directory', () => {
-    const targetDir = join('/tmp', 'octave-song')
+    // resolve() so the expectation carries a drive letter on Windows, matching
+    // the resolved path the function returns.
+    const targetDir = resolve('/tmp', 'octave-song')
     expect(resolveSngOutputPath(targetDir, 'audio/guitar.ogg')).toBe(
       join(targetDir, 'audio/guitar.ogg')
     )
@@ -288,6 +290,66 @@ describe('resolveSngOutputPath', () => {
       )
     }
   )
+})
+
+describe('decryptBytes', () => {
+  const mask64 = 0xffffffffffffffffn
+
+  /** Straightforward per-block CTR reference: one ECB encryption per 16-byte counter. */
+  function referenceDecrypt(
+    buffer: Buffer,
+    startPos: number,
+    count: number,
+    key: Buffer,
+    initialCounter: Buffer
+  ): void {
+    const low0 = initialCounter.readBigUInt64LE(0)
+    const high0 = initialCounter.readBigUInt64LE(8)
+    for (let i = 0; i < count; i++) {
+      const pos = startPos + i
+      const counter = Buffer.alloc(16)
+      const newLow = (low0 + BigInt(Math.floor(pos / 16))) & mask64
+      const newHigh = newLow < low0 ? (high0 + 1n) & mask64 : high0
+      counter.writeBigUInt64LE(newLow, 0)
+      counter.writeBigUInt64LE(newHigh, 8)
+      const cipher = createCipheriv('aes-128-ecb', key, null)
+      cipher.setAutoPadding(false)
+      const keystream = Buffer.concat([cipher.update(counter), cipher.final()])
+      buffer[i] ^= keystream[pos % 16]
+    }
+  }
+
+  function deterministicBytes(size: number, seed: string): Buffer {
+    const out = Buffer.alloc(size)
+    let digest = createHash('sha256').update(seed).digest()
+    for (let offset = 0; offset < size; offset += digest.length) {
+      digest.copy(out, offset, 0, Math.min(digest.length, size - offset))
+      digest = createHash('sha256').update(digest).digest()
+    }
+    return out
+  }
+
+  const key = createHash('md5').update('decrypt-bytes-key').digest()
+
+  it('matches the per-block reference at an unaligned mid-stream offset', () => {
+    const counter = createHash('md5').update('decrypt-bytes-counter').digest()
+    const data = deterministicBytes(5000, 'payload')
+    const expected = Buffer.from(data)
+    referenceDecrypt(expected, 32, expected.length, key, counter)
+    decryptBytes(data, 32, data.length, key, counter)
+    expect(data.equals(expected)).toBe(true)
+  })
+
+  it('carries into the high counter half when the low half wraps', () => {
+    const counter = Buffer.alloc(16)
+    counter.writeBigUInt64LE(mask64 - 1n, 0)
+    counter.writeBigUInt64LE(0x0123456789abcdefn, 8)
+    const data = deterministicBytes(256, 'wrap-payload')
+    const expected = Buffer.from(data)
+    referenceDecrypt(expected, 0, expected.length, key, counter)
+    decryptBytes(data, 0, data.length, key, counter)
+    expect(data.equals(expected)).toBe(true)
+  })
 })
 
 describe('CON packer/importer synthetic round-trip', () => {

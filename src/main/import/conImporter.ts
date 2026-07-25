@@ -132,7 +132,10 @@ export class StfsParser {
       throw new Error(`Invalid STFS package magic header: "${magic}".`)
     }
 
-    const metadataOffset = magic === 'CON ' ? 0x22c : 0x104
+    // The metadata block starts at 0x22C for every package type: CON packages
+    // fill 0x004-0x22C with a console cert + signature, while LIVE/PIRS carry
+    // a 0x100-byte package signature followed by padding up to the same offset.
+    const metadataOffset = 0x22c
     const volDescOffset = metadataOffset + 0x14d
 
     const fileTableBlockCount = this.buffer.readUInt16LE(volDescOffset + 3)
@@ -237,18 +240,27 @@ function findFileCaseInsensitive(
 function findExtensionFile(
   entries: Record<string, Buffer>,
   shortname: string,
-  ext: string
+  ext: string,
+  allowGlobalFallback: boolean
 ): Buffer | null {
-  const targetEnd = `${shortname.toLowerCase()}.${ext.toLowerCase()}`
+  const short = shortname.toLowerCase()
+  const extEnd = `.${ext.toLowerCase()}`
+  const targetEnd = `${short}${extEnd}`
   for (const [key, value] of Object.entries(entries)) {
     const normKey = key.toLowerCase().replace(/\\/g, '/')
-    if (normKey.endsWith(targetEnd)) {
+    // Anchor at a path-segment boundary so shortname "song" cannot match
+    // "notmysong.mid".
+    if (normKey === targetEnd || normKey.endsWith('/' + targetEnd)) {
       return value
     }
   }
   for (const [key, value] of Object.entries(entries)) {
     const normKey = key.toLowerCase().replace(/\\/g, '/')
-    if (normKey.endsWith('.' + ext.toLowerCase())) {
+    if (!normKey.endsWith(extEnd)) continue
+    // In a multi-song pack, only fall back to files inside this song's own
+    // directory; a global fallback could pair a song with another song's
+    // chart or audio.
+    if (allowGlobalFallback || normKey.split('/').includes(short)) {
       return value
     }
   }
@@ -287,9 +299,10 @@ export async function importCon(
   const importedDirs: string[] = []
 
   try {
+    const isSingleSongPack = Object.keys(songs).length === 1
     for (const [shortname, song] of Object.entries(songs)) {
-      const midiBuffer = findExtensionFile(entries, shortname, 'mid')
-      const moggBuffer = findExtensionFile(entries, shortname, 'mogg')
+      const midiBuffer = findExtensionFile(entries, shortname, 'mid', isSingleSongPack)
+      const moggBuffer = findExtensionFile(entries, shortname, 'mogg', isSingleSongPack)
 
       if (!midiBuffer) {
         throw new Error(`MIDI file not found for song: ${shortname}`)

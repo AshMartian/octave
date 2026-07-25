@@ -1254,47 +1254,6 @@ ipcMain.handle(
   }
 )
 
-// Import song from .sng package
-ipcMain.handle('song:importSng', async (_event, sngFilePath: string) => {
-  if (!allowedProjectPath) {
-    return {
-      success: false,
-      error: 'No active song library is loaded. Please open a library folder first.'
-    }
-  }
-  try {
-    const resolvedSng = resolve(sngFilePath)
-    const targetDir = await importSng(resolvedSng, allowedProjectPath)
-    return { success: true, targetDir }
-  } catch (error) {
-    console.error('Error importing SNG:', error)
-    return { success: false, error: error instanceof Error ? error.message : String(error) }
-  }
-})
-
-// Import song from .con/.rb3con STFS package
-ipcMain.handle('song:importCon', async (_event, conFilePath: string) => {
-  if (!allowedProjectPath) {
-    return {
-      success: false,
-      error: 'No active song library is loaded. Please open a library folder first.'
-    }
-  }
-  try {
-    const resolvedCon = resolve(conFilePath)
-    const targetDirs = await importCon(resolvedCon, allowedProjectPath)
-    return { success: true, targetDirs }
-  } catch (error) {
-    console.error('Error importing CON:', error)
-    const targetDirs = error instanceof PartialImportError ? error.importedDirs : undefined
-    return {
-      success: false,
-      ...(targetDirs ? { targetDirs } : {}),
-      error: error instanceof Error ? error.message : String(error)
-    }
-  }
-})
-
 // Check if a file exists
 ipcMain.handle('fs:fileExists', async (_event, filePath: string) => {
   try {

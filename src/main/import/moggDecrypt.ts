@@ -501,53 +501,48 @@ function flipEndianness(val: number): number {
   )
 }
 
-function decryptBytes(
+// Keystream is produced in batches so a single ECB cipher call covers many
+// counter blocks; per-16-byte cipher instantiation froze the main process for
+// minutes on real-world encrypted moggs.
+const KEYSTREAM_CHUNK_BLOCKS = 65536 // 1 MiB of keystream per batch
+
+export function decryptBytes(
   buffer: Buffer,
   startPos: number,
   count: number,
   key: Buffer,
   initialCounter: Buffer
 ): void {
-  let decryptedPos = startPos
-  let counterLoc = decryptedPos % 16
-
-  const counter = Buffer.alloc(16)
-  const cryptedCounter = Buffer.alloc(16)
-
-  const fixCounter = (pos: number): void => {
-    initialCounter.copy(counter)
-    const low = counter.readBigUInt64LE(0)
-    const high = counter.readBigUInt64LE(8)
-    const offset = BigInt(pos >> 4)
-
-    const newLow = low + offset
-    let newHigh = high
-    if (newLow < low) {
-      newHigh += 1n
-    }
-    counter.writeBigUInt64LE(newLow & 0xffffffffffffffffn, 0)
-    counter.writeBigUInt64LE(newHigh & 0xffffffffffffffffn, 8)
-  }
-
-  fixCounter(decryptedPos)
+  const mask64 = 0xffffffffffffffffn
+  const low0 = initialCounter.readBigUInt64LE(0)
+  const high0 = initialCounter.readBigUInt64LE(8)
 
   const cipher = crypto.createCipheriv('aes-128-ecb', key, null)
   cipher.setAutoPadding(false)
-  const keystream = Buffer.concat([cipher.update(counter), cipher.final()])
-  keystream.copy(cryptedCounter)
 
-  for (let i = 0; i < count; i++) {
-    if (decryptedPos !== startPos && decryptedPos % 16 === 0) {
-      fixCounter(decryptedPos)
-      counterLoc = 0
-      const c = crypto.createCipheriv('aes-128-ecb', key, null)
-      c.setAutoPadding(false)
-      const ks = Buffer.concat([c.update(counter), c.final()])
-      ks.copy(cryptedCounter)
+  let done = 0
+  while (done < count) {
+    const pos = startPos + done
+    const firstBlock = Math.floor(pos / 16)
+    const offsetInBlock = pos % 16
+    const bytesThisChunk = Math.min(count - done, KEYSTREAM_CHUNK_BLOCKS * 16 - offsetInBlock)
+    const blockCount = Math.ceil((offsetInBlock + bytesThisChunk) / 16)
+
+    // The MOGG counter is a 128-bit little-endian integer: the low 8 bytes
+    // increment per block and carry into the high 8 bytes on wrap.
+    const counters = Buffer.alloc(blockCount * 16)
+    for (let block = 0; block < blockCount; block++) {
+      const newLow = (low0 + BigInt(firstBlock + block)) & mask64
+      const newHigh = newLow < low0 ? (high0 + 1n) & mask64 : high0
+      counters.writeBigUInt64LE(newLow, block * 16)
+      counters.writeBigUInt64LE(newHigh, block * 16 + 8)
     }
-    buffer[i] ^= cryptedCounter[counterLoc]
-    decryptedPos++
-    counterLoc++
+
+    const keystream = cipher.update(counters)
+    for (let i = 0; i < bytesThisChunk; i++) {
+      buffer[done + i] ^= keystream[offsetInBlock + i]
+    }
+    done += bytesThisChunk
   }
 }
 
