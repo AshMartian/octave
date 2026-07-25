@@ -4,9 +4,10 @@ import type { MetadataArtwork, SongMetadataSearchRequest, SongMetadataSearchResu
 interface ChartEditorAPI {
   // Dialog APIs
   openFolder: () => Promise<string | null>
+  importSongPackage: () => Promise<string | null>
 
   // Folder APIs
-  scanFolder: (folderPath: string) => Promise<Array<{ id: string; path: string; name: string }>>
+  scanFolder: (folderPath: string) => Promise<Array<{ id: string; path: string; name: string; addedAt: number }>>
 
   // Dialog APIs
   openAudioDialog: () => Promise<string | null>
@@ -28,6 +29,11 @@ interface ChartEditorAPI {
   writeSongMidi: (songPath: string, midiBase64: string) => Promise<boolean>
   writeSongChart: (songPath: string, chartText: string) => Promise<boolean>
   exportSng: (
+    songPath: string,
+    metadata: Record<string, unknown>,
+    outputPath: string
+  ) => Promise<{ success: boolean; error?: string }>
+  exportCon: (
     songPath: string,
     metadata: Record<string, unknown>,
     outputPath: string

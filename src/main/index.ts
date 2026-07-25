@@ -1,6 +1,6 @@
 import { app, shell, BrowserWindow, ipcMain, dialog, protocol, net, Menu, session } from 'electron'
 import { join, resolve, basename } from 'path'
-import { readdir, readFile, writeFile, stat, rename, copyFile, unlink, mkdir } from 'fs/promises'
+import { readdir, readFile, writeFile, stat, rename, copyFile, unlink, mkdir, open } from 'fs/promises'
 import { existsSync, readFileSync } from 'fs'
 import { execFile, spawn } from 'child_process'
 import { randomUUID } from 'crypto'
@@ -11,6 +11,15 @@ import ffmpeg from 'fluent-ffmpeg'
 import { cancelAutoChart, getStrumRequirementsPath, killAllRunningJobs, openStrumLogsFolder, resolvePythonCommand, runAutoChart } from './strumIntegration/runner'
 import { ensureBootstrappedPython, getRuntimeStatus, isBootstrapTarget } from './strumIntegration/runtimeBootstrap'
 import { packSng } from './sngPacker'
+import { packRb3con } from './conPacker'
+import { importSng } from './import/sngImporter'
+import { importCon } from './import/conImporter'
+import {
+  ImportCancelledError,
+  PartialImportError,
+  type ImportConflictPolicy,
+  type ImportConflictResolver
+} from './import/importPath'
 import {
   buildMusicBrainzQuery,
   mergeMetadataResults,
@@ -522,6 +531,134 @@ ipcMain.handle('dialog:openFolder', async () => {
   return result.filePaths[0]
 })
 
+// Import song package dialog
+ipcMain.handle('dialog:importSongPackage', async () => {
+  let targetLibrary = allowedProjectPath
+
+  if (!targetLibrary) {
+    // No library folder is open yet - ask to open one
+    const libChoiceResult = await dialog.showMessageBox({
+      type: 'question',
+      buttons: ['Select Library Folder', 'Cancel'],
+      defaultId: 0,
+      title: 'No Library Folder Open',
+      message:
+        'A song library folder must be open to import packages. Would you like to select a song library folder now?'
+    })
+
+    if (libChoiceResult.response === 1) {
+      return null
+    }
+
+    const libResult = await dialog.showOpenDialog({
+      properties: ['openDirectory'],
+      title: 'Select Songs Folder'
+    })
+
+    if (libResult.canceled || libResult.filePaths.length === 0) {
+      return null
+    }
+
+    targetLibrary = resolve(libResult.filePaths[0])
+    allowedProjectPath = targetLibrary
+  }
+
+  // Select the package file to import
+  const fileResult = await dialog.showOpenDialog({
+    properties: ['openFile', 'multiSelections'],
+    title: 'Select Song Package Files (.sng or rb3con)',
+    filters: [
+      { name: 'Song Packages', extensions: ['sng', 'con', 'live', 'rb3con'] },
+      { name: 'All Files', extensions: ['*'] }
+    ]
+  })
+
+  if (fileResult.canceled || fileResult.filePaths.length === 0) {
+    // If they just opened the library but cancelled the file selection,
+    // we should still return the library so it gets loaded in the explorer!
+    return targetLibrary
+  }
+
+  const failures: Array<{ filePath: string; error: string }> = []
+  let importedCount = 0
+  let skippedCount = 0
+  let cancelled = false
+  let conflictPolicy: ImportConflictPolicy | null = null
+
+  const resolveConflict: ImportConflictResolver = async (destinationPath) => {
+    if (conflictPolicy) return conflictPolicy
+
+    const conflictResult = await dialog.showMessageBox({
+      type: 'question',
+      buttons: ['Skip', 'Create New', 'Overwrite', 'Cancel'],
+      defaultId: 1,
+      cancelId: 3,
+      title: 'Song Already Exists',
+      message: `A song folder named “${basename(destinationPath)}” already exists.`,
+      detail: 'Choose how to handle this and all other conflicts in the current import operation.'
+    })
+    conflictPolicy = (['skip', 'create-new', 'overwrite', 'cancel'] as const)[
+      conflictResult.response
+    ]
+    return conflictPolicy
+  }
+
+  // Import sequentially to keep disk and memory pressure bounded for large packages.
+  for (const selectedPath of fileResult.filePaths) {
+    try {
+      const fileHandle = await open(selectedPath, 'r')
+      const magicBuffer = Buffer.alloc(6)
+      try {
+        await fileHandle.read(magicBuffer, 0, 6, 0)
+      } finally {
+        await fileHandle.close()
+      }
+
+      const magic6 = magicBuffer.toString('ascii')
+      const magic4 = magicBuffer.subarray(0, 4).toString('ascii')
+      let importedSongs = 0
+      if (magic6 === 'SNGPKG') {
+        importedSongs = (await importSng(selectedPath, targetLibrary, resolveConflict)) ? 1 : 0
+      } else if (magic4 === 'CON ' || magic4 === 'LIVE' || magic4 === 'PIRS') {
+        importedSongs = (await importCon(selectedPath, targetLibrary, resolveConflict)).length
+      } else {
+        throw new Error('Unrecognized package header')
+      }
+      if (importedSongs > 0) importedCount += 1
+      else skippedCount += 1
+    } catch (error) {
+      const partialDirs =
+        error instanceof ImportCancelledError || error instanceof PartialImportError
+          ? error.importedDirs
+          : []
+      if (partialDirs.length > 0) importedCount += 1
+      if (error instanceof ImportCancelledError) {
+        cancelled = true
+        break
+      }
+      const message = error instanceof Error ? error.message : String(error)
+      failures.push({ filePath: selectedPath, error: message })
+      console.error(`Failed to import package file ${selectedPath}:`, error)
+    }
+  }
+
+  const failureDetails = failures
+    .map(({ filePath, error }) => `• ${filePath.split(/[\\/]/).pop()}: ${error}`)
+    .join('\n')
+  await dialog.showMessageBox({
+    type: failures.length === 0 ? 'info' : importedCount > 0 ? 'warning' : 'error',
+    title: cancelled
+      ? 'Import Cancelled'
+      : failures.length === 0
+        ? 'Import Complete'
+        : 'Import Completed with Errors',
+    message: `${importedCount} package${importedCount === 1 ? '' : 's'} imported${skippedCount ? `; ${skippedCount} skipped` : ''}.`,
+    ...(failureDetails ? { detail: failureDetails } : {})
+  })
+
+  return targetLibrary
+})
+
 // Open audio file dialog
 ipcMain.handle('dialog:openAudio', async () => {
   const result = await dialog.showOpenDialog({
@@ -746,18 +883,20 @@ ipcMain.handle('folder:scan', async (_event, folderPath: string) => {
   if (!allowedProjectPath) {
     allowedProjectPath = resolve(folderPath)
   }
-  const songs: Array<{ id: string; path: string; name: string }> = []
+  const songs: Array<{ id: string; path: string; name: string; addedAt: number }> = []
 
   try {
     // Check if the opened folder itself is a song (contains song.ini)
     const selfIniPath = join(folderPath, 'song.ini')
     try {
       await stat(selfIniPath)
+      const folderStat = await stat(folderPath)
       const folderName = folderPath.split(/[\\/]/).pop() || 'song'
       songs.push({
         id: folderName,
         path: folderPath,
-        name: folderName
+        name: folderName,
+        addedAt: folderStat.birthtimeMs || folderStat.ctimeMs
       })
     } catch {
       // Not a song folder itself — scan children
@@ -773,10 +912,12 @@ ipcMain.handle('folder:scan', async (_event, folderPath: string) => {
 
         try {
           await stat(iniPath)
+          const folderStat = await stat(songPath)
           songs.push({
             id: entry.name,
             path: songPath,
-            name: entry.name
+            name: entry.name,
+            addedAt: folderStat.birthtimeMs || folderStat.ctimeMs
           })
         } catch {
           // No song.ini, skip this folder
@@ -1097,6 +1238,39 @@ ipcMain.handle('song:exportSng', async (_event, songPath: string, metadata: Reco
     return { success: false, error: error instanceof Error ? error.message : String(error) }
   }
 })
+
+// Export song to .con (Rock Band 3 STFS) package
+ipcMain.handle(
+  'song:exportCon',
+  async (_event, songPath: string, metadata: Record<string, unknown>, outputPath: string) => {
+    if (!isPathAllowed(songPath)) {
+      return { success: false, error: 'Path to song directory not allowed' }
+    }
+
+    const resolvedOutput = resolve(outputPath)
+    const parentDir = resolve(resolvedOutput, '..')
+    try {
+      const parentStat = await stat(parentDir)
+      if (!parentStat.isDirectory()) {
+        return { success: false, error: 'Output directory does not exist' }
+      }
+    } catch {
+      return { success: false, error: 'Output directory does not exist or is inaccessible' }
+    }
+
+    try {
+      await packRb3con(
+        songPath,
+        metadata as Record<string, string | number | boolean>,
+        resolvedOutput
+      )
+      return { success: true }
+    } catch (error) {
+      console.error('Error packing CON:', error)
+      return { success: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  }
+)
 
 // Check if a file exists
 ipcMain.handle('fs:fileExists', async (_event, filePath: string) => {
