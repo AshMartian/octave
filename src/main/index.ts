@@ -11,6 +11,15 @@ import ffmpeg from 'fluent-ffmpeg'
 import { cancelAutoChart, getStrumRequirementsPath, killAllRunningJobs, openStrumLogsFolder, resolvePythonCommand, runAutoChart } from './strumIntegration/runner'
 import { ensureBootstrappedPython, getRuntimeStatus, isBootstrapTarget } from './strumIntegration/runtimeBootstrap'
 import { packSng } from './sngPacker'
+import {
+  buildMusicBrainzQuery,
+  mergeMetadataResults,
+  parseMusicBrainzSearchResponse,
+  parseTheAudioDbSearchResponse,
+  type MetadataArtwork,
+  type SongMetadataSearchRequest,
+  type SongMetadataSearchResult
+} from '../shared/songMetadata'
 import { createApplicationMenuTemplate } from './applicationMenu'
 
 // Point fluent-ffmpeg at the bundled static binary
@@ -74,6 +83,11 @@ const RENDERER_CSP = [
   "media-src 'self' song-file: https: http: blob:",
   "connect-src 'self' song-file: https: http: blob:"
 ].join('; ')
+const metadataSearchCache = new Map<
+  string,
+  { expiresAt: number; results: SongMetadataSearchResult[] }
+>()
+let lastMusicBrainzRequestAt = 0
 
 function broadcastUpdaterState(payload: UpdaterState): void {
   const windows = BrowserWindow.getAllWindows()
@@ -843,6 +857,90 @@ ipcMain.handle('song:writeIni', async (_event, songPath: string, metadata: Recor
   }
 })
 
+ipcMain.handle('song:searchMetadata', async (_event, rawRequest: SongMetadataSearchRequest) => {
+  const requestedArtist = rawRequest.artist.trim()
+  const request = {
+    artist: /^unknown(?: artist)?$/i.test(requestedArtist)
+      ? ''
+      : requestedArtist.slice(0, 120),
+    title: rawRequest.title.trim().slice(0, 160),
+    durationMs: rawRequest.durationMs
+  }
+  if (!request.title) return []
+  const cacheKey = `${request.artist}\n${request.title}\n${request.durationMs ?? ''}`.toLocaleLowerCase()
+  const cached = metadataSearchCache.get(cacheKey)
+  if (cached && cached.expiresAt > Date.now()) return cached.results
+
+  const musicBrainzRequest = async (): Promise<SongMetadataSearchResult[]> => {
+    // MusicBrainz asks clients to stay at or below one request per second.
+    // Reserve the slot before sleeping so overlapping searches queue behind
+    // each other instead of firing together.
+    const slot = Math.max(Date.now(), lastMusicBrainzRequestAt + 1000)
+    lastMusicBrainzRequestAt = slot
+    const waitMs = slot - Date.now()
+    if (waitMs > 0) await new Promise((resolveWait) => setTimeout(resolveWait, waitMs))
+    const params = new URLSearchParams({
+      query: buildMusicBrainzQuery(request),
+      fmt: 'json',
+      limit: '15'
+    })
+    const response = await net.fetch(`https://musicbrainz.org/ws/2/recording/?${params}`, {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': `OCTAVE/${app.getVersion()} (https://github.com/opria123/octave)`
+      }
+    })
+    if (!response.ok) throw new Error(`MusicBrainz search failed (${response.status}).`)
+    return parseMusicBrainzSearchResponse(await response.json(), request)
+  }
+
+  const theAudioDbRequest = async (): Promise<SongMetadataSearchResult[]> => {
+    if (!request.artist) return []
+    const params = new URLSearchParams({ s: request.artist, t: request.title })
+    const response = await net.fetch(
+      `https://www.theaudiodb.com/api/v1/json/123/searchtrack.php?${params}`
+    )
+    if (!response.ok) throw new Error(`TheAudioDB search failed (${response.status}).`)
+    return parseTheAudioDbSearchResponse(await response.json(), request)
+  }
+
+  const providerResults = await Promise.allSettled([musicBrainzRequest(), theAudioDbRequest()])
+  const successful = providerResults.flatMap((result) =>
+    result.status === 'fulfilled' ? [result.value] : []
+  )
+  if (successful.length === 0) throw new Error('All metadata providers failed.')
+  const results = mergeMetadataResults(...successful)
+  metadataSearchCache.set(cacheKey, { expiresAt: Date.now() + 5 * 60_000, results })
+  return results
+})
+
+ipcMain.handle('song:fetchMetadataArtwork', async (_event, artwork: MetadataArtwork) => {
+  let artworkUrl: string
+  if (artwork.source === 'cover-art-archive') {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(artwork.releaseGroupId)) {
+      return null
+    }
+    artworkUrl = `https://coverartarchive.org/release-group/${artwork.releaseGroupId}/front-500`
+  } else {
+    const url = new URL(artwork.url)
+    if (url.protocol !== 'https:' || !['theaudiodb.com', 'www.theaudiodb.com', 'r2.theaudiodb.com'].includes(url.hostname)) {
+      return null
+    }
+    artworkUrl = url.toString()
+  }
+
+  const response = await net.fetch(artworkUrl, {
+    headers: { 'User-Agent': `OCTAVE/${app.getVersion()} (https://github.com/opria123/octave)` }
+  })
+  if (response.status === 404) return null
+  if (!response.ok) throw new Error(`Cover Art Archive lookup failed (${response.status}).`)
+  const contentType = response.headers.get('content-type')?.split(';')[0]
+  if (contentType !== 'image/jpeg' && contentType !== 'image/png') return null
+  const buffer = Buffer.from(await response.arrayBuffer())
+  if (buffer.length > 10 * 1024 * 1024) throw new Error('Album artwork is too large to import.')
+  return `data:${contentType};base64,${buffer.toString('base64')}`
+})
+
 // Read notes.mid file (also returns chart format info)
 ipcMain.handle('song:readMidi', async (_event, songPath: string) => {
   if (!isPathAllowed(songPath)) return null
@@ -1119,6 +1217,11 @@ ipcMain.handle('song:writeAlbumArt', async (_event, songPath: string, dataUrl: s
 
     const artPath = join(songPath, `album.${ext}`)
     await writeFile(artPath, buffer)
+    await Promise.allSettled(
+      ['png', 'jpg', 'jpeg']
+        .filter((candidate) => candidate !== ext)
+        .map((candidate) => unlink(join(songPath, `album.${candidate}`)))
+    )
     return true
   } catch (error) {
     console.error('Error writing album art:', error)

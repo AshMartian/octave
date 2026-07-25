@@ -1,4 +1,5 @@
 import { ElectronAPI } from '@electron-toolkit/preload'
+import type { MetadataArtwork, SongMetadataSearchRequest, SongMetadataSearchResult } from '../shared/songMetadata'
 
 interface ChartEditorAPI {
   // Dialog APIs
@@ -21,6 +22,8 @@ interface ChartEditorAPI {
   deleteSongFolder: (songPath: string) => Promise<boolean>
   readSongIni: (songPath: string) => Promise<Record<string, string | number> | null>
   writeSongIni: (songPath: string, metadata: Record<string, unknown>) => Promise<boolean>
+  searchSongMetadata: (request: SongMetadataSearchRequest) => Promise<SongMetadataSearchResult[]>
+  fetchMetadataArtwork: (artwork: MetadataArtwork) => Promise<string | null>
   readSongMidi: (songPath: string) => Promise<{ type: 'midi' | 'chart'; data: string } | null>
   writeSongMidi: (songPath: string, midiBase64: string) => Promise<boolean>
   writeSongChart: (songPath: string, chartText: string) => Promise<boolean>

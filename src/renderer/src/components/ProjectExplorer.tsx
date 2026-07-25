@@ -4,6 +4,7 @@ import { useProjectStore, useSettingsStore, getSongStore, removeSongStore } from
 import * as audioService from '../services/audioService'
 import { parseMidiBase64, parseChartFile } from '../utils/midiParser'
 import type { SongMetadata, Instrument, VideoSync, AudioSync, VenueTrackData } from '../types'
+import { subscribeAlbumArtUpdates } from '../utils/albumArtEvents'
 import './ProjectExplorer.css'
 
 interface SongEntry {
@@ -50,6 +51,13 @@ function useAlbumArt(folderPath: string): string | null {
 
     return () => { mounted = false }
   }, [folderPath])
+
+  useEffect(() =>
+    subscribeAlbumArtUpdates((update) => {
+      if (update.folderPath !== folderPath) return
+      albumArtCache.set(folderPath, update.dataUrl)
+      setArtUrl(update.dataUrl)
+    }), [folderPath])
 
   return artUrl
 }
