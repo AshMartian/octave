@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow, ipcMain, dialog, protocol, net, Menu, session, type MenuItemConstructorOptions } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, dialog, protocol, net, Menu, session } from 'electron'
 import { join, resolve, basename } from 'path'
 import { readdir, readFile, writeFile, stat, rename, copyFile, unlink, mkdir } from 'fs/promises'
 import { existsSync, readFileSync } from 'fs'
@@ -20,6 +20,7 @@ import {
   type SongMetadataSearchRequest,
   type SongMetadataSearchResult
 } from '../shared/songMetadata'
+import { createApplicationMenuTemplate } from './applicationMenu'
 
 // Point fluent-ffmpeg at the bundled static binary
 try {
@@ -266,94 +267,13 @@ function sendMenuCommand(command: string, payload?: unknown): void {
 }
 
 function createApplicationMenu(): void {
-  const template: MenuItemConstructorOptions[] = [
-    {
-      label: 'File',
-      submenu: [
-        {
-          label: 'New',
-          accelerator: 'CmdOrCtrl+N',
-          click: () => sendMenuCommand('file:new-song')
-        },
-        {
-          label: 'Open',
-          accelerator: 'CmdOrCtrl+O',
-          click: () => sendMenuCommand('file:open-folder')
-        },
-        { type: 'separator' },
-        {
-          label: 'Settings',
-          accelerator: 'CmdOrCtrl+,',
-          click: () => sendMenuCommand('file:open-settings')
-        }
-      ]
-    },
-    {
-      label: 'Edit',
-      submenu: [
-        { role: 'undo', label: 'Undo' },
-        { role: 'redo', label: 'Redo' }
-      ]
-    },
-    {
-      label: 'View',
-      submenu: [
-        {
-          label: 'File Explorer',
-          type: 'checkbox',
-          checked: true,
-          click: (item) => sendMenuCommand('view:toggle-panel', { panel: 'explorer', visible: item.checked })
-        },
-        {
-          label: 'Preview',
-          type: 'checkbox',
-          checked: true,
-          click: (item) => sendMenuCommand('view:toggle-panel', { panel: 'preview', visible: item.checked })
-        },
-        {
-          label: 'Properties',
-          type: 'checkbox',
-          checked: true,
-          click: (item) => sendMenuCommand('view:toggle-panel', { panel: 'properties', visible: item.checked })
-        },
-        { type: 'separator' },
-        {
-          label: 'Piano Roll',
-          type: 'checkbox',
-          checked: true,
-          click: (item) => sendMenuCommand('view:toggle-panel', { panel: 'midi', visible: item.checked })
-        },
-        {
-          label: 'Timeline',
-          type: 'checkbox',
-          checked: true,
-          click: (item) => sendMenuCommand('view:toggle-panel', { panel: 'video', visible: item.checked })
-        }
-      ]
-    },
-    {
-      label: 'Help',
-      submenu: [
-        {
-          label: `Version ${app.getVersion()}`,
-          enabled: false
-        },
-        { type: 'separator' },
-        {
-          label: 'GitHub Repository',
-          click: () => {
-            void shell.openExternal('https://github.com/opria123/octave')
-          }
-        },
-        {
-          label: 'Support',
-          click: () => {
-            void shell.openExternal('https://github.com/opria123/octave/issues')
-          }
-        }
-      ]
+  const template = createApplicationMenuTemplate({
+    version: app.getVersion(),
+    sendCommand: sendMenuCommand,
+    openExternal: (url) => {
+      void shell.openExternal(url)
     }
-  ]
+  })
 
   const menu = Menu.buildFromTemplate(template)
   Menu.setApplicationMenu(menu)
