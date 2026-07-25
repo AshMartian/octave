@@ -53,6 +53,12 @@ export function Toolbar(): React.JSX.Element {
     leftyFlip,
     enableAutoChart,
     autoChartOutputDir,
+    autoChartDisableOnlineLookup,
+    autoChartDownloadVideo,
+    autoChartKeepStems,
+    autoChartImproveTempo,
+    autoChartSnapDrums,
+    autoChartEnabledTracks,
     updateSettings
   } = useSettingsStore()
   const [isAudioLoaded, setIsAudioLoaded] = useState(false)
@@ -97,11 +103,6 @@ export function Toolbar(): React.JSX.Element {
   })
   const [autoChartStemSongs, setAutoChartStemSongs] = useState<StemSong[]>([makeEmptyStemSong()])
   const [autoChartUrls, setAutoChartUrls] = useState<string[]>([EMPTY_AUTO_CHART_URL])
-  const [autoChartDisableOnlineLookup, setAutoChartDisableOnlineLookup] = useState(false)
-  const [autoChartDownloadVideo, setAutoChartDownloadVideo] = useState(true)
-  const [autoChartKeepStems, setAutoChartKeepStems] = useState(false)
-  const [autoChartImproveTempo, setAutoChartImproveTempo] = useState(true)
-  const [autoChartSnapDrums, setAutoChartSnapDrums] = useState(false)
   // Optional single-BPM hint typed by the user, treated as authoritative. Empty
   // = detect by beat-tracking the audio (see strum_worker _beat_track_tempo_map).
   const [autoChartManualBpm, setAutoChartManualBpm] = useState('')
@@ -111,23 +112,6 @@ export function Toolbar(): React.JSX.Element {
   const [autoChartTempoEvents, setAutoChartTempoEvents] = useState<
     Array<{ timeSec: string; bpm: string }>
   >([])
-  const [autoChartEnabledTracks, setAutoChartEnabledTracks] = useState<{
-    drums: boolean
-    guitar: boolean
-    bass: boolean
-    vocals: boolean
-    harmonies: boolean
-    keys: boolean
-    proKeys: boolean
-  }>({
-    drums: true,
-    guitar: true,
-    bass: true,
-    vocals: true,
-    harmonies: true,
-    keys: true,
-    proKeys: true
-  })
   const [autoChartCloseCountdown, setAutoChartCloseCountdown] = useState<number | null>(null)
   const [defaultAutoChartOutputDir, setDefaultAutoChartOutputDir] = useState('')
   const [autoChartErrorCopied, setAutoChartErrorCopied] = useState(false)
@@ -1953,7 +1937,9 @@ export function Toolbar(): React.JSX.Element {
                             type="checkbox"
                             checked={autoChartDisableOnlineLookup}
                             onChange={(event) =>
-                              setAutoChartDisableOnlineLookup(event.target.checked)
+                              updateSettings({
+                                autoChartDisableOnlineLookup: event.target.checked
+                              })
                             }
                             disabled={autoChartProgress.isRunning}
                           />
@@ -1970,7 +1956,9 @@ export function Toolbar(): React.JSX.Element {
                           <input
                             type="checkbox"
                             checked={autoChartDownloadVideo}
-                            onChange={(event) => setAutoChartDownloadVideo(event.target.checked)}
+                            onChange={(event) =>
+                              updateSettings({ autoChartDownloadVideo: event.target.checked })
+                            }
                             disabled={autoChartProgress.isRunning}
                           />
                           <span>
@@ -1986,7 +1974,9 @@ export function Toolbar(): React.JSX.Element {
                           <input
                             type="checkbox"
                             checked={autoChartKeepStems}
-                            onChange={(event) => setAutoChartKeepStems(event.target.checked)}
+                            onChange={(event) =>
+                              updateSettings({ autoChartKeepStems: event.target.checked })
+                            }
                             disabled={autoChartProgress.isRunning}
                           />
                           <span>
@@ -2003,7 +1993,9 @@ export function Toolbar(): React.JSX.Element {
                           <input
                             type="checkbox"
                             checked={autoChartImproveTempo}
-                            onChange={(event) => setAutoChartImproveTempo(event.target.checked)}
+                            onChange={(event) =>
+                              updateSettings({ autoChartImproveTempo: event.target.checked })
+                            }
                             disabled={autoChartProgress.isRunning}
                           />
                           <span>
@@ -2051,7 +2043,9 @@ export function Toolbar(): React.JSX.Element {
                           <input
                             type="checkbox"
                             checked={autoChartSnapDrums}
-                            onChange={(event) => setAutoChartSnapDrums(event.target.checked)}
+                            onChange={(event) =>
+                              updateSettings({ autoChartSnapDrums: event.target.checked })
+                            }
                             disabled={autoChartProgress.isRunning}
                           />
                           <span>
@@ -2089,14 +2083,16 @@ export function Toolbar(): React.JSX.Element {
                                     style={{ fontSize: 11, padding: '2px 8px' }}
                                     disabled={autoChartProgress.isRunning}
                                     onClick={() =>
-                                      setAutoChartEnabledTracks({
-                                        drums: true,
-                                        guitar: true,
-                                        bass: true,
-                                        vocals: true,
-                                        harmonies: true,
-                                        keys: true,
-                                        proKeys: true
+                                      updateSettings({
+                                        autoChartEnabledTracks: {
+                                          drums: true,
+                                          guitar: true,
+                                          bass: true,
+                                          vocals: true,
+                                          harmonies: true,
+                                          keys: true,
+                                          proKeys: true
+                                        }
                                       })
                                     }
                                   >
@@ -2108,14 +2104,16 @@ export function Toolbar(): React.JSX.Element {
                                     style={{ fontSize: 11, padding: '2px 8px' }}
                                     disabled={autoChartProgress.isRunning}
                                     onClick={() =>
-                                      setAutoChartEnabledTracks({
-                                        drums: false,
-                                        guitar: false,
-                                        bass: false,
-                                        vocals: false,
-                                        harmonies: false,
-                                        keys: false,
-                                        proKeys: false
+                                      updateSettings({
+                                        autoChartEnabledTracks: {
+                                          drums: false,
+                                          guitar: false,
+                                          bass: false,
+                                          vocals: false,
+                                          harmonies: false,
+                                          keys: false,
+                                          proKeys: false
+                                        }
                                       })
                                     }
                                   >
@@ -2159,15 +2157,17 @@ export function Toolbar(): React.JSX.Element {
                                           !autoChartEnabledTracks.vocals)
                                       }
                                       onChange={(event) =>
-                                        setAutoChartEnabledTracks((prev) => {
-                                          const next = {
-                                            ...prev,
-                                            [track.key]: event.target.checked
-                                          }
-                                          // Disabling vocals also disables harmonies.
-                                          if (track.key === 'vocals' && !event.target.checked)
-                                            next.harmonies = false
-                                          return next
+                                        updateSettings({
+                                          autoChartEnabledTracks: (() => {
+                                            const next = {
+                                              ...autoChartEnabledTracks,
+                                              [track.key]: event.target.checked
+                                            }
+                                            // Disabling vocals also disables harmonies.
+                                            if (track.key === 'vocals' && !event.target.checked)
+                                              next.harmonies = false
+                                            return next
+                                          })()
                                         })
                                       }
                                     />
