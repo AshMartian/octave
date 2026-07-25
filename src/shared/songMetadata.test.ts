@@ -120,6 +120,42 @@ describe('song metadata search', () => {
     })
   })
 
+  it('keeps distinct non-Latin titles separate while still merging identical ones', () => {
+    const gurenge = {
+      id: 'mb-gurenge',
+      title: '紅蓮華',
+      artist: 'LiSA',
+      sources: ['musicbrainz'] as string[],
+      score: 90
+    }
+    const homura = {
+      id: 'adb-homura',
+      title: '炎',
+      artist: 'LiSA',
+      genre: 'J-Pop',
+      sources: ['theaudiodb'] as string[],
+      score: 80
+    }
+    const gurengeFromAudioDb = {
+      id: 'adb-gurenge',
+      title: '紅蓮華',
+      artist: 'LiSA',
+      genre: 'Anime',
+      sources: ['theaudiodb'] as string[],
+      score: 75
+    }
+
+    const merged = mergeMetadataResults([gurenge], [homura, gurengeFromAudioDb])
+
+    expect(merged).toHaveLength(2)
+    const mergedGurenge = merged.find((result) => result.id === 'mb-gurenge')
+    expect(mergedGurenge).toMatchObject({
+      genre: 'Anime',
+      sources: ['musicbrainz', 'theaudiodb']
+    })
+    expect(merged.find((result) => result.id === 'adb-homura')).toMatchObject({ genre: 'J-Pop' })
+  })
+
   it('drops malformed provider records', () => {
     expect(parseMusicBrainzSearchResponse({ recordings: [{ title: 'No ID' }, null] })).toEqual([])
     expect(parseTheAudioDbSearchResponse({ track: [{ strTrack: 'No ID' }, null] })).toEqual([])

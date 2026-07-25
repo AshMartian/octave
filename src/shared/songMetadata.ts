@@ -71,6 +71,25 @@ function normalize(value: string): string {
     .trim()
 }
 
+// Non-Latin text (e.g. Japanese titles) normalizes to '' above, which would
+// make every such title compare equal. Fall back to a Unicode-aware form that
+// keeps letters from any script.
+function normalizeUnicode(value: string): string {
+  return value
+    .normalize('NFKC')
+    .toLocaleLowerCase()
+    .replace(/[\p{P}\p{S}\s]+/gu, ' ')
+    .trim()
+}
+
+function sameNormalized(a: string, b: string): boolean {
+  const latinA = normalize(a)
+  const latinB = normalize(b)
+  if (latinA && latinB) return latinA === latinB
+  const unicodeA = normalizeUnicode(a)
+  return unicodeA !== '' && unicodeA === normalizeUnicode(b)
+}
+
 function firstYear(...dates: Array<string | undefined>): string | undefined {
   for (const date of dates) {
     const match = date?.match(/^\d{4}/)
@@ -216,8 +235,8 @@ export function mergeMetadataResults(
     const existing = merged.find(
       (candidate) =>
         candidate.id === result.id ||
-        (normalize(candidate.title) === normalize(result.title) &&
-          normalize(candidate.artist) === normalize(result.artist))
+        (sameNormalized(candidate.title, result.title) &&
+          sameNormalized(candidate.artist, result.artist))
     )
     if (!existing) {
       merged.push({ ...result, sources: [...result.sources] })
