@@ -20,13 +20,14 @@ on:
         required: false
         default: 'main'
   push:
-    branches: [master, main]
+    branches: [master, main, beta]
     paths:
       - '.github/workflows/demucs-cpp-binaries.yml'
       - 'src/main/strumIntegration/demucsCppBootstrap.ts'
+      - 'scripts/bundle_macos_dylibs.py'
 
 env:
-  BIN_VERSION: '2'
+  BIN_VERSION: '3'
   UPSTREAM_REPO: 'sevagh/demucs.cpp'
   UPSTREAM_REF: ${{ github.event.inputs.upstream_ref || 'main' }}
 
@@ -263,13 +264,11 @@ jobs:
               fi
             done
           elif [ "${{ matrix.platform }}" = "darwin" ]; then
-            # Copy libomp + openblas dylibs and rewrite RPATH to look in the
-            # tarball's own directory.
-            for dylib_dir in "$LIBOMP_PATH/lib" "$OPENBLAS_PATH/lib"; do
-              cp "$dylib_dir"/libomp*.dylib staged/ 2>/dev/null || true
-              cp "$dylib_dir"/libopenblas*.dylib staged/ 2>/dev/null || true
-            done
-            install_name_tool -add_rpath "@executable_path" "staged/${{ matrix.exe }}" || true
+            python3 scripts/test_bundle_macos_dylibs.py
+            python3 scripts/bundle_macos_dylibs.py "staged/${{ matrix.exe }}" \
+              --search "$OPENBLAS_PATH/lib" \
+              --search "$LIBOMP_PATH/lib" \
+              --search "$(brew --prefix gcc)/lib/gcc/current"
           fi
 
       - name: Create tarball
@@ -281,7 +280,7 @@ jobs:
           echo "ASSET=$ASSET" >> "$GITHUB_ENV"
 
       - name: Ensure release exists
-        if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+        if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/beta'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -295,7 +294,7 @@ jobs:
           fi
 
       - name: Upload to release
-        if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+        if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/beta'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
