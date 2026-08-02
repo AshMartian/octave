@@ -1984,10 +1984,19 @@ def _strip_pro_keys_tracks(midi_path: Path) -> int:
 
 
 STAR_POWER_NOTE = 116
+# Drum fill / activation lanes and the Big Rock Ending live on MIDI notes
+# 120-124. Moonscraper models them as Starpower objects (ProDrums_Activation)
+# and .chart export writes them as S 64, so leaving them behind makes charts
+# still show "Star Power" in other editors after the 116 phrases are gone.
+# They only exist to trigger Overdrive anyway, so the starPower=false toggle
+# removes them too (issue #42 follow-up).
+ACTIVATION_LANE_NOTES = frozenset(range(120, 125))
+STAR_POWER_STRIP_NOTES = frozenset({STAR_POWER_NOTE}) | ACTIVATION_LANE_NOTES
 
 
 def _strip_star_power_phrases(midi_path: Path) -> int:
-    """Remove every Star Power / Overdrive phrase (MIDI note 116) from the
+    """Remove every Star Power / Overdrive phrase (MIDI note 116) and every
+    drum fill / activation lane / BRE marker (MIDI notes 120-124) from the
     instrument and vocal tracks of notes.mid in place. This honors the
     user's `starPower=false` toggle (issue #42). Returns the number of
     events removed."""
@@ -2008,7 +2017,7 @@ def _strip_star_power_phrases(midi_path: Path) -> int:
         new_track = mido.MidiTrack()
         carry = 0
         for msg in track:
-            if msg.type in ('note_on', 'note_off') and getattr(msg, 'note', None) == STAR_POWER_NOTE:
+            if msg.type in ('note_on', 'note_off') and getattr(msg, 'note', None) in STAR_POWER_STRIP_NOTES:
                 removed += 1
                 carry += msg.time
                 continue
@@ -3004,7 +3013,7 @@ def run_pipeline(payload: dict[str, Any]) -> int:
                         emit_progress(
                             run_id,
                             "merge",
-                            f"Stripped {removed} Star Power phrase(s) from {notes_mid.name}",
+                            f"Stripped {removed} Star Power / activation-lane event(s) from {notes_mid.name}",
                             percent=min(96, source_start_percent + 65),
                             current_item=source.name,
                         )
