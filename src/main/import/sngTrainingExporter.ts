@@ -87,8 +87,11 @@ export type DatasetSourceKind = 'octave-library' | 'sng' | 'rb3con' | 'zip'
 export interface DatasetCatalogSource {
   kind: DatasetSourceKind
   sourcePath: string
-  /** Set only by the main-process review gate immediately before catalog build. */
-  trainingUse?: 'allowed' | 'review_required'
+  /**
+   * Opaque, content-addressed selection for one song contained in a multi-song
+   * package. This is kept in the main process and is never written to a catalog.
+   */
+  entryId?: string
 }
 
 export interface DatasetSourceSummary {
@@ -102,6 +105,7 @@ export interface DatasetSourceSummary {
   >
   trainingUse: 'allowed' | 'review_required'
   warnings: Array<{ code: string }>
+  isStrumGenerated: boolean
 }
 
 interface CatalogCandidate {
@@ -109,8 +113,10 @@ interface CatalogCandidate {
   midi: Buffer
   metadata: Record<string, string>
   audio: Partial<Record<CatalogAudioRole, CatalogAudioInput>>
+  isStrumGenerated: boolean
   containerSha256?: string
-  trainingUse: 'allowed' | 'review_required'
+  /** Main-process UI admission state; never serialized to a catalog record. */
+  requiresOptIn: boolean
 }
 
 type CatalogAudioRole = 'mix' | 'drums' | 'guitar' | 'bass' | 'keys' | 'vocals' | 'other'
@@ -132,8 +138,13 @@ interface CatalogAsset {
 export interface SongSourceCatalogResult {
   catalogPath: string
   recordCount: number
-  reviewRequiredCount: number
   skipped: Array<{ sourceIndex: number; reason: string }>
+}
+
+/** A renderer-safe per-song summary for a selected package. */
+export interface DatasetSourceEntrySummary extends DatasetSourceSummary {
+  /** Opaque content hash used only by OCTAVE to keep a multi-song selection stable. */
+  entryId: string
 }
 
 export type SongSourceCatalogWriteMode = 'create' | 'update' | 'clone'
@@ -144,6 +155,12 @@ export interface SongSourceCatalogSummary {
   recordCount: number
   libraryRecordCount: number
   externalRecordCount: number
+}
+
+export interface SongSourceCatalogProgress {
+  phase: 'normalizing' | 'materializing' | 'validating'
+  completed: number
+  total: number
 }
 
 function slug(value: string): string {
@@ -297,14 +314,19 @@ async function readCatalogAudioFromFolder(
   return audio
 }
 
-async function extractSngNotesMidi(sngPath: string): Promise<{
+async function extractSngNotesMidi(
+  sngPath: string,
+  includeAudio = true
+): Promise<{
   midi: Buffer
   metadata: Record<string, string>
   audio: Partial<Record<CatalogAudioRole, CatalogAudioInput>>
+  isStrumGenerated: boolean
 } | null> {
   return await new Promise((resolve, reject) => {
     let settled = false
     let metadata: Record<string, string> | null = null
+    let generatedByStrum = false
     let notesMidi: Buffer | null = null
     const audio: Partial<Record<CatalogAudioRole, CatalogAudioInput>> = {}
     const settle = (callback: () => void): void => {
@@ -321,6 +343,7 @@ async function extractSngNotesMidi(sngPath: string): Promise<{
 
     sngStream.on('header', (header: SngHeader) => {
       metadata = sanitizeMetadata(header.metadata)
+      generatedByStrum = isStrumGenerated(header.metadata)
       if (header.fileMeta.length === 0) settle(() => resolve(null))
     })
     sngStream.on('file', (fileName, fileStream, nextFile) => {
@@ -334,7 +357,7 @@ async function extractSngNotesMidi(sngPath: string): Promise<{
             chunks.push(Buffer.from(chunk))
           }
           notesMidi = Buffer.concat(chunks)
-        } else if (/\.(ogg|mp3|opus|wav|flac)$/i.test(fileName)) {
+        } else if (includeAudio && /\.(ogg|mp3|opus|wav|flac)$/i.test(fileName)) {
           const chunks: Buffer[] = []
           let byteLength = 0
           for await (const chunk of Readable.fromWeb(
@@ -351,7 +374,13 @@ async function extractSngNotesMidi(sngPath: string): Promise<{
         }
         if (nextFile) nextFile()
         else
-          settle(() => resolve(notesMidi && metadata ? { midi: notesMidi, metadata, audio } : null))
+          settle(() =>
+            resolve(
+              notesMidi && metadata
+                ? { midi: notesMidi, metadata, audio, isStrumGenerated: generatedByStrum }
+                : null
+            )
+          )
       })().catch(fail)
     })
     sngStream.on('error', fail)
@@ -393,11 +422,15 @@ function findConMogg(
   return null
 }
 
-async function extractConNotesMidi(conPath: string): Promise<
+async function extractConNotesMidi(
+  conPath: string,
+  includeAudio = true
+): Promise<
   Array<{
     midi: Buffer
     metadata: Record<string, string>
     audio: Partial<Record<CatalogAudioRole, CatalogAudioInput>>
+    isStrumGenerated: boolean
   }>
 > {
   const parser = new StfsParser(await readFile(conPath))
@@ -413,7 +446,7 @@ async function extractConNotesMidi(conPath: string): Promise<
     if (!midi) return []
     const mogg = findConMogg(entries, song.shortname, isSingleSongPack)
     let audio: Partial<Record<CatalogAudioRole, CatalogAudioInput>> = {}
-    if (mogg) {
+    if (mogg && includeAudio) {
       try {
         const ogg = decryptMoggBuffer(mogg)
         const input = catalogAudioInput('song.ogg', ogg)
@@ -433,7 +466,8 @@ async function extractConNotesMidi(conPath: string): Promise<
           year: song.year,
           charter: 'C3'
         }),
-        audio
+        audio,
+        isStrumGenerated: false
       }
     ]
   })
@@ -522,10 +556,14 @@ function safeZipEntryName(entryName: string): string | null {
   return normalized
 }
 
-function extractZipNotesMidi(sourcePath: string): Array<{
+function extractZipNotesMidi(
+  sourcePath: string,
+  includeAudio = true
+): Array<{
   midi: Buffer
   metadata: Record<string, string>
   audio: Partial<Record<CatalogAudioRole, CatalogAudioInput>>
+  isStrumGenerated: boolean
 }> {
   const archive = new AdmZip(sourcePath)
   const entries = archive.getEntries()
@@ -544,6 +582,7 @@ function extractZipNotesMidi(sourcePath: string): Array<{
     midi: Buffer
     metadata: Record<string, string>
     audio: Partial<Record<CatalogAudioRole, CatalogAudioInput>>
+    isStrumGenerated: boolean
   }> = []
   for (const [name, entry] of files) {
     if (!name.endsWith(`/${NOTES_MIDI}`) && name !== NOTES_MIDI) continue
@@ -551,70 +590,139 @@ function extractZipNotesMidi(sourcePath: string): Array<{
     if (midi.length > MAX_ZIP_ENTRY_BYTES) throw new Error('ZIP archive entry is too large.')
     const directory = name.slice(0, -NOTES_MIDI.length)
     const songIni = files.get(`${directory}song.ini`)
-    const metadata = songIni
-      ? sanitizeMetadata(parseIniFile(songIni.getData().toString('utf8')))
-      : {}
+    const rawMetadata = songIni ? parseIniFile(songIni.getData().toString('utf8')) : {}
+    const metadata = sanitizeMetadata(rawMetadata)
     const audio: Partial<Record<CatalogAudioRole, CatalogAudioInput>> = {}
-    for (const [entryName, audioEntry] of files) {
-      const childName = entryName.slice(directory.length)
-      if (!childName || childName.includes('/')) continue
-      if (!/\.(ogg|mp3|opus|wav|flac)$/i.test(childName)) continue
-      const bytes = audioEntry.getData()
-      const input = catalogAudioInput(childName, bytes)
-      if (input && !audio[input[0]]) audio[input[0]] = input[1]
+    if (includeAudio) {
+      for (const [entryName, audioEntry] of files) {
+        const childName = entryName.slice(directory.length)
+        if (!childName || childName.includes('/')) continue
+        if (!/\.(ogg|mp3|opus|wav|flac)$/i.test(childName)) continue
+        const bytes = audioEntry.getData()
+        const input = catalogAudioInput(childName, bytes)
+        if (input && !audio[input[0]]) audio[input[0]] = input[1]
+      }
     }
-    candidates.push({ midi, metadata, audio })
+    candidates.push({ midi, metadata, audio, isStrumGenerated: isStrumGenerated(rawMetadata) })
   }
   return candidates
 }
 
-async function inspectDatasetSource(source: DatasetCatalogSource): Promise<CatalogCandidate[]> {
+async function inspectDatasetSource(
+  source: DatasetCatalogSource,
+  includeAudio = true
+): Promise<CatalogCandidate[]> {
   if (source.kind === 'sng') {
-    const extracted = await extractSngNotesMidi(source.sourcePath)
+    const extracted = await extractSngNotesMidi(source.sourcePath, includeAudio)
     if (!extracted) return []
-    return [
+    const candidates = [
       {
         kind: source.kind,
         midi: extracted.midi,
         metadata: redactMetadata(extracted.metadata),
         audio: extracted.audio,
+        isStrumGenerated: extracted.isStrumGenerated,
         containerSha256: await sha256File(source.sourcePath),
-        trainingUse: source.trainingUse ?? 'review_required'
+        requiresOptIn: false
       }
     ]
+    return selectCatalogEntries(candidates, source.entryId)
   }
   if (source.kind === 'rb3con') {
     const containerSha256 = await sha256File(source.sourcePath)
-    return (await extractConNotesMidi(source.sourcePath)).map((candidate) => ({
-      kind: source.kind,
-      midi: candidate.midi,
-      metadata: redactMetadata(candidate.metadata),
-      audio: candidate.audio,
-      containerSha256,
-      trainingUse: source.trainingUse ?? 'review_required'
-    }))
+    const candidates = (await extractConNotesMidi(source.sourcePath, includeAudio)).map(
+      (candidate) => ({
+        kind: source.kind,
+        midi: candidate.midi,
+        metadata: redactMetadata(candidate.metadata),
+        audio: candidate.audio,
+        isStrumGenerated: candidate.isStrumGenerated,
+        containerSha256,
+        requiresOptIn: false
+      })
+    )
+    return selectCatalogEntries(candidates, source.entryId)
   }
   if (source.kind === 'zip') {
     const containerSha256 = await sha256File(source.sourcePath)
-    return extractZipNotesMidi(source.sourcePath).map((candidate) => ({
+    const candidates = extractZipNotesMidi(source.sourcePath, includeAudio).map((candidate) => ({
       kind: source.kind,
       midi: candidate.midi,
       metadata: redactMetadata(candidate.metadata),
       audio: candidate.audio,
+      isStrumGenerated: candidate.isStrumGenerated,
       containerSha256,
-      trainingUse: source.trainingUse ?? 'review_required'
+      requiresOptIn: false
     }))
+    return selectCatalogEntries(candidates, source.entryId)
   }
   const metadata = parseIniFile(await readFile(path.join(source.sourcePath, 'song.ini'), 'utf8'))
-  return [
+  const candidates = [
     {
       kind: source.kind,
       midi: await readFile(path.join(source.sourcePath, NOTES_MIDI)),
       metadata: redactMetadata(sanitizeMetadata(metadata)),
-      audio: await readCatalogAudioFromFolder(source.sourcePath),
-      trainingUse: isDatasetOptedIn(metadata.dataset_opt_in) ? 'allowed' : 'review_required'
+      audio: includeAudio ? await readCatalogAudioFromFolder(source.sourcePath) : {},
+      isStrumGenerated: isStrumGenerated(metadata),
+      requiresOptIn: !isDatasetOptedIn(metadata.dataset_opt_in)
     }
   ]
+  return selectCatalogEntries(candidates, source.entryId)
+}
+
+function catalogEntryId(candidate: CatalogCandidate, entryIndex: number): string {
+  // Content alone is not sufficient here: a multi-song package can legally
+  // contain two songs with byte-identical MIDI. Bind the opaque selection to
+  // its stable package order as well, without exposing its entry name/path.
+  return sha256Buffer(
+    Buffer.from(
+      `${candidate.kind}\u0000${candidate.containerSha256 ?? ''}\u0000${entryIndex}\u0000${sha256Buffer(candidate.midi)}`,
+      'utf8'
+    )
+  )
+}
+
+function selectCatalogEntries(
+  candidates: CatalogCandidate[],
+  entryId: string | undefined
+): CatalogCandidate[] {
+  if (!entryId) return candidates
+  if (!/^[a-f0-9]{64}$/.test(entryId)) return []
+  return candidates.filter(
+    (candidate, entryIndex) => catalogEntryId(candidate, entryIndex) === entryId
+  )
+}
+
+function summarizeCatalogCandidate(candidate: CatalogCandidate): DatasetSourceSummary {
+  const midiValid = isValidMidi(candidate.midi)
+  return {
+    kind: candidate.kind,
+    songCount: 1,
+    metadata: candidate.metadata,
+    midiValid,
+    instruments: midiValid ? discoverInstrumentCoverage(candidate.midi) : {},
+    // This is a UI-only review state. Catalog records always serialize allowed.
+    trainingUse: candidate.requiresOptIn ? 'review_required' : 'allowed',
+    warnings: midiValid ? [] : [{ code: 'invalid_notes_midi' }],
+    isStrumGenerated: candidate.isStrumGenerated
+  }
+}
+
+/**
+ * Returns one opaque, safe summary per contained song. In particular, ZIP
+ * archives are deliberately not collapsed to their first song.
+ */
+export async function summarizeDatasetSourceEntries(
+  source: DatasetCatalogSource
+): Promise<DatasetSourceEntrySummary[]> {
+  try {
+    return (await inspectDatasetSource(source, false)).map((candidate, entryIndex) => ({
+      ...summarizeCatalogCandidate(candidate),
+      entryId: catalogEntryId(candidate, entryIndex)
+    }))
+  } catch {
+    return []
+  }
 }
 
 /** Returns a renderer-safe summary; original source locations and parser errors never leave main. */
@@ -622,7 +730,7 @@ export async function summarizeDatasetSource(
   source: DatasetCatalogSource
 ): Promise<DatasetSourceSummary> {
   try {
-    const candidates = await inspectDatasetSource(source)
+    const candidates = await inspectDatasetSource(source, false)
     const first = candidates[0]
     if (!first) {
       return {
@@ -632,7 +740,8 @@ export async function summarizeDatasetSource(
         midiValid: false,
         instruments: {},
         trainingUse: 'review_required',
-        warnings: [{ code: 'missing_notes_midi' }]
+        warnings: [{ code: 'missing_notes_midi' }],
+        isStrumGenerated: false
       }
     }
     const midiValid = candidates.every((candidate) => isValidMidi(candidate.midi))
@@ -642,8 +751,9 @@ export async function summarizeDatasetSource(
       metadata: first.metadata,
       midiValid,
       instruments: midiValid ? discoverInstrumentCoverage(first.midi) : {},
-      trainingUse: first.trainingUse,
-      warnings: midiValid ? [] : [{ code: 'invalid_notes_midi' }]
+      trainingUse: summarizeCatalogCandidate(first).trainingUse,
+      warnings: midiValid ? [] : [{ code: 'invalid_notes_midi' }],
+      isStrumGenerated: first.isStrumGenerated
     }
   } catch {
     return {
@@ -653,7 +763,8 @@ export async function summarizeDatasetSource(
       midiValid: false,
       instruments: {},
       trainingUse: 'review_required',
-      warnings: [{ code: 'source_unavailable' }]
+      warnings: [{ code: 'source_unavailable' }],
+      isStrumGenerated: false
     }
   }
 }
@@ -690,7 +801,7 @@ function catalogRecord(
   return {
     source_id: sourceId,
     import: importRecord,
-    rights: { training_use: candidate.trainingUse, provenance: '', license: '' },
+    rights: { training_use: 'allowed', provenance: '', license: '' },
     metadata: candidate.metadata,
     chart: {
       notes_midi: notesAsset,
@@ -723,10 +834,7 @@ function validateCatalogRecord(record: Record<string, unknown>): void {
   if (typeof sourceId !== 'string' || !/^octave-src-[a-z0-9][a-z0-9-]{7,127}$/.test(sourceId)) {
     throw new Error('Catalog record validation failed.')
   }
-  if (
-    !rights ||
-    !['allowed', 'review_required', 'prohibited'].includes(rights.training_use ?? '')
-  ) {
+  if (!rights || rights.training_use !== 'allowed') {
     throw new Error('Catalog record validation failed.')
   }
   for (const value of [rights.provenance, rights.license]) {
@@ -906,6 +1014,7 @@ export async function buildSongSourceCatalog(options: {
   octaveVersion: string
   mode?: SongSourceCatalogWriteMode
   sourceCatalogName?: string
+  onProgress?: (progress: SongSourceCatalogProgress) => void
 }): Promise<SongSourceCatalogResult> {
   if (!options.sources.length && options.mode !== 'update') {
     throw new Error('Select at least one reviewed source.')
@@ -979,6 +1088,11 @@ export async function buildSongSourceCatalog(options: {
       }
     }
     for (const [sourceIndex, source] of options.sources.entries()) {
+      options.onProgress?.({
+        phase: 'normalizing',
+        completed: sourceIndex,
+        total: options.sources.length
+      })
       let candidates: CatalogCandidate[]
       try {
         candidates = await inspectDatasetSource(source)
@@ -1019,10 +1133,18 @@ export async function buildSongSourceCatalog(options: {
             ])
           )
         ) as Partial<Record<CatalogAudioRole, CatalogAsset>>
+        options.onProgress?.({
+          phase: 'materializing',
+          completed: sourceIndex + 1,
+          total: options.sources.length
+        })
         const record = catalogRecord(candidate, notesAsset, notesSha256, audio) as {
           rights: { training_use: string; provenance: string; license: string }
         }
-        record.rights = { training_use: candidate.trainingUse, provenance, license }
+        // OCTAVE curation is the admission gate. A materialized catalog is
+        // therefore a trainable artifact and can never carry an unresolved
+        // review state, including when this service is called directly.
+        record.rights = { training_use: 'allowed', provenance, license }
         validateCatalogRecord(record)
         records.push(record)
         seenMidi.add(notesSha256)
@@ -1054,6 +1176,11 @@ export async function buildSongSourceCatalog(options: {
       JSON.stringify(catalog, null, 2) + '\n',
       'utf8'
     )
+    options.onProgress?.({
+      phase: 'validating',
+      completed: options.sources.length,
+      total: options.sources.length
+    })
     await validateStagedCatalog(stagingRoot)
     if (mode === 'update') {
       const backupPath = path.join(parentDir, `.${catalogName}.backup-${randomUUID()}`)
@@ -1085,9 +1212,6 @@ export async function buildSongSourceCatalog(options: {
   return {
     catalogPath,
     recordCount: records.length,
-    reviewRequiredCount: records.filter(
-      (record) => (record.rights as { training_use: string }).training_use === 'review_required'
-    ).length,
     skipped
   }
 }

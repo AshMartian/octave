@@ -10,7 +10,8 @@ import {
   exportSngTrainingMidi,
   listDatasetLibrarySongs,
   listSongSourceCatalogs,
-  summarizeDatasetSource
+  summarizeDatasetSource,
+  summarizeDatasetSourceEntries
 } from './sngTrainingExporter'
 
 describe('exportSngTrainingMidi', () => {
@@ -260,6 +261,7 @@ describe('exportSngTrainingMidi', () => {
       '[song]\nname = Catalog Song\nartist = Catalog Artist\ndataset_opt_in = true\n'
     )
 
+    const progress: Array<{ phase: string; completed: number; total: number }> = []
     const result = await buildSongSourceCatalog({
       sources: [{ kind: 'octave-library', sourcePath: songDir }],
       parentDir,
@@ -267,10 +269,11 @@ describe('exportSngTrainingMidi', () => {
       catalogId: 'strum-reviewed',
       provenance: 'Reviewed local collection',
       license: 'test-only',
-      octaveVersion: 'test'
+      octaveVersion: 'test',
+      onProgress: (update) => progress.push(update)
     })
 
-    expect(result).toMatchObject({ recordCount: 1, reviewRequiredCount: 0, skipped: [] })
+    expect(result).toMatchObject({ recordCount: 1, skipped: [] })
     const catalogPath = join(parentDir, 'strum-reviewed')
     const catalog = await readFile(join(catalogPath, 'catalog.json'), 'utf8')
     const records = await readFile(join(catalogPath, 'records.jsonl'), 'utf8')
@@ -290,9 +293,14 @@ describe('exportSngTrainingMidi', () => {
     )
     expect(record.audio.mix.media_type).toBe('audio/ogg')
     expect(existsSync(join(parentDir, '.strum-reviewed.staging'))).toBe(false)
+    expect(progress).toEqual([
+      { phase: 'normalizing', completed: 0, total: 1 },
+      { phase: 'materializing', completed: 1, total: 1 },
+      { phase: 'validating', completed: 1, total: 1 }
+    ])
   })
 
-  it('keeps unreviewed STRUM output in the catalog with review_required rights', async () => {
+  it('serializes only allowed catalog records even when called directly for unreviewed STRUM output', async () => {
     const songDir = join(testDir, 'catalog-strum-song')
     const parentDir = join(testDir, 'catalog-strum-parent')
     await mkdir(songDir, { recursive: true })
@@ -306,17 +314,17 @@ describe('exportSngTrainingMidi', () => {
     const result = await buildSongSourceCatalog({
       sources: [{ kind: 'octave-library', sourcePath: songDir }],
       parentDir,
-      catalogName: 'strum-review-required',
-      catalogId: 'strum-review-required',
+      catalogName: 'strum-catalog',
+      catalogId: 'strum-catalog',
       provenance: 'Reviewed local collection',
       license: 'test-only',
       octaveVersion: 'test'
     })
 
-    expect(result).toMatchObject({ recordCount: 1, reviewRequiredCount: 1 })
-    expect(
-      await readFile(join(parentDir, 'strum-review-required', 'records.jsonl'), 'utf8')
-    ).toContain('"training_use":"review_required"')
+    expect(result).toMatchObject({ recordCount: 1 })
+    expect(await readFile(join(parentDir, 'strum-catalog', 'records.jsonl'), 'utf8')).toContain(
+      '"training_use":"allowed"'
+    )
   })
 
   it('writes schema-shaped instrument coverage with track_names', async () => {
@@ -384,12 +392,19 @@ describe('exportSngTrainingMidi', () => {
     const parentDir = join(testDir, 'catalog-zip-parent')
     const archive = new AdmZip()
     archive.addFile('song/notes.mid', validMidi)
-    archive.addFile('song/song.ini', Buffer.from('[song]\nname = ZIP Song\n'))
+    archive.addFile(
+      'song/song.ini',
+      Buffer.from('[song]\nname = ZIP Song\ncharter = STRUM\nstrum_generated = true\n')
+    )
     archive.writeZip(archivePath)
     await mkdir(parentDir, { recursive: true })
 
+    await expect(
+      summarizeDatasetSource({ kind: 'zip', sourcePath: archivePath })
+    ).resolves.toMatchObject({ isStrumGenerated: true })
+
     const result = await buildSongSourceCatalog({
-      sources: [{ kind: 'zip', sourcePath: archivePath, trainingUse: 'allowed' }],
+      sources: [{ kind: 'zip', sourcePath: archivePath }],
       parentDir,
       catalogName: 'zip-catalog',
       catalogId: 'zip-catalog',
@@ -398,10 +413,67 @@ describe('exportSngTrainingMidi', () => {
       octaveVersion: 'test'
     })
 
-    expect(result).toMatchObject({ recordCount: 1, reviewRequiredCount: 0 })
+    expect(result).toMatchObject({ recordCount: 1 })
     expect(await readFile(join(parentDir, 'zip-catalog', 'records.jsonl'), 'utf8')).toContain(
       '"kind":"zip"'
     )
+  })
+
+  it('returns independently selectable summaries for every song in a ZIP package', async () => {
+    const archivePath = join(testDir, 'multi-song-source.zip')
+    const archive = new AdmZip()
+    archive.addFile('approved/notes.mid', validMidi)
+    archive.addFile('approved/song.ini', Buffer.from('[song]\nname = Approved\nartist = Tester\n'))
+    // Byte-identical charts must still be independently selectable when they
+    // belong to different songs in the same package.
+    archive.addFile('strum/notes.mid', validMidi)
+    archive.addFile(
+      'strum/song.ini',
+      Buffer.from('[song]\nname = STRUM Song\nartist = Tester\ncharter = STRUM\n')
+    )
+    archive.writeZip(archivePath)
+
+    const entries = await summarizeDatasetSourceEntries({ kind: 'zip', sourcePath: archivePath })
+
+    expect(entries).toHaveLength(2)
+    expect(entries.map((entry) => entry.entryId)).toEqual(
+      expect.arrayContaining([expect.stringMatching(/^[a-f0-9]{64}$/)])
+    )
+    expect(new Set(entries.map((entry) => entry.entryId)).size).toBe(2)
+    expect(entries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          metadata: expect.objectContaining({ name: 'STRUM Song' }),
+          isStrumGenerated: true
+        }),
+        expect.objectContaining({
+          metadata: expect.objectContaining({ name: 'Approved' }),
+          isStrumGenerated: false
+        })
+      ])
+    )
+
+    const strumEntry = entries.find((entry) => entry.isStrumGenerated)
+    expect(strumEntry).toBeDefined()
+    if (!strumEntry) throw new Error('Expected STRUM ZIP entry fixture')
+    const parentDir = join(testDir, 'multi-song-catalog-parent')
+    await mkdir(parentDir, { recursive: true })
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'zip', sourcePath: archivePath, entryId: strumEntry.entryId }],
+      parentDir,
+      catalogName: 'selected-entry',
+      catalogId: 'selected-entry',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    const record = JSON.parse(
+      await readFile(join(parentDir, 'selected-entry', 'records.jsonl'), 'utf8')
+    ) as { metadata: { name: string }; rights: { training_use: string } }
+    expect(record).toMatchObject({
+      metadata: { name: 'STRUM Song' },
+      rights: { training_use: 'allowed' }
+    })
   })
 
   it('returns only a safe code for parser failures and cleans failed staging directories', async () => {
@@ -415,7 +487,7 @@ describe('exportSngTrainingMidi', () => {
     )
     await expect(
       buildSongSourceCatalog({
-        sources: [{ kind: 'sng', sourcePath: packagePath, trainingUse: 'allowed' }],
+        sources: [{ kind: 'sng', sourcePath: packagePath }],
         parentDir,
         catalogName: 'failed-catalog',
         catalogId: 'failed-catalog',

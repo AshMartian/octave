@@ -8,7 +8,7 @@
   background: rgba(0, 0, 0, 0.68);
 }
 .dataset-curation-modal {
-  width: min(820px, 100%);
+  width: min(900px, 100%);
   max-height: 90vh;
   display: flex;
   flex-direction: column;
@@ -19,8 +19,8 @@
   border-radius: 14px;
   box-shadow: var(--shadow-lg);
 }
-.dataset-curation-modal header,
-.dataset-curation-modal footer {
+.dataset-curation-modal > header,
+.dataset-curation-modal > footer {
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -28,7 +28,82 @@
   padding: 16px 20px;
   border-bottom: 1px solid var(--border-color);
 }
-.dataset-curation-modal footer {
+.training-steps {
+  display: flex;
+  align-items: start;
+  justify-content: center;
+  gap: 0;
+  padding: 14px 46px 12px;
+  background: color-mix(in srgb, var(--bg-tertiary) 72%, var(--bg-secondary));
+  border-bottom: 1px solid var(--border-color);
+}
+.training-step-item {
+  display: flex;
+  flex: 1 1 0;
+  align-items: start;
+  min-width: 0;
+}
+.training-steps button {
+  display: grid;
+  place-items: center;
+  gap: 6px;
+  min-width: 64px;
+  padding: 0;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 0;
+  text-transform: capitalize;
+}
+.training-step-orb {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+  border: 2px solid color-mix(in srgb, var(--text-secondary) 65%, transparent);
+  border-radius: 50%;
+  box-shadow: 0 2px 7px rgba(0, 0, 0, 0.22);
+  font-size: 15px;
+  font-weight: 700;
+}
+.training-step-label {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+.training-steps button.active {
+  color: var(--accent-color);
+}
+.training-steps button.active .training-step-orb {
+  color: #271b0e;
+  background: var(--accent-color);
+  border-color: var(--accent-color);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent-color) 18%, transparent);
+}
+.training-steps button.complete {
+  color: #82d47c;
+}
+.training-steps button.complete .training-step-orb {
+  color: #fff;
+  background: #5da85a;
+  border-color: #70c66b;
+}
+.training-step-connector {
+  height: 3px;
+  flex: 1 1 28px;
+  min-width: 24px;
+  margin: 18px 10px 0;
+  background: color-mix(in srgb, var(--text-secondary) 26%, transparent);
+  border-radius: 999px;
+}
+.training-step-item:has(.complete) .training-step-connector {
+  background: #5da85a;
+}
+.training-step-item:has(.active) .training-step-connector {
+  background: color-mix(in srgb, var(--accent-color) 72%, var(--text-secondary));
+}
+.dataset-curation-modal > footer {
   border-top: 1px solid var(--border-color);
   border-bottom: 0;
 }
@@ -37,7 +112,23 @@
   margin: 0;
 }
 .dataset-curation-modal h2 {
+  display: flex;
+  align-items: center;
+  gap: 11px;
   font-size: 20px;
+}
+.dataset-curation-modal h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.dataset-curation-modal h2 span,
+.dataset-heading-icon {
+  display: inline-grid;
+  place-items: center;
+  margin: 0;
+  line-height: 1;
+  filter: saturate(1.15);
 }
 .dataset-curation-modal h3 {
   font-size: 14px;
@@ -104,6 +195,26 @@
 .dataset-package-list label:last-child {
   border-bottom: 0;
 }
+.dataset-package-group + .dataset-package-group {
+  border-top: 1px solid var(--border-color);
+}
+.dataset-package-group > header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 11px;
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+.dataset-package-group > header strong,
+.dataset-package-group > header small {
+  display: block;
+}
+.dataset-package-group > header small {
+  margin-top: 2px;
+  color: var(--text-secondary);
+}
 .dataset-song-list label.disabled {
   opacity: 0.55;
   cursor: not-allowed;
@@ -134,9 +245,20 @@
   color: var(--text-secondary);
   font-size: 11px;
 }
-.dataset-details label:nth-of-type(3),
-.dataset-details label:nth-of-type(4) {
+.dataset-catalog-parent,
+.dataset-editor-fields {
   grid-column: 1 / -1;
+}
+.dataset-editor-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.dataset-editor-fields label {
+  display: grid;
+  gap: 5px;
+  color: var(--text-secondary);
+  font-size: 11px;
 }
 .dataset-details input {
   min-width: 0;
@@ -185,6 +307,12 @@
   font-weight: 600;
   font-size: 12px;
 }
+.dataset-curation-modal button > span:first-child {
+  display: inline-block;
+  min-width: 1em;
+  color: var(--accent-color);
+  font-weight: 700;
+}
 .dataset-curation-modal button:disabled {
   opacity: 0.55;
   cursor: default;
@@ -212,18 +340,82 @@
   color: #b8e8c7;
   background: rgba(45, 150, 80, 0.15);
 }
+.dataset-message.progress {
+  color: #b8d9ff;
+  background: rgba(50, 115, 185, 0.18);
+}
+.dataset-library-loading {
+  display: grid;
+  place-items: center;
+  gap: 6px;
+  min-height: 142px;
+  padding: 18px;
+  color: var(--text-secondary);
+  text-align: center;
+  background: linear-gradient(
+    135deg,
+    var(--bg-tertiary),
+    color-mix(in srgb, var(--accent-color) 7%, var(--bg-tertiary))
+  );
+}
+.dataset-library-loading strong {
+  color: var(--text-primary);
+  font-size: 13px;
+}
+.dataset-library-loading small {
+  font-size: 11px;
+}
+.dataset-loading-orbit {
+  width: 25px;
+  height: 25px;
+  border: 3px solid color-mix(in srgb, var(--accent-color) 22%, transparent);
+  border-top-color: var(--accent-color);
+  border-radius: 50%;
+  animation: dataset-spin 0.75s linear infinite;
+}
+.dataset-spin {
+  animation: dataset-spin 0.75s linear infinite;
+}
+@keyframes dataset-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
 .dataset-message.warning {
   grid-column: 1 / -1;
   color: #f6d99c;
   background: rgba(160, 110, 25, 0.18);
 }
+.training-step-panel {
+  display: grid;
+  gap: 14px;
+  max-width: 580px;
+  padding: 16px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+}
+.training-step-panel dl {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+}
+.training-step-panel dl div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+.training-step-panel dt,
+.training-step-panel dd {
+  margin: 0;
+}
+.training-step-panel dt {
+  color: var(--text-secondary);
+}
 @media (max-width: 620px) {
-  .dataset-details {
+  .dataset-details,
+  .dataset-editor-fields {
     grid-template-columns: 1fr;
-  }
-  .dataset-details label:nth-of-type(3),
-  .dataset-details label:nth-of-type(4) {
-    grid-column: auto;
   }
   .dataset-curation-modal footer {
     align-items: start;

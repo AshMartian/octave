@@ -31,7 +31,7 @@ raw parser error.
     "kind": "sng",
     "adapter_version": "octave-sng/1",
     "container_sha256": "…",
-    "warnings": [{"code": "missing_optional_artwork"}]
+    "warnings": [{ "code": "missing_optional_artwork" }]
   },
   "rights": {
     "training_use": "allowed",
@@ -64,20 +64,21 @@ raw parser error.
 - Adapter selection, archive parsing, safe extraction, and import warnings.
 - Metadata normalization, MIDI validation, instrument/difficulty discovery,
   hashing, duplicate handling, and catalog materialization.
-- The user-facing rights decision. `training_use` starts as `review_required`;
-  only an explicit review may set it to `allowed`.
+- The user-facing curation gate. A source may be unselected or need explicit
+  consent in the UI, but every record that reaches a catalog has already been
+  approved and is written as `training_use: allowed`.
 - Private original-location bookkeeping, if needed for refresh or reveal in
   the file browser. That resolver is a local OCTAVE sidecar and is neither a
   catalog asset nor a training artifact.
 
 ### STRUM owns
 
-- Selecting `training_use: allowed` records and creating task-specific views.
+- Reading allowed catalog records and creating task-specific views.
 - Converting catalog chart/audio assets into model examples, windows, tokens,
   targets, splits, and evaluation manifests.
 - Recording catalog `source_id`s and input hashes in experiment metadata.
-- Rejecting records with missing assets, hash mismatches, or non-allowed
-  training rights.
+- Rejecting records with missing assets, hash mismatches, or a training right
+  other than `allowed`.
 
 STRUM must not infer rights, persist source locations, or add SNG/RB3CON/ZIP
 parsers. OCTAVE must not encode STRUM model tokens or prescribe a model
@@ -88,12 +89,12 @@ architecture.
 One catalog can produce many STRUM datasets without duplicating source
 metadata:
 
-| STRUM task | Catalog inputs | Derived view |
-| --- | --- | --- |
-| Audio to chart | `audio` + `chart.notes_midi` | instrument-specific onset/lane targets |
-| Difficulty transform | `chart.notes_midi` | source/target difficulty event pairs |
-| Vocal model | `chart.notes_midi` + `audio.vocals` | phrase, lyric, and pitch targets |
-| Pro instrument model | `chart.notes_midi` + stem/mix | string/fret or chromatic-key targets |
+| STRUM task           | Catalog inputs                      | Derived view                           |
+| -------------------- | ----------------------------------- | -------------------------------------- |
+| Audio to chart       | `audio` + `chart.notes_midi`        | instrument-specific onset/lane targets |
+| Difficulty transform | `chart.notes_midi`                  | source/target difficulty event pairs   |
+| Vocal model          | `chart.notes_midi` + `audio.vocals` | phrase, lyric, and pitch targets       |
+| Pro instrument model | `chart.notes_midi` + stem/mix       | string/fret or chromatic-key targets   |
 
 Views contain `source_id`, selected asset hashes, view-builder version, and
 their own split assignment. They do not copy rights text or absolute paths.
@@ -137,9 +138,11 @@ importer or tokenization layer.
 2. Show the normalized candidate summary supplied by the catalog service:
    source kind, sanitized metadata, MIDI validity, instrument coverage,
    duplicate status, import warnings, and rights status.
-3. Require an explicit provenance and license/permission basis before setting
-   `training_use` to `allowed`. STRUM-generated songs remain
-   `review_required` by default.
+3. Require an explicit provenance and license/permission basis before a source
+   can be included. STRUM-charted library songs require saved explicit consent;
+   STRUM-charted external packages are shown per contained song and require an
+   explicit selection. OCTAVE then materializes only those approved sources,
+   with `training_use: allowed`; unresolved review states are never exported.
 4. Ask the user for a parent directory and a new catalog name. The final
    `<parent>/<name>` destination must not already exist; an existing empty
    directory is not an atomic destination. Materialize approved assets through

@@ -35,9 +35,13 @@ const api = {
   getDefaultAutoChartOutputDir: (): Promise<string> =>
     ipcRenderer.invoke('strum:getDefaultOutputFolder'),
 
-  chooseDatasetPackageFolder: (): Promise<
-    Array<{
+  chooseDatasetPackageFolder: (): Promise<{
+    groupId: string
+    groupName: string
+    strumGeneratedCount: number
+    candidates: Array<{
       candidateId: string
+      groupId: string
       kind: 'octave-library' | 'sng' | 'rb3con' | 'zip'
       songCount: number
       metadata: Record<string, string>
@@ -48,8 +52,46 @@ const api = {
       >
       trainingUse: 'allowed' | 'review_required'
       warnings: Array<{ code: string }>
+      isStrumGenerated: boolean
     }>
-  > => ipcRenderer.invoke('dataset:choosePackageFolder'),
+  } | null> => ipcRenderer.invoke('dataset:choosePackageFolder'),
+
+  removeDatasetPackageGroup: (candidateIds: string[]): Promise<void> =>
+    ipcRenderer.invoke('dataset:removePackageGroup', candidateIds),
+
+  onDatasetScanProgress: (
+    callback: (progress: {
+      phase: 'discovering' | 'inspecting'
+      completed: number
+      total: number
+    }) => void
+  ): (() => void) => {
+    const listener = (
+      _event: Electron.IpcRendererEvent,
+      progress: { phase: 'discovering' | 'inspecting'; completed: number; total: number }
+    ): void => callback(progress)
+    ipcRenderer.on('dataset:scanProgress', listener)
+    return () => ipcRenderer.removeListener('dataset:scanProgress', listener)
+  },
+
+  onDatasetSaveProgress: (
+    callback: (progress: {
+      phase: 'checking' | 'normalizing' | 'materializing' | 'validating'
+      completed: number
+      total: number
+    }) => void
+  ): (() => void) => {
+    const listener = (
+      _event: Electron.IpcRendererEvent,
+      progress: {
+        phase: 'checking' | 'normalizing' | 'materializing' | 'validating'
+        completed: number
+        total: number
+      }
+    ): void => callback(progress)
+    ipcRenderer.on('dataset:saveProgress', listener)
+    return () => ipcRenderer.removeListener('dataset:saveProgress', listener)
+  },
 
   chooseDatasetCatalogParent: (): Promise<{ parentId: string; name: string } | null> =>
     ipcRenderer.invoke('dataset:chooseCatalogParent'),
@@ -111,7 +153,6 @@ const api = {
     sourceCatalogName?: string
   }): Promise<{
     recordCount: number
-    reviewRequiredCount: number
     skipped: Array<{ reason: string }>
   }> => ipcRenderer.invoke('dataset:export', options),
 
