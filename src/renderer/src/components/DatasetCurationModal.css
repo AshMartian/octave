@@ -30,32 +30,43 @@
 }
 .training-steps {
   display: grid;
-  grid-template-columns: 92px minmax(56px, 1fr) 92px minmax(56px, 1fr) 92px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   align-items: start;
-  justify-content: center;
-  column-gap: 16px;
-  padding: 16px max(46px, 9%);
+  padding: 20px max(46px, 9%);
   background: color-mix(in srgb, var(--bg-tertiary) 72%, var(--bg-secondary));
   border-bottom: 1px solid var(--border-color);
 }
 .dataset-curation-modal .training-steps button {
+  position: relative;
   display: grid;
   grid-template-rows: 42px 16px;
   align-content: start;
   justify-items: center;
   gap: 7px;
-  width: 92px;
-  min-height: 88px;
-  padding: 12px 8px 10px;
+  min-height: 65px;
+  padding: 0;
   color: var(--text-secondary);
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-color);
-  border-radius: 7px;
+  background: transparent;
+  border: 0;
   text-transform: capitalize;
 }
+.dataset-curation-modal .training-steps button::after {
+  position: absolute;
+  z-index: 0;
+  top: 20px;
+  left: calc(50% + 21px);
+  width: calc(100% - 42px);
+  height: 3px;
+  content: '';
+  background: color-mix(in srgb, var(--text-secondary) 26%, transparent);
+  border-radius: 999px;
+}
+.dataset-curation-modal .training-steps button:last-child::after {
+  content: none;
+}
 .training-step-orb {
-  display: grid;
-  place-items: center;
+  position: relative;
+  z-index: 1;
   width: 42px;
   height: 42px;
   color: var(--text-muted);
@@ -65,9 +76,13 @@
   box-shadow: 0 2px 7px rgba(0, 0, 0, 0.22);
 }
 .training-step-orb svg {
+  position: absolute;
+  top: 50%;
+  left: 50%;
   display: block;
-  width: 21px;
-  height: 21px;
+  width: 20px;
+  height: 20px;
+  transform: translate(-50%, -50%);
   fill: none;
   stroke: currentColor;
   stroke-linecap: round;
@@ -75,14 +90,14 @@
   stroke-width: 2;
 }
 .training-step-label {
+  position: relative;
+  z-index: 1;
   font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.01em;
 }
 .training-steps button.active {
   color: #79b8ff;
-  border-color: color-mix(in srgb, #58a6ff 48%, var(--border-color));
-  background: color-mix(in srgb, #58a6ff 9%, var(--bg-secondary));
 }
 .dataset-curation-modal .training-steps button.active .training-step-orb {
   color: #79b8ff;
@@ -92,25 +107,16 @@
 }
 .training-steps button.complete {
   color: var(--success-color);
-  border-color: color-mix(in srgb, var(--success-color) 38%, var(--border-color));
-  background: color-mix(in srgb, var(--success-color) 8%, var(--bg-secondary));
 }
 .dataset-curation-modal .training-steps button.complete .training-step-orb {
   color: #102817;
   background: var(--success-color);
   border-color: var(--success-color);
 }
-.training-step-connector {
-  height: 3px;
-  width: 100%;
-  margin-top: 31.5px;
-  background: color-mix(in srgb, var(--text-secondary) 26%, transparent);
-  border-radius: 999px;
-}
-.training-steps button.complete + .training-step-connector {
+.dataset-curation-modal .training-steps button.complete::after {
   background: var(--success-color);
 }
-.training-steps button.active + .training-step-connector {
+.dataset-curation-modal .training-steps button.active::after {
   background: #58a6ff;
 }
 .dataset-curation-modal > footer {
@@ -435,17 +441,10 @@
 }
 @media (max-width: 620px) {
   .training-steps {
-    grid-template-columns: 70px minmax(20px, 1fr) 70px minmax(20px, 1fr) 70px;
-    column-gap: 6px;
     padding-inline: 16px;
   }
   .dataset-curation-modal .training-steps button {
-    width: 70px;
-    min-height: 78px;
-    padding-inline: 4px;
-  }
-  .training-step-connector {
-    margin-top: 31.5px;
+    min-height: 65px;
   }
   .dataset-details,
   .dataset-editor-fields {
