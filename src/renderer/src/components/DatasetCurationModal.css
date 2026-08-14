@@ -56,12 +56,12 @@
   border: 0;
   transform: translateX(-50%);
 }
-.training-header .training-steps button {
+.dataset-curation-modal .training-header .training-steps button {
   grid-template-rows: 14px 34px;
   gap: 2px;
   min-height: 52px;
 }
-.training-header .training-steps button::after {
+.dataset-curation-modal .training-header .training-steps button::after {
   top: 32px;
   left: calc(50% + 17px);
   width: calc(100% - 34px);
