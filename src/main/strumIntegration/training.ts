@@ -2,9 +2,9 @@ import { app, BrowserWindow, dialog } from 'electron'
 import { execFile, spawn, type ChildProcess } from 'child_process'
 import { createHash, randomUUID } from 'crypto'
 import { createReadStream, existsSync } from 'fs'
-import { mkdir, readFile, stat, unlink, writeFile } from 'fs/promises'
+import { mkdir, readFile, realpath, stat, unlink, writeFile } from 'fs/promises'
 import { join } from 'path'
-import { resolvePythonCommand } from './runner'
+import { resolvePythonCommand, type PythonCommand } from './runner'
 import { sanitizeTrainingSchemaValues } from './trainingSchema'
 import type { AutoChartRunOptions, AutoChartRunResult } from './types'
 
@@ -113,18 +113,28 @@ export type TrainingJobEvent = {
 
 type RuntimeSettings = {
   developerSourceRoot?: string
+  developerPython?: PythonCommand
+  developerRuntimeLock?: DeveloperRuntimeLock
   installedWorkerPath?: string
   installedRuntimeLock?: InstalledRuntimeLock
 }
 
-type InstalledRuntimeLock = {
-  workerSha256: string
-  workerByteLength: number
+type RuntimeProbeLock = {
   runtimeId: string
   protocolVersion: string
   capabilities: string[]
   sourceRevision: string | null
+  dirty: boolean
   validatedAt: string
+}
+
+type DeveloperRuntimeLock = RuntimeProbeLock & {
+  sourceRoot: string
+}
+
+type InstalledRuntimeLock = RuntimeProbeLock & {
+  workerSha256: string
+  workerByteLength: number
 }
 
 type WorkerInvocation = {
@@ -274,20 +284,41 @@ async function fingerprintWorker(path: string): Promise<{ sha256: string; byteLe
   })
 }
 
-function runtimeLock(
+function runtimeProbeLock(runtime: TrainingRuntime): RuntimeProbeLock {
+  return {
+    runtimeId: runtime.runtimeId,
+    protocolVersion: runtime.protocolVersion,
+    capabilities: [...runtime.capabilities].sort(),
+    sourceRevision: runtime.sourceRevision,
+    dirty: runtime.dirty,
+    validatedAt: new Date().toISOString()
+  }
+}
+
+function installedRuntimeLock(
   runtime: TrainingRuntime,
   fingerprint: { sha256: string; byteLength: number }
 ): InstalledRuntimeLock {
-  const validatedAt = new Date().toISOString()
   return {
+    ...runtimeProbeLock(runtime),
     workerSha256: fingerprint.sha256,
-    workerByteLength: fingerprint.byteLength,
-    runtimeId: runtime.runtimeId,
-    protocolVersion: runtime.protocolVersion,
-    capabilities: [...runtime.capabilities],
-    sourceRevision: runtime.sourceRevision,
-    validatedAt
+    workerByteLength: fingerprint.byteLength
   }
+}
+
+function developerRuntimeLock(runtime: TrainingRuntime, sourceRoot: string): DeveloperRuntimeLock {
+  return { ...runtimeProbeLock(runtime), sourceRoot }
+}
+
+function runtimeMatchesLock(runtime: TrainingRuntime, lock: RuntimeProbeLock): boolean {
+  return (
+    runtime.runtimeId === lock.runtimeId &&
+    runtime.protocolVersion === lock.protocolVersion &&
+    runtime.sourceRevision === lock.sourceRevision &&
+    runtime.dirty === lock.dirty &&
+    [...runtime.capabilities].sort().join('\u0000') ===
+      lock.capabilities.slice().sort().join('\u0000')
+  )
 }
 
 async function verifyInstalledRuntimeLock(settings: RuntimeSettings): Promise<void> {
@@ -306,17 +337,55 @@ async function verifyInstalledRuntimeLock(settings: RuntimeSettings): Promise<vo
   }
 }
 
-async function resolveWorkerInvocation(purpose: string): Promise<WorkerInvocation> {
-  const settings = await readRuntimeSettings()
-  const env = await workerEnvironment(settings)
-  if (settings.installedWorkerPath) {
-    await verifyInstalledRuntimeLock(settings)
-    return { command: settings.installedWorkerPath, baseArgs: [], env }
-  }
-  const python = await resolvePythonCommand(purpose)
+async function bundledAdapterInvocation(
+  purpose: string,
+  settings: RuntimeSettings
+): Promise<WorkerInvocation> {
+  const python = settings.developerPython ?? (await resolvePythonCommand(purpose))
   const script = workerScriptPath()
   if (!existsSync(script)) throw new Error('OCTAVE could not find its STRUM runtime adapter.')
-  return { command: python.command, baseArgs: [...python.baseArgs, script], env }
+  return {
+    command: python.command,
+    baseArgs: [...python.baseArgs, script],
+    env: await workerEnvironment(settings)
+  }
+}
+
+async function verifyDeveloperRuntimeLock(settings: RuntimeSettings): Promise<WorkerInvocation> {
+  const lock = settings.developerRuntimeLock
+  if (
+    !settings.developerSourceRoot ||
+    !settings.developerPython ||
+    !lock ||
+    lock.sourceRoot !== settings.developerSourceRoot ||
+    !hasLegacyGuitarSources(settings.developerSourceRoot)
+  ) {
+    throw new Error('Enable the developer STRUM runtime again to validate this checkout.')
+  }
+  const invocation = await bundledAdapterInvocation('training-probe', settings)
+  const runtime = normalizeRuntime(
+    await runWorkerJsonWithInvocation(invocation, ['probe', '--json'])
+  )
+  if (runtime.kind !== 'developer_override' || !runtimeMatchesLock(runtime, lock)) {
+    throw new Error(
+      'The developer STRUM runtime changed after validation. Enable it again to continue.'
+    )
+  }
+  return invocation
+}
+
+async function resolveWorkerInvocation(purpose: string): Promise<WorkerInvocation> {
+  const settings = await readRuntimeSettings()
+  if (settings.installedWorkerPath) {
+    await verifyInstalledRuntimeLock(settings)
+    return {
+      command: settings.installedWorkerPath,
+      baseArgs: [],
+      env: await workerEnvironment(settings)
+    }
+  }
+  if (settings.developerSourceRoot) return await verifyDeveloperRuntimeLock(settings)
+  return await bundledAdapterInvocation(purpose, settings)
 }
 
 function normalizeRuntime(raw: unknown): TrainingRuntime {
@@ -389,14 +458,30 @@ export async function probeTrainingRuntime(): Promise<TrainingRuntime> {
 
 export async function enableDetectedDeveloperTrainingRuntime(): Promise<TrainingRuntime | null> {
   if (app.isPackaged) return null
-  const root = findDetectedDeveloperRoot()
-  if (!root) return null
+  const detectedRoot = findDetectedDeveloperRoot()
+  if (!detectedRoot) return null
+  const root = await realpath(detectedRoot)
+  const developerPython = await resolvePythonCommand('developer-training-runtime')
+  const settings: RuntimeSettings = {
+    developerSourceRoot: root,
+    developerPython,
+    installedWorkerPath: undefined,
+    installedRuntimeLock: undefined
+  }
+  const runtime = normalizeRuntime(
+    await runWorkerJsonWithInvocation(
+      await bundledAdapterInvocation('developer-training-runtime', settings),
+      ['probe', '--json']
+    )
+  )
+  if (runtime.kind !== 'developer_override') return null
   await mkdir(trainingRoot(), { recursive: true })
   await writeFile(
     runtimeSettingsPath(),
     JSON.stringify(
       {
-        developerSourceRoot: root,
+        ...settings,
+        developerRuntimeLock: developerRuntimeLock(runtime, root),
         installedWorkerPath: undefined,
         installedRuntimeLock: undefined
       },
@@ -405,7 +490,7 @@ export async function enableDetectedDeveloperTrainingRuntime(): Promise<Training
     ) + '\n',
     'utf8'
   )
-  return await probeTrainingRuntime()
+  return runtime
 }
 
 export async function chooseInstalledTrainingRuntime(): Promise<TrainingRuntime | null> {
@@ -441,8 +526,10 @@ export async function chooseInstalledTrainingRuntime(): Promise<TrainingRuntime 
       JSON.stringify(
         {
           installedWorkerPath,
-          installedRuntimeLock: runtimeLock(runtime, fingerprint),
-          developerSourceRoot: undefined
+          installedRuntimeLock: installedRuntimeLock(runtime, fingerprint),
+          developerSourceRoot: undefined,
+          developerPython: undefined,
+          developerRuntimeLock: undefined
         },
         null,
         2
