@@ -20,7 +20,9 @@ import {
   listDatasetLibrarySongs,
   listSongSourceCatalogs,
   summarizeDatasetSource,
+  summarizeDatasetSourceEntries,
   type DatasetCatalogSource,
+  type DatasetSourceSummary,
   type SongSourceCatalogWriteMode
 } from './import/sngTrainingExporter'
 import {
@@ -771,12 +773,19 @@ ipcMain.handle('dialog:openOutputFolder', async () => {
   return result.filePaths[0]
 })
 
-async function findDatasetPackages(folderPath: string): Promise<string[]> {
+async function findDatasetPackages(
+  folderPath: string,
+  onDirectoryScanned: (directoryCount: number) => void
+): Promise<string[]> {
   const packages: string[] = []
   const pending = [resolve(folderPath)]
+  let directoryCount = 0
   while (pending.length > 0) {
     const current = pending.pop()!
     const entries = await readdir(current, { withFileTypes: true })
+    directoryCount += 1
+    onDirectoryScanned(directoryCount)
+    await new Promise<void>((resolve) => setImmediate(resolve))
     for (const entry of entries) {
       const entryPath = join(current, entry.name)
       if (entry.isDirectory()) {
@@ -803,33 +812,67 @@ function pathExtname(fileName: string): string {
   return index === -1 ? '' : fileName.slice(index).toLowerCase()
 }
 
-ipcMain.handle('dataset:choosePackageFolder', async () => {
+ipcMain.handle('dataset:choosePackageFolder', async (event) => {
   const result = await dialog.showOpenDialog({
     properties: ['openDirectory'],
     title: 'Select Folder of .sng / .rb3con / .zip Packages'
   })
-  if (result.canceled || result.filePaths.length === 0) return []
+  if (result.canceled || result.filePaths.length === 0) return null
   try {
-    const packagePaths = await findDatasetPackages(result.filePaths[0])
-    return await Promise.all(
-      packagePaths.map(async (packagePath) => {
-        const source: DatasetCatalogSource = {
-          kind:
-            pathExtname(packagePath) === '.sng'
-              ? 'sng'
-              : pathExtname(packagePath) === '.zip'
-                ? 'zip'
-                : 'rb3con',
-          sourcePath: resolve(packagePath)
-        }
-        const candidateId = randomUUID()
-        datasetSources.set(candidateId, source)
-        return { candidateId, ...(await summarizeDatasetSource(source)) }
+    const packagePaths = await findDatasetPackages(result.filePaths[0], (directoryCount) => {
+      event.sender.send('dataset:scanProgress', {
+        phase: 'discovering',
+        completed: directoryCount,
+        total: 0
       })
-    )
+    })
+    const groupId = randomUUID()
+    const candidates: Array<{ candidateId: string; groupId: string } & DatasetSourceSummary> = []
+    let strumGeneratedCount = 0
+    for (const [index, packagePath] of packagePaths.entries()) {
+      event.sender.send('dataset:scanProgress', {
+        phase: 'inspecting',
+        completed: index,
+        total: packagePaths.length
+      })
+      const source: DatasetCatalogSource = {
+        kind:
+          pathExtname(packagePath) === '.sng'
+            ? 'sng'
+            : pathExtname(packagePath) === '.zip'
+              ? 'zip'
+              : 'rb3con',
+        sourcePath: resolve(packagePath)
+      }
+      const summaries = await summarizeDatasetSourceEntries(source)
+      for (const summary of summaries) {
+        const candidateId = randomUUID()
+        datasetSources.set(candidateId, { ...source, entryId: summary.entryId })
+        candidates.push({ candidateId, groupId, ...summary })
+        if (summary.isStrumGenerated) strumGeneratedCount += 1
+      }
+    }
+    event.sender.send('dataset:scanProgress', {
+      phase: 'inspecting',
+      completed: packagePaths.length,
+      total: packagePaths.length
+    })
+    return {
+      groupId,
+      groupName: basename(resolve(result.filePaths[0])),
+      candidates,
+      strumGeneratedCount
+    }
   } catch {
     console.error('Dataset package scan failed.')
-    return []
+    return null
+  }
+})
+
+ipcMain.handle('dataset:removePackageGroup', (_event, groupCandidateIds: string[]) => {
+  for (const candidateId of groupCandidateIds) {
+    datasetSources.delete(candidateId)
+    approvedDatasetPackageIds.delete(candidateId)
   }
 })
 
@@ -924,7 +967,7 @@ ipcMain.handle('dataset:readCandidateArtwork', async (_event, candidateId: strin
 ipcMain.handle(
   'dataset:export',
   async (
-    _event,
+    event,
     options: {
       candidateIds: string[]
       parentId: string
@@ -947,6 +990,12 @@ ipcMain.handle(
     if (selectedSources.some((source) => !source))
       throw new Error('Refresh the curation candidates and try again.')
     for (const [index, source] of (selectedSources as DatasetCatalogSource[]).entries()) {
+      event.sender.send('dataset:saveProgress', {
+        phase: 'checking',
+        completed: index,
+        total: selectedSources.length
+      })
+      await new Promise<void>((resolve) => setImmediate(resolve))
       const candidateId = options.candidateIds[index]
       if (source.kind !== 'octave-library' && !approvedDatasetPackageIds.has(candidateId)) {
         throw new Error('Review package sources before building the catalog.')
@@ -958,13 +1007,16 @@ ipcMain.handle(
         }
       }
     }
+    event.sender.send('dataset:saveProgress', {
+      phase: 'checking',
+      completed: selectedSources.length,
+      total: selectedSources.length
+    })
     const result = await buildSongSourceCatalog({
-      // A package is allowed only by this explicit selection together with the
-      // required provenance/license supplied in the same review submission.
-      // Library consent is always re-read from song.ini by the catalog service.
-      sources: (selectedSources as DatasetCatalogSource[]).map((source) =>
-        source.kind === 'octave-library' ? source : { ...source, trainingUse: 'allowed' }
-      ),
+      // Package approval is an explicit per-song curation action. The catalog
+      // service serializes only allowed records; library consent is re-read
+      // from song.ini before materialization.
+      sources: selectedSources as DatasetCatalogSource[],
       parentDir,
       catalogName: options.catalogName,
       catalogId: options.catalogId,
@@ -972,13 +1024,13 @@ ipcMain.handle(
       license: options.license,
       octaveVersion: app.getVersion(),
       mode: options.mode,
-      sourceCatalogName: options.sourceCatalogName
+      sourceCatalogName: options.sourceCatalogName,
+      onProgress: (progress) => event.sender.send('dataset:saveProgress', progress)
     })
     // Keep the catalog location inside the main-process STRUM handoff. The
     // renderer only receives a safe completion summary.
     return {
       recordCount: result.recordCount,
-      reviewRequiredCount: result.reviewRequiredCount,
       skipped: result.skipped
     }
   }

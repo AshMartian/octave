@@ -107,7 +107,7 @@
           "additionalProperties": false,
           "required": ["training_use", "provenance", "license"],
           "properties": {
-            "training_use": { "enum": ["allowed", "review_required", "prohibited"] },
+            "training_use": { "const": "allowed" },
             "provenance": { "$ref": "#/$defs/safeText" },
             "license": { "$ref": "#/$defs/safeText" }
           }

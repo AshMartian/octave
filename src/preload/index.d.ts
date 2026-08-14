@@ -22,9 +22,13 @@ interface ChartEditorAPI {
   openOutputFolderDialog: () => Promise<string | null>
   showItemInFolder: (filePath: string) => Promise<boolean>
   getDefaultAutoChartOutputDir: () => Promise<string>
-  chooseDatasetPackageFolder: () => Promise<
-    Array<{
+  chooseDatasetPackageFolder: () => Promise<{
+    groupId: string
+    groupName: string
+    strumGeneratedCount: number
+    candidates: Array<{
       candidateId: string
+      groupId: string
       kind: 'octave-library' | 'sng' | 'rb3con' | 'zip'
       songCount: number
       metadata: Record<string, string>
@@ -35,8 +39,24 @@ interface ChartEditorAPI {
       >
       trainingUse: 'allowed' | 'review_required'
       warnings: Array<{ code: string }>
+      isStrumGenerated: boolean
     }>
-  >
+  } | null>
+  removeDatasetPackageGroup: (candidateIds: string[]) => Promise<void>
+  onDatasetScanProgress: (
+    callback: (progress: {
+      phase: 'discovering' | 'inspecting'
+      completed: number
+      total: number
+    }) => void
+  ) => () => void
+  onDatasetSaveProgress: (
+    callback: (progress: {
+      phase: 'checking' | 'normalizing' | 'materializing' | 'validating'
+      completed: number
+      total: number
+    }) => void
+  ) => () => void
   chooseDatasetCatalogParent: () => Promise<{ parentId: string; name: string } | null>
   useDefaultDatasetCatalogParent: () => Promise<{ parentId: string; name: string } | null>
   restoreDatasetCatalogParent: (
@@ -81,7 +101,6 @@ interface ChartEditorAPI {
     sourceCatalogName?: string
   }) => Promise<{
     recordCount: number
-    reviewRequiredCount: number
     skipped: Array<{ reason: string }>
   }>
   openLyricsFileDialog: () => Promise<{ filePath: string; content: string } | null>

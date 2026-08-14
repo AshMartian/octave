@@ -13,7 +13,7 @@ import { serializeMidiBase64, serializeChartFile } from '../utils/midiParser'
 import { validateChartAsync } from '../utils/chartValidation'
 import { SettingsModal } from './SettingsModal'
 import { ExportModal } from './ExportModal'
-import { DatasetCurationModal } from './DatasetCurationModal'
+import { TrainingModal, type TrainingActivity } from './DatasetCurationModal'
 import { ValidationPreviewCard } from './ValidationPreviewCard'
 import './Toolbar.css'
 
@@ -69,6 +69,7 @@ export function Toolbar(): React.JSX.Element {
   const [isAudioLoaded, setIsAudioLoaded] = useState(false)
   const [showOpenDropdown, setShowOpenDropdown] = useState(false)
   const [isDatasetCurationOpen, setIsDatasetCurationOpen] = useState(false)
+  const [trainingActivity, setTrainingActivity] = useState<TrainingActivity | null>(null)
   const [isAutoChartModalOpen, setIsAutoChartModalOpen] = useState(false)
   const [autoChartFiles, setAutoChartFiles] = useState<string[]>([])
   const [autoChartFolders, setAutoChartFolders] = useState<string[]>([])
@@ -941,10 +942,26 @@ export function Toolbar(): React.JSX.Element {
         <button
           className="toolbar-button"
           onClick={() => setIsDatasetCurationOpen(true)}
-          title="Curate a MIDI-only STRUM training dataset"
+          title={
+            trainingActivity
+              ? `${trainingActivity.phase}: ${trainingActivity.completed} of ${trainingActivity.total || '?'}`
+              : 'Open the STRUM training wizard'
+          }
         >
           <span className="toolbar-icon">🧪</span>
-          <span className="toolbar-label">Dataset</span>
+          {trainingActivity && (
+            <span
+              className="toolbar-training-status"
+              style={{
+                background: `conic-gradient(var(--accent-color) ${
+                  trainingActivity.total
+                    ? Math.round((trainingActivity.completed / trainingActivity.total) * 100)
+                    : 8
+                }%, var(--bg-tertiary) 0)`
+              }}
+            />
+          )}
+          <span className="toolbar-label">Train</span>
         </button>
       </div>
 
@@ -2416,9 +2433,10 @@ export function Toolbar(): React.JSX.Element {
 
       <SettingsModal />
       {isExportModalOpen && <ExportModal onSaveBeforeExport={handleSave} />}
-      <DatasetCurationModal
+      <TrainingModal
         isOpen={isDatasetCurationOpen}
         onClose={() => setIsDatasetCurationOpen(false)}
+        onActivityChange={setTrainingActivity}
       />
     </div>
   )
