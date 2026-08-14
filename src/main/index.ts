@@ -18,8 +18,10 @@ import { importCon } from './import/conImporter'
 import {
   buildSongSourceCatalog,
   listDatasetLibrarySongs,
+  listSongSourceCatalogs,
   summarizeDatasetSource,
-  type DatasetCatalogSource
+  type DatasetCatalogSource,
+  type SongSourceCatalogWriteMode
 } from './import/sngTrainingExporter'
 import {
   ImportCancelledError,
@@ -84,6 +86,47 @@ let allowedProjectPath: string | null = null
 const datasetSources = new Map<string, DatasetCatalogSource>()
 const datasetCatalogParents = new Map<string, string>()
 const approvedDatasetPackageIds = new Set<string>()
+const DATASET_CATALOG_PARENT_KEY = 'dataset-catalog-parent.json'
+
+type DatasetCatalogParentBookmark = {
+  parentId: string
+  name: string
+  path: string
+}
+
+function datasetCatalogParentBookmarkPath(): string {
+  return join(app.getPath('userData'), DATASET_CATALOG_PARENT_KEY)
+}
+
+async function rememberDatasetCatalogParent(
+  parentPath: string,
+  name: string
+): Promise<{
+  parentId: string
+  name: string
+}> {
+  const bookmark = { parentId: randomUUID(), name, path: parentPath }
+  datasetCatalogParents.set(bookmark.parentId, bookmark.path)
+  await writeFile(datasetCatalogParentBookmarkPath(), JSON.stringify(bookmark), 'utf8')
+  return { parentId: bookmark.parentId, name: bookmark.name }
+}
+
+async function restoreDatasetCatalogParent(parentId: string): Promise<{
+  parentId: string
+  name: string
+} | null> {
+  try {
+    const bookmark = JSON.parse(
+      await readFile(datasetCatalogParentBookmarkPath(), 'utf8')
+    ) as DatasetCatalogParentBookmark
+    if (bookmark.parentId !== parentId) return null
+    if (!(await stat(bookmark.path)).isDirectory()) return null
+    datasetCatalogParents.set(bookmark.parentId, bookmark.path)
+    return { parentId: bookmark.parentId, name: bookmark.name }
+  } catch {
+    return null
+  }
+}
 
 type UpdaterState = {
   state: 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'not-available' | 'error'
@@ -796,10 +839,35 @@ ipcMain.handle('dataset:chooseCatalogParent', async () => {
     title: 'Select Parent Directory for New Catalog'
   })
   if (result.canceled || result.filePaths.length === 0) return null
-  const parentId = randomUUID()
   const parentPath = resolve(result.filePaths[0])
-  datasetCatalogParents.set(parentId, parentPath)
-  return { parentId, name: basename(parentPath) }
+  return await rememberDatasetCatalogParent(parentPath, basename(parentPath))
+})
+
+ipcMain.handle('dataset:useDefaultCatalogParent', async () => {
+  if (!allowedProjectPath) return null
+  try {
+    const parentPath = join(allowedProjectPath, 'Catalog Parent')
+    await mkdir(parentPath, { recursive: true })
+    return await rememberDatasetCatalogParent(parentPath, 'Catalog Parent')
+  } catch {
+    console.error('Dataset default catalog parent could not be prepared.')
+    return null
+  }
+})
+
+ipcMain.handle('dataset:restoreCatalogParent', async (_event, parentId: string) => {
+  return await restoreDatasetCatalogParent(parentId)
+})
+
+ipcMain.handle('dataset:listCatalogs', async (_event, parentId: string) => {
+  const parentDir = datasetCatalogParents.get(parentId)
+  if (!parentDir) return []
+  try {
+    return await listSongSourceCatalogs(parentDir)
+  } catch {
+    console.error('Dataset catalog listing failed.')
+    return []
+  }
 })
 
 ipcMain.handle('dataset:scanLibrary', async () => {
@@ -847,6 +915,12 @@ ipcMain.handle('dataset:setPackageApproved', (_event, candidateId: string, appro
   return true
 })
 
+ipcMain.handle('dataset:readCandidateArtwork', async (_event, candidateId: string) => {
+  const source = datasetSources.get(candidateId)
+  if (!source || source.kind !== 'octave-library' || !isPathAllowed(source.sourcePath)) return null
+  return await readAlbumArtFromSongPath(source.sourcePath)
+})
+
 ipcMain.handle(
   'dataset:export',
   async (
@@ -858,9 +932,14 @@ ipcMain.handle(
       catalogId: string
       provenance: string
       license: string
+      mode: SongSourceCatalogWriteMode
+      sourceCatalogName?: string
     }
   ) => {
     const parentDir = datasetCatalogParents.get(options.parentId)
+    if (!['create', 'update', 'clone'].includes(options.mode)) {
+      throw new Error('Choose a valid catalog save mode.')
+    }
     const selectedSources = options.candidateIds.map((candidateId) =>
       datasetSources.get(candidateId)
     )
@@ -891,7 +970,9 @@ ipcMain.handle(
       catalogId: options.catalogId,
       provenance: options.provenance,
       license: options.license,
-      octaveVersion: app.getVersion()
+      octaveVersion: app.getVersion(),
+      mode: options.mode,
+      sourceCatalogName: options.sourceCatalogName
     })
     // Keep the catalog location inside the main-process STRUM handoff. The
     // renderer only receives a safe completion summary.
@@ -1573,9 +1654,7 @@ ipcMain.handle('venue:writeJson', async (_event, songPath: string, data: unknown
   }
 })
 
-// Read album art (album.png, album.jpg, or album.jpeg)
-ipcMain.handle('song:readAlbumArt', async (_event, songPath: string) => {
-  if (!isPathAllowed(songPath)) return null
+async function readAlbumArtFromSongPath(songPath: string): Promise<string | null> {
   const extensions = ['png', 'jpg', 'jpeg']
 
   for (const ext of extensions) {
@@ -1590,6 +1669,12 @@ ipcMain.handle('song:readAlbumArt', async (_event, songPath: string) => {
   }
 
   return null
+}
+
+// Read album art (album.png, album.jpg, or album.jpeg)
+ipcMain.handle('song:readAlbumArt', async (_event, songPath: string) => {
+  if (!isPathAllowed(songPath)) return null
+  return await readAlbumArtFromSongPath(songPath)
 })
 
 // Write album art

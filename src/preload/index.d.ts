@@ -38,6 +38,19 @@ interface ChartEditorAPI {
     }>
   >
   chooseDatasetCatalogParent: () => Promise<{ parentId: string; name: string } | null>
+  useDefaultDatasetCatalogParent: () => Promise<{ parentId: string; name: string } | null>
+  restoreDatasetCatalogParent: (
+    parentId: string
+  ) => Promise<{ parentId: string; name: string } | null>
+  listDatasetCatalogs: (parentId: string) => Promise<
+    Array<{
+      catalogName: string
+      catalogId: string
+      recordCount: number
+      libraryRecordCount: number
+      externalRecordCount: number
+    }>
+  >
   scanDatasetLibrary: () => Promise<
     Array<{
       candidateId: string
@@ -56,6 +69,7 @@ interface ChartEditorAPI {
   >
   setDatasetSongOptIn: (candidateId: string, optedIn: boolean) => Promise<boolean>
   setDatasetPackageApproved: (candidateId: string, approved: boolean) => Promise<boolean>
+  readDatasetCandidateArtwork: (candidateId: string) => Promise<string | null>
   buildSongSourceCatalog: (options: {
     candidateIds: string[]
     parentId: string
@@ -63,6 +77,8 @@ interface ChartEditorAPI {
     catalogId: string
     provenance: string
     license: string
+    mode: 'create' | 'update' | 'clone'
+    sourceCatalogName?: string
   }) => Promise<{
     recordCount: number
     reviewRequiredCount: number
