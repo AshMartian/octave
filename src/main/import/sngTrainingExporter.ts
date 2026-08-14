@@ -159,6 +159,11 @@ export interface SongSourceCatalogSummary {
   externalRecordCount: number
 }
 
+type CatalogCuration = {
+  provenance: string
+  license: string
+}
+
 export interface SongSourceCatalogProgress {
   phase: 'normalizing' | 'materializing' | 'validating'
   completed: number
@@ -982,7 +987,12 @@ export async function listSongSourceCatalogs(
           if (!validateCatalogManifestSchema(catalog)) return null
           await validateStagedCatalog(catalogRoot)
           const records = await readCatalogRecords(catalogRoot)
-          const rights = records[0].rights as { provenance: string; license: string }
+          // v1 catalogs created before catalog-level curation metadata keep
+          // their rights on every record. Preserve that compatibility while
+          // preferring the durable catalog-wide values for the editor.
+          const legacyRights = records[0].rights as CatalogCuration
+          const curation = catalog.curation as CatalogCuration | undefined
+          const rights = curation ?? legacyRights
           const libraryRecordCount = records.filter(
             (record) => (record.import as { kind?: string }).kind === 'song_folder'
           ).length
@@ -1086,6 +1096,12 @@ export async function buildSongSourceCatalog(options: {
     await mkdir(path.join(stagingRoot, 'assets', 'sha256'), { recursive: true })
     if (mode === 'update' || mode === 'clone') {
       const existingRecords = await readCatalogRecords(stagingRoot)
+      if (mode === 'update' || mode === 'clone') {
+        for (const record of existingRecords) {
+          record.rights = { training_use: 'allowed', provenance, license }
+          validateCatalogRecord(record)
+        }
+      }
       records.push(...existingRecords)
       for (const record of existingRecords) {
         const notes = (record.chart as { notes_midi: CatalogAsset }).notes_midi
@@ -1173,6 +1189,7 @@ export async function buildSongSourceCatalog(options: {
       format: 'octave-song-source-catalog/v1',
       catalog_id: existingCatalog?.catalog_id ?? catalogId,
       records: 'records.jsonl',
+      curation: { provenance, license },
       created_by: { product: 'octave', version: options.octaveVersion }
     }
     if (!records.length) throw new Error('No valid source records were available for the catalog.')
