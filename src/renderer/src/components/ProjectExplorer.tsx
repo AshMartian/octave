@@ -507,7 +507,10 @@ export function ProjectExplorer(): React.JSX.Element {
         postProcessing: Array.isArray(venueJson.postProcessing) ? venueJson.postProcessing as VenueTrackData['postProcessing'] : [],
         stage: Array.isArray(venueJson.stage) ? venueJson.stage as VenueTrackData['stage'] : [],
         performer: Array.isArray(venueJson.performer) ? venueJson.performer as VenueTrackData['performer'] : [],
-        cameraCuts: Array.isArray(venueJson.cameraCuts) ? venueJson.cameraCuts as VenueTrackData['cameraCuts'] : []
+        cameraCuts: Array.isArray(venueJson.cameraCuts) ? venueJson.cameraCuts as VenueTrackData['cameraCuts'] : [],
+        preservedTextEvents: Array.isArray(venueJson.preservedTextEvents)
+          ? venueJson.preservedTextEvents as VenueTrackData['preservedTextEvents']
+          : []
       }
 
       store.getState().updateVenueTrack(venueTrack)
@@ -546,6 +549,7 @@ export function ProjectExplorer(): React.JSX.Element {
         && venueTrack.stage.length === 0
         && venueTrack.performer.length === 0
         && venueTrack.cameraCuts.length === 0
+        && !venueTrack.preservedTextEvents?.length
       ) {
         await loadVenueTrack(activeSongId, folderPath)
       }
