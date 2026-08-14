@@ -27,6 +27,17 @@ import {
   runAutoChart
 } from './strumIntegration/runner'
 import {
+  cancelTrainingJob,
+  enableDetectedDeveloperTrainingRuntime,
+  inspectTrainingCatalog,
+  killAllTrainingJobs,
+  listTrainingArtifacts,
+  listTrainingPipelines,
+  probeTrainingRuntime,
+  startTrainingPrepare,
+  startTrainingRun
+} from './strumIntegration/training'
+import {
   ensureBootstrappedPython,
   getRuntimeStatus,
   isBootstrapTarget
@@ -99,6 +110,7 @@ if (!gotSingleInstanceLock) {
 app.on('before-quit', () => {
   try {
     killAllRunningJobs()
+    killAllTrainingJobs()
   } catch (error) {
     console.warn('[Quit] Failed to terminate STRUM workers:', error)
   }
@@ -541,6 +553,7 @@ app.whenReady().then(() => {
             // "OCTAVE cannot be closed" check.
             try {
               killAllRunningJobs()
+              killAllTrainingJobs()
             } catch (error) {
               console.warn('[Updater] Failed to terminate STRUM workers before install:', error)
             }
@@ -1068,6 +1081,99 @@ ipcMain.handle(
     }
   }
 )
+
+function datasetCatalogRoot(parentId: string, catalogName: string): string | null {
+  const parentDir = datasetCatalogParents.get(parentId)
+  if (!parentDir || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(catalogName)) return null
+  const root = resolve(parentDir, catalogName)
+  const relative = root.slice(resolve(parentDir).length)
+  return relative.startsWith('/') || relative.startsWith('\\') ? root : null
+}
+
+ipcMain.handle('training:runtime', async () => {
+  try {
+    return await probeTrainingRuntime()
+  } catch {
+    return null
+  }
+})
+
+ipcMain.handle('training:enableDeveloperRuntime', async () => {
+  try {
+    return await enableDetectedDeveloperTrainingRuntime()
+  } catch {
+    return null
+  }
+})
+
+ipcMain.handle('training:pipelines', async () => {
+  try {
+    return await listTrainingPipelines()
+  } catch {
+    return []
+  }
+})
+
+ipcMain.handle('training:artifacts', async () => await listTrainingArtifacts())
+
+ipcMain.handle(
+  'training:inspectCatalog',
+  async (_event, options: { parentId: string; catalogName: string; pipelineId: string }) => {
+    const root = datasetCatalogRoot(options.parentId, options.catalogName)
+    if (!root || !existsSync(join(root, 'catalog.json'))) {
+      throw new Error('Select a catalog from the active catalog parent first.')
+    }
+    try {
+      return await inspectTrainingCatalog(root, options.pipelineId)
+    } catch {
+      throw new Error('STRUM could not inspect the selected catalog.')
+    }
+  }
+)
+
+ipcMain.handle(
+  'training:prepare',
+  async (
+    _event,
+    options: {
+      parentId: string
+      catalogId: string
+      catalogName: string
+      pipelineId: string
+      splitSeed?: number
+    }
+  ) => {
+    const root = datasetCatalogRoot(options.parentId, options.catalogName)
+    if (!root || !existsSync(join(root, 'catalog.json'))) {
+      throw new Error('Select a catalog from the active catalog parent first.')
+    }
+    try {
+      return await startTrainingPrepare({ ...options, catalogRoot: root })
+    } catch {
+      throw new Error('STRUM could not start catalog preparation.')
+    }
+  }
+)
+
+ipcMain.handle(
+  'training:start',
+  async (
+    _event,
+    options: {
+      taskViewId: string
+      pipelineId: string
+      train: { epochs: number; batchSize: number; device: string; seed: number }
+    }
+  ) => {
+    try {
+      return await startTrainingRun(options)
+    } catch {
+      throw new Error('STRUM could not start this training run.')
+    }
+  }
+)
+
+ipcMain.handle('training:cancel', async (_event, jobId: string) => await cancelTrainingJob(jobId))
 
 // Reveal file in OS file explorer
 ipcMain.handle('dialog:showItemInFolder', async (_event, filePath: string) => {

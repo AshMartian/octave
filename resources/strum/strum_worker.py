@@ -3232,6 +3232,14 @@ def load_payload(payload_file: Path) -> dict[str, Any]:
 
 
 def main() -> int:
+    # The auto-chart payload mode predates the versioned training protocol.
+    # Keep it for release inference compatibility, but route every contract
+    # command through the JSON-only adapter before importing any legacy code.
+    if len(sys.argv) > 1 and sys.argv[1] != "--payload-file":
+        from training_protocol import main as training_protocol_main
+
+        return training_protocol_main(sys.argv[1:])
+
     parser = argparse.ArgumentParser(description="Run STRUM auto-charting for OCTAVE.")
     parser.add_argument("--payload-file", required=True, type=Path)
     args = parser.parse_args()
