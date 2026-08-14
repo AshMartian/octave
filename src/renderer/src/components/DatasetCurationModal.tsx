@@ -17,7 +17,7 @@ type SourceCandidate = {
 }
 
 type CatalogSaveMode = 'create' | 'update' | 'clone'
-export type TrainingStep = 'curate' | 'prepare' | 'train'
+export type TrainingStep = 'learn' | 'curate' | 'prepare' | 'train' | 'deploy'
 
 export type TrainingActivity = {
   step: TrainingStep
@@ -44,12 +44,55 @@ type PackageGroup = {
 }
 
 const CATALOG_PARENT_STORAGE_KEY = 'octave.datasetCatalogParent'
+const TRAINING_LEARN_SEEN_STORAGE_KEY = 'octave.trainingLearnSeen'
+
+const TRAINING_STEPS = [
+  'learn',
+  'curate',
+  'prepare',
+  'train',
+  'deploy'
+] as const satisfies readonly TrainingStep[]
 
 const TRAINING_STEP_TAGLINES = {
+  learn: 'Understand the local, personal-use training workflow before curating a catalog.',
   curate: 'Select approved songs and sources for your STRUM catalog.',
   prepare: 'Create a STRUM task view from the approved catalog assets.',
-  train: 'Run STRUM from the prepared catalog and follow progress in the background.'
+  train: 'Run STRUM from the prepared catalog and follow progress in the background.',
+  deploy: 'Choose a local checkpoint to use as OCTAVE’s default auto-chart profile.'
 } as const satisfies Record<TrainingStep, string>
+
+const TRAINING_STEP_DETAILS = [
+  {
+    step: 'learn',
+    title: 'Learn',
+    description: 'Review the workflow, responsibilities, and what OCTAVE keeps local.'
+  },
+  {
+    step: 'curate',
+    title: 'Curate',
+    description: 'Choose music you are allowed to use and build a permission-backed catalog.'
+  },
+  {
+    step: 'prepare',
+    title: 'Prepare',
+    description: 'Create a STRUM task view from approved catalog assets and metadata.'
+  },
+  {
+    step: 'train',
+    title: 'Train',
+    description: 'Run STRUM in the background and evaluate the checkpoints it produces.'
+  },
+  {
+    step: 'deploy',
+    title: 'Deploy',
+    description: 'Select a checkpoint as a local OCTAVE auto-chart profile and default.'
+  }
+] as const satisfies ReadonlyArray<{
+  step: TrainingStep
+  title: string
+  description: string
+}>
 
 function candidateLabel(candidate: SourceCandidate): string {
   const artist = candidate.metadata.artist
@@ -71,6 +114,15 @@ function TrainingStepIcon({
       </svg>
     )
   }
+  if (step === 'learn') {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <circle cx="12" cy="12" r="8.5" />
+        <path d="M12 10v5" />
+        <path d="M12 7.2h.01" />
+      </svg>
+    )
+  }
   if (step === 'curate') {
     return (
       <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -87,6 +139,15 @@ function TrainingStepIcon({
         <circle cx="5" cy="9" r="2" />
         <circle cx="12" cy="15" r="2" />
         <circle cx="19" cy="7" r="2" />
+      </svg>
+    )
+  }
+  if (step === 'deploy') {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M12 3v11" />
+        <path d="m8 10 4 4 4-4" />
+        <path d="M5 17.5v2a1.5 1.5 0 0 0 1.5 1.5h11a1.5 1.5 0 0 0 1.5-1.5v-2" />
       </svg>
     )
   }
@@ -145,7 +206,11 @@ export function TrainingModal({
   const [existingCatalogs, setExistingCatalogs] = useState<ExistingCatalog[]>([])
   const [selectedCatalog, setSelectedCatalog] = useState<ExistingCatalog | null>(null)
   const [saveMode, setSaveMode] = useState<CatalogSaveMode>('create')
-  const [activeStep, setActiveStep] = useState<TrainingStep>('curate')
+  const [activeStep, setActiveStep] = useState<TrainingStep>('learn')
+  const [hasSeenLearn, setHasSeenLearn] = useState(
+    () => localStorage.getItem(TRAINING_LEARN_SEEN_STORAGE_KEY) === 'true'
+  )
+  const [hasInitializedOpening, setHasInitializedOpening] = useState(false)
   const [catalogName, setCatalogName] = useState('octave-curated-catalog')
   const [catalogId, setCatalogId] = useState('octave-curated-dataset')
   const [provenance, setProvenance] = useState('Curated in Octave')
@@ -207,6 +272,45 @@ export function TrainingModal({
     localStorage.setItem(CATALOG_PARENT_STORAGE_KEY, catalogParent.parentId)
     void window.api.listDatasetCatalogs(catalogParent.parentId).then(setExistingCatalogs)
   }, [catalogParent])
+
+  useEffect(() => {
+    if (!isOpen) {
+      setHasInitializedOpening(false)
+      return
+    }
+    if (hasInitializedOpening) return
+    if (!hasSeenLearn) {
+      setActiveStep('learn')
+      setHasInitializedOpening(true)
+      return
+    }
+    if (!catalogParent) return
+    let current = true
+    void window.api.listDatasetCatalogs(catalogParent.parentId).then((catalogs) => {
+      if (!current) return
+      setExistingCatalogs(catalogs)
+      const existingCatalog = catalogs[0]
+      if (existingCatalog) {
+        setSelectedCatalog(existingCatalog)
+        setSaveMode('update')
+        setActiveStep('prepare')
+      } else {
+        setSelectedCatalog(null)
+        setSaveMode('create')
+        setActiveStep('curate')
+      }
+      setHasInitializedOpening(true)
+    })
+    return () => {
+      current = false
+    }
+  }, [catalogParent, hasInitializedOpening, hasSeenLearn, isOpen])
+
+  useEffect(() => {
+    if (!isOpen || activeStep !== 'learn') return
+    localStorage.setItem(TRAINING_LEARN_SEEN_STORAGE_KEY, 'true')
+    setHasSeenLearn(true)
+  }, [activeStep, isOpen])
 
   useEffect(() => {
     const unsubscribeScan = window.api.onDatasetScanProgress(setScanProgress)
@@ -509,12 +613,14 @@ export function TrainingModal({
             <span aria-hidden="true">🧪</span> Training
           </h2>
           <nav className="training-steps" aria-label="Training steps">
-            {(['curate', 'prepare', 'train'] as const).map((step, index) => {
-              const activeStepIndex = ['curate', 'prepare', 'train'].indexOf(activeStep)
+            {TRAINING_STEPS.map((step, index) => {
+              const activeStepIndex = TRAINING_STEPS.indexOf(activeStep)
               const available =
+                step === 'learn' ||
                 step === 'curate' ||
                 (step === 'prepare' && selectedCatalog !== null) ||
-                (step === 'train' && selectedCatalog !== null)
+                (step === 'train' && selectedCatalog !== null) ||
+                (step === 'deploy' && selectedCatalog !== null)
               return (
                 <button
                   key={step}
@@ -558,7 +664,40 @@ export function TrainingModal({
               of {saveProgress?.total ?? '?'}.
             </p>
           )}
-          {activeStep === 'curate' ? (
+          {activeStep === 'learn' ? (
+            <section className="training-learn">
+              <div className="training-learn-intro">
+                <h3>
+                  <span className="dataset-heading-icon" aria-hidden="true">
+                    ✦
+                  </span>{' '}
+                  Train thoughtfully
+                </h3>
+                <p>
+                  Training turns a catalog of approved songs into local STRUM checkpoints. OCTAVE
+                  keeps the catalog, task views, and eventual profiles as local inputs and outputs.
+                </p>
+              </div>
+              <ol className="training-learn-path">
+                {TRAINING_STEP_DETAILS.map((detail, index) => (
+                  <li key={detail.step}>
+                    <span aria-hidden="true">{index + 1}</span>
+                    <div>
+                      <strong>{detail.title}</strong>
+                      <p>{detail.description}</p>
+                    </div>
+                  </li>
+                ))}
+              </ol>
+              <aside className="training-use-notice">
+                <strong>Personal and offline use</strong>
+                <p>
+                  Only train with music you own or have clear permission to use. Keep trained models
+                  offline, and do not share them unless every training input is music you own.
+                </p>
+              </aside>
+            </section>
+          ) : activeStep === 'curate' ? (
             <>
               <section className="dataset-section dataset-details">
                 <h3>
@@ -779,21 +918,50 @@ export function TrainingModal({
                 Continue to Train
               </button>
             </section>
-          ) : (
+          ) : activeStep === 'train' ? (
             <section className="training-step-panel">
               <h3>Train</h3>
               <p>
                 Training runs will use the prepared catalog view and record only catalog IDs and
                 hashes. STRUM run configuration will be added here next.
               </p>
+              <button className="dataset-primary" onClick={() => setActiveStep('deploy')}>
+                Review deployment
+              </button>
+            </section>
+          ) : (
+            <section className="training-step-panel training-deploy-panel">
+              <h3>Deploy</h3>
+              <p>
+                Choose a reviewed STRUM checkpoint and save it as a local OCTAVE auto-chart profile.
+                Saving will make that profile the default in Auto Chart settings.
+              </p>
+              <dl>
+                <div>
+                  <dt>Catalog</dt>
+                  <dd>{selectedCatalog?.catalogName ?? 'Select a catalog first'}</dd>
+                </div>
+                <div>
+                  <dt>Checkpoint</dt>
+                  <dd>Checkpoint selection coming next</dd>
+                </div>
+                <div>
+                  <dt>Profile</dt>
+                  <dd>Local auto-chart default</dd>
+                </div>
+              </dl>
               <button className="dataset-primary" disabled>
-                Training configuration coming next
+                Save as Auto Chart default
               </button>
             </section>
           )}
         </main>
-        <footer>
-          {activeStep === 'curate' ? (
+        <footer className={activeStep === 'learn' ? 'training-learn-footer' : undefined}>
+          {activeStep === 'learn' ? (
+            <button className="dataset-primary" onClick={() => setActiveStep('curate')}>
+              I understand — Start Curating <span aria-hidden="true">→</span>
+            </button>
+          ) : activeStep === 'curate' ? (
             <>
               <span>
                 {allowedLibrarySongs.length} library records allowed; {selectedPackages.size}{' '}

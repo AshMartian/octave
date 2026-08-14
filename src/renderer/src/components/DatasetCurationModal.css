@@ -8,7 +8,7 @@
   background: rgba(0, 0, 0, 0.68);
 }
 .dataset-curation-modal {
-  width: min(900px, 100%);
+  width: min(980px, 100%);
   max-height: 90vh;
   display: flex;
   flex-direction: column;
@@ -39,7 +39,7 @@
 }
 .training-steps {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   align-items: start;
   padding: 20px max(46px, 9%);
   background: color-mix(in srgb, var(--bg-tertiary) 72%, var(--bg-secondary));
@@ -49,7 +49,7 @@
   position: absolute;
   top: 19px;
   left: 50%;
-  width: min(480px, calc(100% - 360px));
+  width: min(620px, calc(100% - 340px));
   padding: 0;
   background: transparent;
   border: 0;
@@ -175,6 +175,9 @@
 .dataset-curation-modal > footer {
   border-top: 1px solid var(--border-color);
   border-bottom: 0;
+}
+.dataset-curation-modal > footer.training-learn-footer {
+  justify-content: flex-end;
 }
 .dataset-curation-modal h2,
 .dataset-curation-modal h3 {
@@ -480,6 +483,77 @@
   border-radius: 8px;
   background: var(--bg-tertiary);
 }
+.training-learn {
+  display: grid;
+  gap: 16px;
+  max-width: 720px;
+}
+.training-learn-intro {
+  display: grid;
+  gap: 6px;
+}
+.training-learn-intro p {
+  margin: 0;
+  font-size: 13px;
+}
+.training-learn-path {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.training-learn-path li {
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr);
+  gap: 9px;
+  align-items: start;
+  padding: 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 7px;
+  background: var(--bg-tertiary);
+}
+.training-learn-path li:last-child {
+  grid-column: 1 / -1;
+}
+.training-learn-path li > span {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  color: var(--accent-color);
+  background: color-mix(in srgb, var(--accent-color) 12%, var(--bg-secondary));
+  border: 1px solid color-mix(in srgb, var(--accent-color) 32%, var(--border-color));
+  border-radius: 50%;
+  font-size: 11px;
+  font-weight: 700;
+}
+.training-learn-path strong {
+  display: block;
+  font-size: 12px;
+}
+.training-learn-path p {
+  margin: 2px 0 0;
+  font-size: 11px;
+}
+.training-use-notice {
+  padding: 12px;
+  color: #f6d99c;
+  background: rgba(160, 110, 25, 0.18);
+  border: 1px solid rgba(191, 143, 50, 0.3);
+  border-radius: 7px;
+}
+.training-use-notice strong {
+  display: block;
+  color: #ffe7ac;
+  font-size: 12px;
+}
+.training-use-notice p {
+  margin: 3px 0 0;
+  color: inherit;
+  font-size: 12px;
+}
 .training-step-panel dl {
   display: grid;
   gap: 8px;
@@ -515,8 +589,12 @@
     min-height: 65px;
   }
   .dataset-details,
-  .dataset-editor-fields {
+  .dataset-editor-fields,
+  .training-learn-path {
     grid-template-columns: 1fr;
+  }
+  .training-learn-path li:last-child {
+    grid-column: auto;
   }
   .dataset-curation-modal footer {
     align-items: start;
