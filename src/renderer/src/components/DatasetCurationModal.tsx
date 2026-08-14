@@ -64,11 +64,6 @@ const TRAINING_STEP_TAGLINES = {
 
 const TRAINING_STEP_DETAILS = [
   {
-    step: 'learn',
-    title: 'Learn',
-    description: 'Review the workflow, responsibilities, and what OCTAVE keeps local.'
-  },
-  {
     step: 'curate',
     title: 'Curate',
     description: 'Choose music you are allowed to use and build a permission-backed catalog.'
@@ -679,9 +674,9 @@ export function TrainingModal({
                 </p>
               </div>
               <ol className="training-learn-path">
-                {TRAINING_STEP_DETAILS.map((detail, index) => (
+                {TRAINING_STEP_DETAILS.map((detail) => (
                   <li key={detail.step}>
-                    <span aria-hidden="true">{index + 1}</span>
+                    <span aria-hidden="true">{TRAINING_STEPS.indexOf(detail.step) + 1}</span>
                     <div>
                       <strong>{detail.title}</strong>
                       <p>{detail.description}</p>
