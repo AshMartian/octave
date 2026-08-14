@@ -562,6 +562,10 @@ describe('exportSngTrainingMidi', () => {
         recordCount: 2
       })
     ])
+    const updatedManifest = JSON.parse(
+      await readFile(join(parentDir, 'editable-catalog', 'catalog.json'), 'utf8')
+    ) as { curation: { provenance: string; license: string } }
+    expect(updatedManifest.curation).toEqual({ provenance: 'Reviewed', license: 'test-only' })
 
     const clone = await buildSongSourceCatalog({
       sources: [{ kind: 'octave-library', sourcePath: secondSong }],

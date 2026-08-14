@@ -733,6 +733,19 @@ export function TrainingModal({
     }
   }
 
+  const updateCatalog = (
+    event: React.MouseEvent<HTMLButtonElement>,
+    catalog: ExistingCatalog
+  ): void => {
+    // The catalog row remains selectable, but Update is a separate action. Keep
+    // this explicit so a click can never be interpreted as a row selection or
+    // form submission before the update request is started.
+    event.preventDefault()
+    event.stopPropagation()
+    chooseExistingCatalog(catalog)
+    void buildCatalog(catalog)
+  }
+
   const enableDeveloperRuntime = async (): Promise<void> => {
     setError(null)
     const runtime = await window.api.enableDeveloperTrainingRuntime()
@@ -1025,12 +1038,9 @@ export function TrainingModal({
                         </button>
                         {isSelected && saveMode === 'update' && (
                           <button
+                            type="button"
                             className="dataset-catalog-update"
-                            onClick={(event) => {
-                              event.stopPropagation()
-                              chooseExistingCatalog(catalog)
-                              void buildCatalog(catalog)
-                            }}
+                            onClick={(event) => updateCatalog(event, catalog)}
                             disabled={exporting}
                           >
                             {exporting ? 'Updating…' : 'Update'}

@@ -18,7 +18,10 @@ my-catalog/
     └── sha256/<hash>/...    # OCTAVE-managed materialized MIDI/audio assets
 ```
 
-`catalog.json.records` is a relative JSONL path. A catalog record contains a
+`catalog.json.records` is a relative JSONL path. `catalog.json.curation` records
+the catalog-wide provenance and license/permission basis selected in OCTAVE, so
+the catalog editor can restore them without inferring state from a song record.
+A catalog record contains a
 stable `source_id`, content hashes, normalized metadata, chart coverage, a
 rights decision, and references only to materialized assets under `assets/`.
 It never contains the original package path, SMB path, URL, user home path, or

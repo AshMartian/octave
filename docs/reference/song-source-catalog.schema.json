@@ -14,6 +14,15 @@
       "type": "string",
       "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[^\\\\]+\\.jsonl$"
     },
+    "curation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provenance", "license"],
+      "properties": {
+        "provenance": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "license": { "type": "string", "minLength": 1, "maxLength": 512 }
+      }
+    },
     "created_by": {
       "type": "object",
       "additionalProperties": false,
