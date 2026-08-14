@@ -674,9 +674,9 @@ export function TrainingModal({
                 </p>
               </div>
               <ol className="training-learn-path">
-                {TRAINING_STEP_DETAILS.map((detail) => (
+                {TRAINING_STEP_DETAILS.map((detail, index) => (
                   <li key={detail.step}>
-                    <span aria-hidden="true">{TRAINING_STEPS.indexOf(detail.step) + 1}</span>
+                    <span aria-hidden="true">{index + 1}</span>
                     <div>
                       <strong>{detail.title}</strong>
                       <p>{detail.description}</p>
