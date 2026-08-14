@@ -775,7 +775,8 @@ export function Toolbar(): React.JSX.Element {
         venueTrack.postProcessing.length > 0 ||
         venueTrack.stage.length > 0 ||
         venueTrack.performer.length > 0 ||
-        venueTrack.cameraCuts.length > 0
+        venueTrack.cameraCuts.length > 0 ||
+        venueTrack.preservedTextEvents?.length
       ) {
         await window.api.writeVenueJson(state.song.folderPath, venueTrack)
       }
