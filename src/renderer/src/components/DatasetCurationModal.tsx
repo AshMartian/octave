@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import './DatasetCurationModal.css'
 
 type SourceCandidate = {
@@ -517,21 +517,19 @@ export function TrainingModal({
               (step === 'prepare' && selectedCatalog !== null) ||
               (step === 'train' && selectedCatalog !== null)
             return (
-              <Fragment key={step}>
-                <button
-                  className={
-                    activeStep === step ? 'active' : index < activeStepIndex ? 'complete' : ''
-                  }
-                  disabled={!available}
-                  onClick={() => setActiveStep(step)}
-                >
-                  <span className="training-step-orb" aria-hidden="true">
-                    <TrainingStepIcon step={step} complete={index < activeStepIndex} />
-                  </span>
-                  <span className="training-step-label">{step}</span>
-                </button>
-                {index < 2 && <span className="training-step-connector" aria-hidden="true" />}
-              </Fragment>
+              <button
+                key={step}
+                className={
+                  activeStep === step ? 'active' : index < activeStepIndex ? 'complete' : ''
+                }
+                disabled={!available}
+                onClick={() => setActiveStep(step)}
+              >
+                <span className="training-step-orb" aria-hidden="true">
+                  <TrainingStepIcon step={step} complete={index < activeStepIndex} />
+                </span>
+                <span className="training-step-label">{step}</span>
+              </button>
             )
           })}
         </nav>
