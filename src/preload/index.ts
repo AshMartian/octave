@@ -190,6 +190,19 @@ const api = {
     sourceRevision: string | null
   } | null> => ipcRenderer.invoke('training:enableDeveloperRuntime'),
 
+  chooseInstalledTrainingRuntime: (): Promise<{
+    runtimeId: string
+    displayName: string
+    kind: 'bundled_inference' | 'developer_override' | 'managed_checkout' | 'installed_runtime'
+    protocolVersion: string
+    capabilities: string[]
+    pipelineIds: string[]
+    deviceSupport: string[]
+    trainingSetupRequired: boolean
+    dirty: boolean
+    sourceRevision: string | null
+  } | null> => ipcRenderer.invoke('training:chooseInstalledRuntime'),
+
   listTrainingPipelines: (): Promise<
     Array<{
       id: string
@@ -227,7 +240,40 @@ const api = {
       checkpointManifestHash: string
       createdAt: string
     }>
+    profiles: Array<{
+      profileId: string
+      runId: string
+      pipelineId: string
+      runtimeId: string
+      createdAt: string
+      isDefault: boolean
+    }>
   }> => ipcRenderer.invoke('training:artifacts'),
+
+  inspectTrainingCheckpoint: (
+    runId: string
+  ): Promise<{
+    runId: string
+    pipelineId: string
+    runtimeId: string
+    taskViewId: string
+    taskViewHash: string
+    checkpointManifestHash: string
+    deployable: boolean
+    deploymentReason: string | null
+    components: Array<{ id: string; sha256: string; byteLength: number }>
+  }> => ipcRenderer.invoke('training:inspectCheckpoint', runId),
+
+  saveAutoChartProfile: (
+    runId: string
+  ): Promise<{
+    profileId: string
+    runId: string
+    pipelineId: string
+    runtimeId: string
+    createdAt: string
+    isDefault: boolean
+  }> => ipcRenderer.invoke('training:saveAutoChartProfile', runId),
 
   inspectTrainingCatalog: (options: {
     parentId: string

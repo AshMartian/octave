@@ -275,7 +275,12 @@
   color: var(--text-muted);
   font-size: 12px;
 }
-.training-runtime-card .dataset-secondary {
+.training-runtime-actions {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}
+.training-runtime-actions .dataset-secondary {
   margin-left: auto;
   white-space: nowrap;
 }
@@ -318,6 +323,31 @@
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
   margin: 16px 0;
+}
+.training-checkpoint-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 14px 0 2px;
+}
+.training-checkpoint-summary > div {
+  display: grid;
+  gap: 4px;
+  min-height: 64px;
+  padding: 11px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: color-mix(in srgb, #58a6ff 7%, var(--bg-tertiary));
+}
+.training-checkpoint-summary span {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.training-checkpoint-summary strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
 }
 .training-inspection-grid > div {
   display: grid;
@@ -407,10 +437,18 @@
   color: #e7c98b;
   line-height: 1.45;
 }
+.training-profile-summary {
+  display: grid;
+  gap: 6px;
+  margin: 16px 0 2px;
+  color: #b8f3cd;
+  font-size: 12px;
+}
 
 @media (max-width: 680px) {
   .training-inspection-grid,
-  .training-config-grid {
+  .training-config-grid,
+  .training-checkpoint-summary {
     grid-template-columns: 1fr;
   }
   .training-runtime-card,
@@ -418,7 +456,7 @@
     align-items: flex-start;
     flex-direction: column;
   }
-  .training-runtime-card .dataset-secondary {
+  .training-runtime-actions {
     margin-left: 0;
   }
 }

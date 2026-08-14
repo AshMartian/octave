@@ -133,6 +133,18 @@ interface ChartEditorAPI {
     dirty: boolean
     sourceRevision: string | null
   } | null>
+  chooseInstalledTrainingRuntime: () => Promise<{
+    runtimeId: string
+    displayName: string
+    kind: 'bundled_inference' | 'developer_override' | 'managed_checkout' | 'installed_runtime'
+    protocolVersion: string
+    capabilities: string[]
+    pipelineIds: string[]
+    deviceSupport: string[]
+    trainingSetupRequired: boolean
+    dirty: boolean
+    sourceRevision: string | null
+  } | null>
   listTrainingPipelines: () => Promise<
     Array<{
       id: string
@@ -169,6 +181,33 @@ interface ChartEditorAPI {
       checkpointManifestHash: string
       createdAt: string
     }>
+    profiles: Array<{
+      profileId: string
+      runId: string
+      pipelineId: string
+      runtimeId: string
+      createdAt: string
+      isDefault: boolean
+    }>
+  }>
+  inspectTrainingCheckpoint: (runId: string) => Promise<{
+    runId: string
+    pipelineId: string
+    runtimeId: string
+    taskViewId: string
+    taskViewHash: string
+    checkpointManifestHash: string
+    deployable: boolean
+    deploymentReason: string | null
+    components: Array<{ id: string; sha256: string; byteLength: number }>
+  }>
+  saveAutoChartProfile: (runId: string) => Promise<{
+    profileId: string
+    runId: string
+    pipelineId: string
+    runtimeId: string
+    createdAt: string
+    isDefault: boolean
   }>
   inspectTrainingCatalog: (options: {
     parentId: string

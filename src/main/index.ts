@@ -28,12 +28,17 @@ import {
 } from './strumIntegration/runner'
 import {
   cancelTrainingJob,
+  cancelDefaultAutoChartProfile,
+  chooseInstalledTrainingRuntime,
   enableDetectedDeveloperTrainingRuntime,
+  inspectTrainingCheckpoint,
   inspectTrainingCatalog,
   killAllTrainingJobs,
   listTrainingArtifacts,
   listTrainingPipelines,
   probeTrainingRuntime,
+  runDefaultAutoChartProfile,
+  saveAutoChartProfile,
   startTrainingPrepare,
   startTrainingRun
 } from './strumIntegration/training'
@@ -1106,6 +1111,14 @@ ipcMain.handle('training:enableDeveloperRuntime', async () => {
   }
 })
 
+ipcMain.handle('training:chooseInstalledRuntime', async () => {
+  try {
+    return await chooseInstalledTrainingRuntime()
+  } catch {
+    return null
+  }
+})
+
 ipcMain.handle('training:pipelines', async () => {
   try {
     return await listTrainingPipelines()
@@ -1115,6 +1128,22 @@ ipcMain.handle('training:pipelines', async () => {
 })
 
 ipcMain.handle('training:artifacts', async () => await listTrainingArtifacts())
+
+ipcMain.handle('training:inspectCheckpoint', async (_event, runId: string) => {
+  try {
+    return await inspectTrainingCheckpoint(runId)
+  } catch {
+    throw new Error('STRUM could not inspect the selected checkpoint bundle.')
+  }
+})
+
+ipcMain.handle('training:saveAutoChartProfile', async (_event, runId: string) => {
+  try {
+    return await saveAutoChartProfile(runId)
+  } catch {
+    throw new Error('STRUM did not validate this checkpoint for Auto Chart.')
+  }
+})
 
 ipcMain.handle(
   'training:inspectCatalog',
@@ -1250,7 +1279,7 @@ ipcMain.handle(
   ) => {
     const runId = randomUUID()
 
-    void runAutoChart({
+    const autoChartOptions = {
       runId,
       outputDir: options.outputDir,
       files: options.files,
@@ -1272,7 +1301,10 @@ ipcMain.handle(
       enabledTracks: options.enabledTracks,
       tempoMap: options.tempoMap,
       manualBpm: options.manualBpm
-    })
+    }
+
+    void runDefaultAutoChartProfile(autoChartOptions)
+      .then((profileResult) => profileResult ?? runAutoChart(autoChartOptions))
       .then(async (result) => {
         // STRUM output is generated rather than manually curated. Persist an
         // explicit opt-out so it can only enter a training dataset after a user
@@ -1310,7 +1342,7 @@ ipcMain.handle(
 )
 
 ipcMain.handle('strum:cancel', async (_event, runId: string) => {
-  return await cancelAutoChart(runId)
+  return (await cancelDefaultAutoChartProfile(runId)) || (await cancelAutoChart(runId))
 })
 
 ipcMain.handle('runtime:status', async () => {
