@@ -83,6 +83,7 @@ app.on('before-quit', () => {
 let allowedProjectPath: string | null = null
 const datasetSources = new Map<string, DatasetCatalogSource>()
 const datasetCatalogParents = new Map<string, string>()
+const approvedDatasetPackageIds = new Set<string>()
 
 type UpdaterState = {
   state: 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'not-available' | 'error'
@@ -741,7 +742,12 @@ async function findDatasetPackages(folderPath: string): Promise<string[]> {
       }
       if (!entry.isFile()) continue
       const extension = pathExtname(entry.name)
-      if (extension === '.sng' || extension === '.con' || extension === '.rb3con') {
+      if (
+        extension === '.sng' ||
+        extension === '.con' ||
+        extension === '.rb3con' ||
+        extension === '.zip'
+      )
         packages.push(entryPath)
       }
     }
@@ -757,7 +763,7 @@ function pathExtname(fileName: string): string {
 ipcMain.handle('dataset:choosePackageFolder', async () => {
   const result = await dialog.showOpenDialog({
     properties: ['openDirectory'],
-    title: 'Select Folder of .sng / .rb3con Packages'
+    title: 'Select Folder of .sng / .rb3con / .zip Packages'
   })
   if (result.canceled || result.filePaths.length === 0) return []
   try {
@@ -765,7 +771,12 @@ ipcMain.handle('dataset:choosePackageFolder', async () => {
     return await Promise.all(
       packagePaths.map(async (packagePath) => {
         const source: DatasetCatalogSource = {
-          kind: pathExtname(packagePath) === '.sng' ? 'sng' : 'rb3con',
+          kind:
+            pathExtname(packagePath) === '.sng'
+              ? 'sng'
+              : pathExtname(packagePath) === '.zip'
+                ? 'zip'
+                : 'rb3con',
           sourcePath: resolve(packagePath)
         }
         const candidateId = randomUUID()
@@ -828,6 +839,14 @@ ipcMain.handle('dataset:setSongOptIn', async (_event, candidateId: string, opted
   }
 })
 
+ipcMain.handle('dataset:setPackageApproved', (_event, candidateId: string, approved: boolean) => {
+  const source = datasetSources.get(candidateId)
+  if (!source || source.kind === 'octave-library') return false
+  if (approved) approvedDatasetPackageIds.add(candidateId)
+  else approvedDatasetPackageIds.delete(candidateId)
+  return true
+})
+
 ipcMain.handle(
   'dataset:export',
   async (
@@ -842,13 +861,31 @@ ipcMain.handle(
     }
   ) => {
     const parentDir = datasetCatalogParents.get(options.parentId)
-    const sources = options.candidateIds.map((candidateId) => datasetSources.get(candidateId))
+    const selectedSources = options.candidateIds.map((candidateId) =>
+      datasetSources.get(candidateId)
+    )
     if (!parentDir) throw new Error('Choose a catalog parent directory through Dataset Curation.')
-    if (sources.some((source) => !source)) {
+    if (selectedSources.some((source) => !source))
       throw new Error('Refresh the curation candidates and try again.')
+    for (const [index, source] of (selectedSources as DatasetCatalogSource[]).entries()) {
+      const candidateId = options.candidateIds[index]
+      if (source.kind !== 'octave-library' && !approvedDatasetPackageIds.has(candidateId)) {
+        throw new Error('Review package sources before building the catalog.')
+      }
+      if (source.kind === 'octave-library') {
+        const summary = await summarizeDatasetSource(source)
+        if (summary.trainingUse !== 'allowed') {
+          throw new Error('Only opted-in library songs may be materialized.')
+        }
+      }
     }
-    return await buildSongSourceCatalog({
-      sources: sources as DatasetCatalogSource[],
+    const result = await buildSongSourceCatalog({
+      // A package is allowed only by this explicit selection together with the
+      // required provenance/license supplied in the same review submission.
+      // Library consent is always re-read from song.ini by the catalog service.
+      sources: (selectedSources as DatasetCatalogSource[]).map((source) =>
+        source.kind === 'octave-library' ? source : { ...source, trainingUse: 'allowed' }
+      ),
       parentDir,
       catalogName: options.catalogName,
       catalogId: options.catalogId,
@@ -856,6 +893,13 @@ ipcMain.handle(
       license: options.license,
       octaveVersion: app.getVersion()
     })
+    // Keep the catalog location inside the main-process STRUM handoff. The
+    // renderer only receives a safe completion summary.
+    return {
+      recordCount: result.recordCount,
+      reviewRequiredCount: result.reviewRequiredCount,
+      skipped: result.skipped
+    }
   }
 )
 

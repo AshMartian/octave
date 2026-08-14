@@ -1,13 +1,15 @@
 import { existsSync } from 'fs'
-import { mkdir, readFile, rm, writeFile } from 'fs/promises'
+import { mkdir, readFile, readdir, rm, writeFile } from 'fs/promises'
 import { join } from 'path'
+import AdmZip from 'adm-zip'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { packRb3con } from '../conPacker'
 import { packSng } from '../sngPacker'
 import {
   buildSongSourceCatalog,
   exportSngTrainingMidi,
-  listDatasetLibrarySongs
+  listDatasetLibrarySongs,
+  summarizeDatasetSource
 } from './sngTrainingExporter'
 
 describe('exportSngTrainingMidi', () => {
@@ -20,6 +22,22 @@ describe('exportSngTrainingMidi', () => {
     0x4d, 0x54, 0x68, 0x64, 0x00, 0x00, 0x00, 0x06, 0x00, 0x01, 0x00, 0x01, 0x01, 0xe0, 0x4d, 0x54,
     0x72, 0x6b, 0x00, 0x00, 0x00, 0x04, 0x00, 0xff
   ])
+
+  function guitarMidi(trackName = 'PART GUITAR'): Buffer {
+    const events = Buffer.concat([
+      Buffer.from([0x00, 0xff, 0x03, trackName.length]),
+      Buffer.from(trackName),
+      Buffer.from([0x00, 0x90, 0x60, 0x40, 0x83, 0x60, 0x80, 0x60, 0x00, 0x00, 0xff, 0x2f, 0x00])
+    ])
+    const header = Buffer.from([
+      0x4d, 0x54, 0x68, 0x64, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x01, 0x01, 0xe0
+    ])
+    const track = Buffer.alloc(8 + events.length)
+    track.write('MTrk', 0)
+    track.writeUInt32BE(events.length, 4)
+    events.copy(track, 8)
+    return Buffer.concat([header, track])
+  }
 
   function emptySngPackage(): Buffer {
     const header = Buffer.alloc(26)
@@ -290,5 +308,136 @@ describe('exportSngTrainingMidi', () => {
     expect(
       await readFile(join(parentDir, 'strum-review-required', 'records.jsonl'), 'utf8')
     ).toContain('"training_use":"review_required"')
+  })
+
+  it('writes schema-shaped instrument coverage with track_names', async () => {
+    const songDir = join(testDir, 'catalog-guitar-song')
+    const parentDir = join(testDir, 'catalog-guitar-parent')
+    await mkdir(songDir, { recursive: true })
+    await mkdir(parentDir, { recursive: true })
+    await writeFile(join(songDir, 'notes.mid'), guitarMidi())
+    await writeFile(join(songDir, 'song.ini'), '[song]\nname = Guitar\ndataset_opt_in = true\n')
+
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: songDir }],
+      parentDir,
+      catalogName: 'guitar-coverage',
+      catalogId: 'guitar-coverage',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+
+    const record = JSON.parse(
+      await readFile(join(parentDir, 'guitar-coverage', 'records.jsonl'), 'utf8')
+    ) as { chart: { instruments: { guitar: Record<string, unknown> } } }
+    expect(record.chart.instruments.guitar).toMatchObject({
+      status: 'present',
+      difficulties: ['expert'],
+      track_names: ['PART GUITAR']
+    })
+    expect(record.chart.instruments.guitar).not.toHaveProperty('trackNames')
+  })
+
+  it('redacts parser-derived locations from catalog metadata and track names', async () => {
+    const songDir = join(testDir, 'catalog-redaction-song')
+    const parentDir = join(testDir, 'catalog-redaction-parent')
+    await mkdir(songDir, { recursive: true })
+    await mkdir(parentDir, { recursive: true })
+    await writeFile(
+      join(songDir, 'notes.mid'),
+      guitarMidi('PART GUITAR https://example.invalid/private')
+    )
+    await writeFile(
+      join(songDir, 'song.ini'),
+      '[song]\nname = file:///private/song\nartist = \\\\\\\\server\\share\ncharter = C:\\\\private\\\\charter\ndataset_opt_in = true\n'
+    )
+
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: songDir }],
+      parentDir,
+      catalogName: 'redacted-catalog',
+      catalogId: 'redacted-catalog',
+      provenance: 'https://example.invalid/provenance',
+      license: 'file:///private/license',
+      octaveVersion: 'test'
+    })
+
+    const serialized = await readFile(join(parentDir, 'redacted-catalog', 'records.jsonl'), 'utf8')
+    expect(serialized).not.toMatch(/https?:\/\/|file:\/\/|C:\\\\/)
+    expect(serialized).not.toContain('private')
+    expect(serialized).not.toContain('server')
+    expect(serialized).toContain('[redacted]')
+  })
+
+  it('normalizes selected ZIP sources in the main-process catalog service', async () => {
+    const archivePath = join(testDir, 'catalog-source.zip')
+    const parentDir = join(testDir, 'catalog-zip-parent')
+    const archive = new AdmZip()
+    archive.addFile('song/notes.mid', validMidi)
+    archive.addFile('song/song.ini', Buffer.from('[song]\nname = ZIP Song\n'))
+    archive.writeZip(archivePath)
+    await mkdir(parentDir, { recursive: true })
+
+    const result = await buildSongSourceCatalog({
+      sources: [{ kind: 'zip', sourcePath: archivePath, trainingUse: 'allowed' }],
+      parentDir,
+      catalogName: 'zip-catalog',
+      catalogId: 'zip-catalog',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+
+    expect(result).toMatchObject({ recordCount: 1, reviewRequiredCount: 0 })
+    expect(await readFile(join(parentDir, 'zip-catalog', 'records.jsonl'), 'utf8')).toContain(
+      '"kind":"zip"'
+    )
+  })
+
+  it('returns only a safe code for parser failures and cleans failed staging directories', async () => {
+    const packagePath = join(testDir, 'private-broken-package.sng')
+    const parentDir = join(testDir, 'catalog-failure-parent')
+    await writeFile(packagePath, Buffer.from('not an sng package'))
+    await mkdir(parentDir, { recursive: true })
+
+    await expect(summarizeDatasetSource({ kind: 'sng', sourcePath: packagePath })).resolves.toEqual(
+      expect.objectContaining({ warnings: [{ code: 'source_unavailable' }] })
+    )
+    await expect(
+      buildSongSourceCatalog({
+        sources: [{ kind: 'sng', sourcePath: packagePath, trainingUse: 'allowed' }],
+        parentDir,
+        catalogName: 'failed-catalog',
+        catalogId: 'failed-catalog',
+        provenance: 'Reviewed',
+        license: 'test-only',
+        octaveVersion: 'test'
+      })
+    ).rejects.toThrow('No valid source records')
+    expect(await readdir(parentDir)).toEqual([])
+  })
+
+  it('refuses an existing empty catalog destination', async () => {
+    const songDir = join(testDir, 'catalog-existing-song')
+    const parentDir = join(testDir, 'catalog-existing-parent')
+    const destination = join(parentDir, 'existing-catalog')
+    await mkdir(songDir, { recursive: true })
+    await mkdir(destination, { recursive: true })
+    await writeFile(join(songDir, 'notes.mid'), validMidi)
+    await writeFile(join(songDir, 'song.ini'), '[song]\ndataset_opt_in = true\n')
+
+    await expect(
+      buildSongSourceCatalog({
+        sources: [{ kind: 'octave-library', sourcePath: songDir }],
+        parentDir,
+        catalogName: 'existing-catalog',
+        catalogId: 'existing-catalog',
+        provenance: 'Reviewed',
+        license: 'test-only',
+        octaveVersion: 'test'
+      })
+    ).rejects.toThrow('already exists')
+    expect(await readdir(destination)).toEqual([])
   })
 })
