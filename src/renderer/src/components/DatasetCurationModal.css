@@ -56,13 +56,21 @@
   place-items: center;
   width: 42px;
   height: 42px;
-  color: var(--text-secondary);
+  color: var(--text-muted);
   background: var(--bg-secondary);
   border: 2px solid color-mix(in srgb, var(--text-secondary) 65%, transparent);
   border-radius: 50%;
   box-shadow: 0 2px 7px rgba(0, 0, 0, 0.22);
-  font-size: 18px;
-  font-weight: 700;
+}
+.training-step-orb svg {
+  display: block;
+  width: 21px;
+  height: 21px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2;
 }
 .training-step-label {
   font-size: 12px;
@@ -70,21 +78,25 @@
   letter-spacing: 0.01em;
 }
 .training-steps button.active {
-  color: var(--accent-color);
+  color: #79b8ff;
+  border-color: color-mix(in srgb, #58a6ff 48%, var(--border-color));
+  background: color-mix(in srgb, #58a6ff 9%, var(--bg-secondary));
 }
-.training-steps button.active .training-step-orb {
-  color: #271b0e;
-  background: var(--accent-color);
-  border-color: var(--accent-color);
-  box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent-color) 18%, transparent);
+.dataset-curation-modal .training-steps button.active .training-step-orb {
+  color: #79b8ff;
+  background: color-mix(in srgb, #58a6ff 16%, var(--bg-secondary));
+  border-color: #58a6ff;
+  box-shadow: 0 0 0 4px color-mix(in srgb, #58a6ff 16%, transparent);
 }
 .training-steps button.complete {
-  color: #82d47c;
+  color: var(--success-color);
+  border-color: color-mix(in srgb, var(--success-color) 38%, var(--border-color));
+  background: color-mix(in srgb, var(--success-color) 8%, var(--bg-secondary));
 }
-.training-steps button.complete .training-step-orb {
-  color: #fff;
-  background: #5da85a;
-  border-color: #70c66b;
+.dataset-curation-modal .training-steps button.complete .training-step-orb {
+  color: #102817;
+  background: var(--success-color);
+  border-color: var(--success-color);
 }
 .training-step-connector {
   height: 3px;
@@ -93,11 +105,11 @@
   background: color-mix(in srgb, var(--text-secondary) 26%, transparent);
   border-radius: 999px;
 }
-.training-step-item:has(.complete) .training-step-connector {
-  background: #5da85a;
+.training-steps button.complete + .training-step-connector {
+  background: var(--success-color);
 }
-.training-step-item:has(.active) .training-step-connector {
-  background: color-mix(in srgb, var(--accent-color) 72%, var(--text-secondary));
+.training-steps button.active + .training-step-connector {
+  background: #58a6ff;
 }
 .dataset-curation-modal > footer {
   border-top: 1px solid var(--border-color);

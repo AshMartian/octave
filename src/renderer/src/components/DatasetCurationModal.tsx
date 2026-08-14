@@ -51,6 +51,46 @@ function candidateLabel(candidate: SourceCandidate): string {
   return artist && name ? `${artist} — ${name}` : `${candidate.kind} source`
 }
 
+function TrainingStepIcon({
+  step,
+  complete = false
+}: {
+  step: TrainingStep
+  complete?: boolean
+}): React.JSX.Element {
+  if (complete) {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="m5 12 4.2 4.2L19 6.5" />
+      </svg>
+    )
+  }
+  if (step === 'curate') {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M3.5 7.5h6l1.8 2h9.2v8.8a2.2 2.2 0 0 1-2.2 2.2H5.7a2.2 2.2 0 0 1-2.2-2.2Z" />
+        <path d="M3.5 7.5V5.7a2.2 2.2 0 0 1 2.2-2.2h4.1l1.8 2H18" />
+      </svg>
+    )
+  }
+  if (step === 'prepare') {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M5 4v16M12 4v16M19 4v16" />
+        <path d="M3 9h4M10 15h4M17 7h4" />
+        <circle cx="5" cy="9" r="2" />
+        <circle cx="12" cy="15" r="2" />
+        <circle cx="19" cy="7" r="2" />
+      </svg>
+    )
+  }
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="m13.5 2-9 12h6.8l-.8 8 9-12h-6.8Z" />
+    </svg>
+  )
+}
+
 function DatasetArtwork({
   candidateId,
   label
@@ -140,7 +180,7 @@ export function TrainingModal({
   }, [isOpen, refreshLibrary])
 
   useEffect(() => {
-    if (!isOpen || catalogParent) return
+    if (!isOpen || catalogParent?.path) return
     const storedParentId = localStorage.getItem(CATALOG_PARENT_STORAGE_KEY)
     const restore = storedParentId
       ? window.api.restoreDatasetCatalogParent(storedParentId)
@@ -480,13 +520,7 @@ export function TrainingModal({
                   onClick={() => setActiveStep(step)}
                 >
                   <span className="training-step-orb" aria-hidden="true">
-                    {index < activeStepIndex
-                      ? '✓'
-                      : step === 'curate'
-                        ? '🗂'
-                        : step === 'prepare'
-                          ? '⚙'
-                          : '⚡'}
+                    <TrainingStepIcon step={step} complete={index < activeStepIndex} />
                   </span>
                   <span className="training-step-label">{step}</span>
                 </button>
@@ -529,7 +563,7 @@ export function TrainingModal({
                   Catalog parent
                   <div className="dataset-output">
                     <input
-                      value={catalogParent?.path ?? ''}
+                      value={catalogParent?.path ?? catalogParent?.name ?? ''}
                       readOnly
                       placeholder="Preparing Catalog Parent"
                     />
