@@ -117,7 +117,14 @@
   background: var(--success-color);
 }
 .dataset-curation-modal .training-steps button.active::after {
-  background: #58a6ff;
+  background: linear-gradient(
+    90deg,
+    #58a6ff,
+    color-mix(in srgb, var(--text-secondary) 26%, transparent)
+  );
+}
+.dataset-curation-modal .training-steps button.complete:has(+ button.active)::after {
+  background: linear-gradient(90deg, var(--success-color), #58a6ff);
 }
 .dataset-curation-modal > footer {
   border-top: 1px solid var(--border-color);
