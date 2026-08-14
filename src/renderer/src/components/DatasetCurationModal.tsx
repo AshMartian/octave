@@ -94,6 +94,27 @@ type TrainingRun = {
   createdAt: string
 }
 
+type TrainingCheckpoint = {
+  runId: string
+  pipelineId: string
+  runtimeId: string
+  taskViewId: string
+  taskViewHash: string
+  checkpointManifestHash: string
+  deployable: boolean
+  deploymentReason: string | null
+  components: Array<{ id: string; sha256: string; byteLength: number }>
+}
+
+type AutoChartProfile = {
+  profileId: string
+  runId: string
+  pipelineId: string
+  runtimeId: string
+  createdAt: string
+  isDefault: boolean
+}
+
 type TrainingJob = {
   jobId: string
   sequence: number
@@ -309,7 +330,11 @@ export function TrainingModal({
   } | null>(null)
   const [trainingTasks, setTrainingTasks] = useState<TrainingTask[]>([])
   const [trainingRuns, setTrainingRuns] = useState<TrainingRun[]>([])
+  const [trainingProfiles, setTrainingProfiles] = useState<AutoChartProfile[]>([])
   const [selectedTaskViewId, setSelectedTaskViewId] = useState('')
+  const [selectedRunId, setSelectedRunId] = useState('')
+  const [selectedCheckpoint, setSelectedCheckpoint] = useState<TrainingCheckpoint | null>(null)
+  const [savingAutoChartProfile, setSavingAutoChartProfile] = useState(false)
   const [trainingJob, setTrainingJob] = useState<TrainingJob | null>(null)
   const [trainConfig, setTrainConfig] = useState({
     epochs: 20,
@@ -422,10 +447,16 @@ export function TrainingModal({
     )
     setTrainingTasks(artifacts.tasks)
     setTrainingRuns(artifacts.runs)
+    setTrainingProfiles(artifacts.profiles)
     setSelectedTaskViewId((current) =>
       artifacts.tasks.some((task) => task.taskViewId === current)
         ? current
         : (artifacts.tasks[0]?.taskViewId ?? '')
+    )
+    setSelectedRunId((current) =>
+      artifacts.runs.some((run) => run.runId === current)
+        ? current
+        : (artifacts.runs[0]?.runId ?? '')
     )
   }, [])
 
@@ -478,6 +509,25 @@ export function TrainingModal({
       current = false
     }
   }, [activeStep, catalogParent, selectedCatalog, selectedPipelineId, trainingRuntime])
+
+  useEffect(() => {
+    if (activeStep !== 'deploy' || !selectedRunId) {
+      setSelectedCheckpoint(null)
+      return
+    }
+    let current = true
+    void window.api
+      .inspectTrainingCheckpoint(selectedRunId)
+      .then((checkpoint) => {
+        if (current) setSelectedCheckpoint(checkpoint)
+      })
+      .catch(() => {
+        if (current) setSelectedCheckpoint(null)
+      })
+    return () => {
+      current = false
+    }
+  }, [activeStep, selectedRunId])
 
   useEffect(() => {
     if (scanningPackages) {
@@ -754,6 +804,30 @@ export function TrainingModal({
       return
     }
     await refreshTrainingState()
+  }
+
+  const chooseInstalledRuntime = async (): Promise<void> => {
+    setError(null)
+    const runtime = await window.api.chooseInstalledTrainingRuntime()
+    if (!runtime?.capabilities.includes('training')) {
+      setError('The selected STRUM worker is not compatible with OCTAVE training.')
+      return
+    }
+    await refreshTrainingState()
+  }
+
+  const saveSelectedAutoChartProfile = async (): Promise<void> => {
+    if (!selectedCheckpoint?.deployable) return
+    setSavingAutoChartProfile(true)
+    setError(null)
+    try {
+      await window.api.saveAutoChartProfile(selectedCheckpoint.runId)
+      await refreshTrainingState()
+    } catch {
+      setError('STRUM did not validate this checkpoint for Auto Chart.')
+    } finally {
+      setSavingAutoChartProfile(false)
+    }
   }
 
   const prepareDataset = async (): Promise<void> => {
@@ -1230,12 +1304,20 @@ export function TrainingModal({
                   </small>
                 </div>
                 {trainingRuntime?.trainingSetupRequired && (
-                  <button
-                    className="dataset-secondary"
-                    onClick={() => void enableDeveloperRuntime()}
-                  >
-                    Enable developer override
-                  </button>
+                  <div className="training-runtime-actions">
+                    <button
+                      className="dataset-secondary"
+                      onClick={() => void chooseInstalledRuntime()}
+                    >
+                      Select STRUM runtime
+                    </button>
+                    <button
+                      className="dataset-secondary"
+                      onClick={() => void enableDeveloperRuntime()}
+                    >
+                      Developer override
+                    </button>
+                  </div>
                 )}
               </div>
               {trainingRuntime?.kind === 'developer_override' && (
@@ -1250,8 +1332,8 @@ export function TrainingModal({
                 </p>
               ) : !trainingRuntime?.capabilities.includes('training') ? (
                 <p className="dataset-message warning">
-                  This runtime is inference-only. Training requires an explicitly enabled developer
-                  override or a future verified STRUM training runtime.
+                  This runtime is inference-only. Select a compatible installed STRUM runtime, or
+                  enable a local developer override.
                 </p>
               ) : (
                 <>
@@ -1484,22 +1566,84 @@ export function TrainingModal({
                 <p className="dataset-message warning">
                   A completed training run is required before deployment can be evaluated.
                 </p>
-              ) : trainingRuns.some((run) => run.deployable) ? (
-                <p className="dataset-message success">
-                  A compatible checkpoint bundle is available for local profile validation.
-                </p>
               ) : (
-                <aside className="training-deploy-blocked">
-                  <strong>Deployment safely blocked</strong>
-                  <p>
-                    The current Guitar compatibility adapter produces experiment checkpoints, not a
-                    validated OCTAVE Auto Chart model bundle. They remain available for local
-                    evaluation and are never selected automatically.
-                  </p>
-                </aside>
+                <>
+                  <div className="training-artifact-list training-deploy-runs">
+                    <h4>Select a completed run</h4>
+                    {trainingRuns.map((run) => (
+                      <button
+                        className={selectedRunId === run.runId ? 'selected' : ''}
+                        key={run.runId}
+                        onClick={() => setSelectedRunId(run.runId)}
+                      >
+                        <span>
+                          <strong>{run.pipelineId}</strong>
+                          <small>
+                            {run.checkpointCount} components ·{' '}
+                            {run.deployable ? 'declared deployable' : 'experiment only'}
+                          </small>
+                        </span>
+                        <span
+                          className={
+                            run.deployable ? 'training-status-ready' : 'training-status-neutral'
+                          }
+                        >
+                          {selectedRunId === run.runId ? 'Inspecting' : 'Inspect'}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                  {selectedCheckpoint ? (
+                    <div className="training-checkpoint-summary">
+                      <div>
+                        <span>Pipeline</span>
+                        <strong>{selectedCheckpoint.pipelineId}</strong>
+                      </div>
+                      <div>
+                        <span>Verified components</span>
+                        <strong>{selectedCheckpoint.components.length}</strong>
+                      </div>
+                      <div>
+                        <span>Deployment</span>
+                        <strong>
+                          {selectedCheckpoint.deployable ? 'Eligible for validation' : 'Blocked'}
+                        </strong>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="training-inline-note">
+                      Inspecting the selected checkpoint bundle…
+                    </p>
+                  )}
+                  {!selectedCheckpoint?.deployable && (
+                    <aside className="training-deploy-blocked">
+                      <strong>Deployment safely blocked</strong>
+                      <p>
+                        {selectedCheckpoint?.deploymentReason ??
+                          'This checkpoint is an experiment artifact, not a validated OCTAVE Auto Chart model bundle.'}
+                      </p>
+                    </aside>
+                  )}
+                  {trainingProfiles.length > 0 && (
+                    <div className="training-profile-summary">
+                      {trainingProfiles.map((profile) => (
+                        <span key={profile.profileId}>
+                          {profile.pipelineId}{' '}
+                          {profile.isDefault ? '· current Auto Chart default' : ''}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </>
               )}
-              <button className="dataset-primary" disabled>
-                Save as Auto Chart default
+              <button
+                className="dataset-primary"
+                disabled={!selectedCheckpoint?.deployable || savingAutoChartProfile}
+                onClick={() => void saveSelectedAutoChartProfile()}
+              >
+                {savingAutoChartProfile
+                  ? 'Validating profile…'
+                  : 'Validate & save as Auto Chart default'}
               </button>
             </section>
           )}

@@ -13,12 +13,17 @@ import { ensureBootstrappedPython, getRuntimeStatus, isBootstrapTarget } from '.
 import { ensureFreshYtDlp, isYtDlpBlockedError } from './strumIntegration/ytDlpRefresh'
 import {
   cancelTrainingJob,
+  cancelDefaultAutoChartProfile,
+  chooseInstalledTrainingRuntime,
   enableDetectedDeveloperTrainingRuntime,
+  inspectTrainingCheckpoint,
   inspectTrainingCatalog,
   killAllTrainingJobs,
   listTrainingArtifacts,
   listTrainingPipelines,
   probeTrainingRuntime,
+  runDefaultAutoChartProfile,
+  saveAutoChartProfile,
   startTrainingPrepare,
   startTrainingRun
 } from './strumIntegration/training'
@@ -1075,6 +1080,14 @@ ipcMain.handle('training:enableDeveloperRuntime', async () => {
   }
 })
 
+ipcMain.handle('training:chooseInstalledRuntime', async () => {
+  try {
+    return await chooseInstalledTrainingRuntime()
+  } catch {
+    return null
+  }
+})
+
 ipcMain.handle('training:pipelines', async () => {
   try {
     return await listTrainingPipelines()
@@ -1084,6 +1097,22 @@ ipcMain.handle('training:pipelines', async () => {
 })
 
 ipcMain.handle('training:artifacts', async () => await listTrainingArtifacts())
+
+ipcMain.handle('training:inspectCheckpoint', async (_event, runId: string) => {
+  try {
+    return await inspectTrainingCheckpoint(runId)
+  } catch {
+    throw new Error('STRUM could not inspect the selected checkpoint bundle.')
+  }
+})
+
+ipcMain.handle('training:saveAutoChartProfile', async (_event, runId: string) => {
+  try {
+    return await saveAutoChartProfile(runId)
+  } catch {
+    throw new Error('STRUM did not validate this checkpoint for Auto Chart.')
+  }
+})
 
 ipcMain.handle(
   'training:inspectCatalog',
@@ -1178,82 +1207,106 @@ ipcMain.handle('strum:getDefaultOutputFolder', async () => {
   return defaultOutputFolder
 })
 
-ipcMain.handle('strum:start', async (_event, options: {
-  outputDir: string
-  files: string[]
-  folders: string[]
-  stemFolders?: string[]
-  stemSongs?: Array<{ name?: string; stems: Record<string, string>; extras?: string[] }>
-  urls: string[]
-  includeKeys?: boolean
-  disableOnlineLookup?: boolean
-  skipHarmonies?: boolean
-  keepStems?: boolean
-  starPower?: boolean
-  snapDrums?: boolean
-  snapDrumsDivision?: number
-  snapDrumsWindowMs?: number
-  autoTempo?: boolean
-  autoTempoDrift?: boolean
-  autoTempoSnap?: boolean
-  enabledTracks?: {
-    drums?: boolean
-    guitar?: boolean
-    bass?: boolean
-    vocals?: boolean
-    harmonies?: boolean
-    keys?: boolean
-    proKeys?: boolean
+ipcMain.handle(
+  'strum:start',
+  async (
+    _event,
+    options: {
+      outputDir: string
+      files: string[]
+      folders: string[]
+      stemFolders?: string[]
+      stemSongs?: Array<{ name?: string; stems: Record<string, string>; extras?: string[] }>
+      urls: string[]
+      includeKeys?: boolean
+      disableOnlineLookup?: boolean
+      skipHarmonies?: boolean
+      keepStems?: boolean
+      starPower?: boolean
+      snapDrums?: boolean
+      snapDrumsDivision?: number
+      snapDrumsWindowMs?: number
+      autoTempo?: boolean
+      autoTempoDrift?: boolean
+      autoTempoSnap?: boolean
+      enabledTracks?: {
+        drums?: boolean
+        guitar?: boolean
+        bass?: boolean
+        vocals?: boolean
+        harmonies?: boolean
+        keys?: boolean
+        proKeys?: boolean
+      }
+      tempoMap?: Array<{ timeSec: number; bpm: number }>
+      manualBpm?: number
+    }
+  ) => {
+    const runId = randomUUID()
+
+    const autoChartOptions = {
+      runId,
+      outputDir: options.outputDir,
+      files: options.files,
+      folders: options.folders,
+      stemFolders: options.stemFolders ?? [],
+      stemSongs: options.stemSongs ?? [],
+      urls: options.urls,
+      includeKeys: options.includeKeys,
+      disableOnlineLookup: options.disableOnlineLookup,
+      skipHarmonies: options.skipHarmonies,
+      keepStems: options.keepStems,
+      starPower: options.starPower,
+      snapDrums: options.snapDrums,
+      snapDrumsDivision: options.snapDrumsDivision,
+      snapDrumsWindowMs: options.snapDrumsWindowMs,
+      autoTempo: options.autoTempo,
+      autoTempoDrift: options.autoTempoDrift,
+      autoTempoSnap: options.autoTempoSnap,
+      enabledTracks: options.enabledTracks,
+      tempoMap: options.tempoMap,
+      manualBpm: options.manualBpm
+    }
+
+    void runDefaultAutoChartProfile(autoChartOptions)
+      .then((profileResult) => profileResult ?? runAutoChart(autoChartOptions))
+      .then(async (result) => {
+        // STRUM output is generated rather than manually curated. Persist an
+        // explicit opt-out so it can only enter a training dataset after a user
+        // reviews it in Dataset Curation and opts it in.
+        await Promise.all(
+          result.songFolders.map(async (songFolder) => {
+            try {
+              const iniPath = join(songFolder, 'song.ini')
+              const metadata = parseIniFile(await readFile(iniPath, 'utf8'))
+              metadata.strum_generated = 'true'
+              metadata.dataset_opt_in = 'false'
+              await writeFile(iniPath, serializeIniFile(metadata), 'utf8')
+            } catch (error) {
+              console.warn(`Failed to mark STRUM output as opted out: ${songFolder}`, error)
+            }
+          })
+        )
+        for (const win of BrowserWindow.getAllWindows()) {
+          win.webContents.send('strum:complete', { runId, ...result })
+        }
+      })
+      .catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error)
+        for (const win of BrowserWindow.getAllWindows()) {
+          win.webContents.send('strum:error', {
+            runId,
+            message,
+            requirementsPath: getStrumRequirementsPath()
+          })
+        }
+      })
+    return { runId }
   }
-  tempoMap?: Array<{ timeSec: number; bpm: number }>
-  manualBpm?: number
-}) => {
-  const runId = randomUUID()
-
-  void runAutoChart({
-    runId,
-    outputDir: options.outputDir,
-    files: options.files,
-    folders: options.folders,
-    stemFolders: options.stemFolders ?? [],
-    stemSongs: options.stemSongs ?? [],
-    urls: options.urls,
-    includeKeys: options.includeKeys,
-    disableOnlineLookup: options.disableOnlineLookup,
-    skipHarmonies: options.skipHarmonies,
-    keepStems: options.keepStems,
-    starPower: options.starPower,
-    snapDrums: options.snapDrums,
-    snapDrumsDivision: options.snapDrumsDivision,
-    snapDrumsWindowMs: options.snapDrumsWindowMs,
-    autoTempo: options.autoTempo,
-    autoTempoDrift: options.autoTempoDrift,
-    autoTempoSnap: options.autoTempoSnap,
-    enabledTracks: options.enabledTracks,
-    tempoMap: options.tempoMap,
-    manualBpm: options.manualBpm
-  })
-    .then((result) => {
-      for (const win of BrowserWindow.getAllWindows()) {
-        win.webContents.send('strum:complete', { runId, ...result })
-      }
-    })
-    .catch((error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error)
-      for (const win of BrowserWindow.getAllWindows()) {
-        win.webContents.send('strum:error', {
-          runId,
-          message,
-          requirementsPath: getStrumRequirementsPath()
-        })
-      }
-    })
-
-  return { runId }
-})
+)
 
 ipcMain.handle('strum:cancel', async (_event, runId: string) => {
-  return await cancelAutoChart(runId)
+  return (await cancelDefaultAutoChartProfile(runId)) || (await cancelAutoChart(runId))
 })
 
 ipcMain.handle('runtime:status', async () => {

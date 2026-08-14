@@ -26,6 +26,7 @@ from typing import Any, Iterable
 PROTOCOL_VERSION = "1.0"
 PIPELINE_ID = "guitar.onset-fret/v1"
 SAFE_CODE = re.compile(r"^[a-z0-9_.-]{1,80}$")
+SAFE_COMPONENT_PATH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
 
 PIPELINE = {
     "id": PIPELINE_ID,
@@ -135,6 +136,67 @@ def safe_relative_asset(root: Path, relative_path: Any) -> Path:
     except ValueError as exc:
         raise ProtocolError("catalog_invalid", "The catalog contains an invalid managed asset reference.") from exc
     return candidate
+
+
+def load_checkpoint_manifest(checkpoint_root: Path) -> dict[str, Any]:
+    """Read and hash-validate one immutable checkpoint bundle.
+
+    The manifest is the only authority OCTAVE may inspect.  All component
+    paths are constrained to its bundle root and every declared byte length
+    and digest must match before a run can be shown as deployable.
+    """
+    try:
+        root = checkpoint_root.resolve(strict=True)
+        manifest_path = root / "checkpoint-manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ProtocolError("checkpoint_invalid", "The selected checkpoint bundle is invalid.") from exc
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != "strum-checkpoint-manifest/v1":
+        raise ProtocolError("checkpoint_invalid", "The selected checkpoint bundle is invalid.")
+    expected_hash = manifest.get("manifest_hash")
+    unsigned_manifest = {key: value for key, value in manifest.items() if key != "manifest_hash"}
+    if not isinstance(expected_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", expected_hash) or sha256_json(unsigned_manifest) != expected_hash:
+        raise ProtocolError("checkpoint_invalid", "The selected checkpoint bundle is invalid.")
+    for field in ("run_id", "pipeline_id", "runtime_id", "task_view_id", "task_view_hash"):
+        if not isinstance(manifest.get(field), str) or not manifest[field]:
+            raise ProtocolError("checkpoint_invalid", "The selected checkpoint bundle is invalid.")
+    components = manifest.get("components")
+    if not isinstance(components, list) or not components:
+        raise ProtocolError("checkpoint_invalid", "The selected checkpoint bundle is invalid.")
+    component_ids: set[str] = set()
+    for component in components:
+        if not isinstance(component, dict):
+            raise ProtocolError("checkpoint_invalid", "The selected checkpoint bundle is invalid.")
+        component_id = component.get("id")
+        relative_path = component.get("relative_path")
+        digest = component.get("sha256")
+        byte_length = component.get("byte_length")
+        if (
+            not isinstance(component_id, str)
+            or not SAFE_CODE.fullmatch(component_id)
+            or component_id in component_ids
+            or not isinstance(relative_path, str)
+            or not SAFE_COMPONENT_PATH.fullmatch(relative_path)
+            or ".." in Path(relative_path).parts
+            or not isinstance(digest, str)
+            or not re.fullmatch(r"[a-f0-9]{64}", digest)
+            or not isinstance(byte_length, int)
+            or byte_length < 0
+        ):
+            raise ProtocolError("checkpoint_invalid", "The selected checkpoint bundle is invalid.")
+        component_ids.add(component_id)
+        component_path = (root / relative_path).resolve()
+        try:
+            component_path.relative_to(root)
+        except ValueError as exc:
+            raise ProtocolError("checkpoint_invalid", "The selected checkpoint bundle is invalid.") from exc
+        if (
+            not component_path.is_file()
+            or component_path.stat().st_size != byte_length
+            or sha256_file(component_path) != digest
+        ):
+            raise ProtocolError("checkpoint_invalid", "The selected checkpoint bundle is invalid.")
+    return manifest
 
 
 def load_catalog(catalog_root: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -509,12 +571,7 @@ def command_train_cancel(args: argparse.Namespace) -> int:
 
 
 def command_checkpoint_inspect(args: argparse.Namespace) -> int:
-    try:
-        manifest = json.loads((args.checkpoint / "checkpoint-manifest.json").read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise ProtocolError("checkpoint_invalid", "The selected checkpoint bundle is invalid.") from exc
-    if manifest.get("schema_version") != "strum-checkpoint-manifest/v1":
-        raise ProtocolError("checkpoint_invalid", "The selected checkpoint bundle is invalid.")
+    manifest = load_checkpoint_manifest(args.checkpoint)
     emit_json({key: manifest.get(key) for key in ["schema_version", "run_id", "pipeline_id", "runtime_id", "task_view_id", "task_view_hash", "components", "inference_capabilities", "deployable", "deployment_reason", "manifest_hash"]})
     return 0
 
@@ -523,8 +580,8 @@ def command_profile_validate(args: argparse.Namespace) -> int:
     request = load_request(args.request)
     checkpoint_root = Path(str(request.get("checkpoint_root", ""))).resolve()
     try:
-        manifest = json.loads((checkpoint_root / "checkpoint-manifest.json").read_text(encoding="utf-8"))
-    except Exception:
+        manifest = load_checkpoint_manifest(checkpoint_root)
+    except ProtocolError:
         emit_json({"valid": False, "code": "checkpoint_invalid", "message": "The selected checkpoint bundle is invalid."})
         return 0
     if not manifest.get("deployable"):

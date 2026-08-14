@@ -1,10 +1,11 @@
-import { app, BrowserWindow } from 'electron'
+import { app, BrowserWindow, dialog } from 'electron'
 import { execFile, spawn, type ChildProcess } from 'child_process'
 import { randomUUID } from 'crypto'
 import { existsSync } from 'fs'
 import { mkdir, readFile, unlink, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { resolvePythonCommand } from './runner'
+import type { AutoChartRunOptions, AutoChartRunResult } from './types'
 
 const PROTOCOL_MAJOR = 1
 const TRAINING_ROOT_NAME = 'strum-training'
@@ -69,6 +70,27 @@ export type TrainingRun = {
   createdAt: string
 }
 
+export type TrainingCheckpoint = {
+  runId: string
+  pipelineId: string
+  runtimeId: string
+  taskViewId: string
+  taskViewHash: string
+  checkpointManifestHash: string
+  deployable: boolean
+  deploymentReason: string | null
+  components: Array<{ id: string; sha256: string; byteLength: number }>
+}
+
+export type AutoChartProfile = {
+  profileId: string
+  runId: string
+  pipelineId: string
+  runtimeId: string
+  createdAt: string
+  isDefault: boolean
+}
+
 export type TrainingJobEvent = {
   jobId: string
   sequence: number
@@ -90,11 +112,20 @@ export type TrainingJobEvent = {
 
 type RuntimeSettings = {
   developerSourceRoot?: string
+  installedWorkerPath?: string
+}
+
+type WorkerInvocation = {
+  command: string
+  baseArgs: string[]
+  env: NodeJS.ProcessEnv
 }
 
 type TrainingRegistry = {
   tasks: Array<TrainingTask & { taskRoot: string; catalogRoot: string }>
   runs: Array<TrainingRun & { outputRoot: string }>
+  profiles?: Array<AutoChartProfile & { checkpointRoot: string }>
+  defaultProfileId?: string
 }
 
 type RunningTrainingJob = {
@@ -105,7 +136,13 @@ type RunningTrainingJob = {
   runId?: string
 }
 
+type RunningProfiledAutoChart = {
+  process: ChildProcess
+  requestPath: string
+}
+
 const runningJobs = new Map<string, RunningTrainingJob>()
+const runningProfiledAutoCharts = new Map<string, RunningProfiledAutoChart>()
 
 function trainingRoot(): string {
   return join(app.getPath('userData'), TRAINING_ROOT_NAME)
@@ -131,6 +168,17 @@ function broadcast(payload: TrainingJobEvent): void {
   }
 }
 
+function broadcastAutoChartProgress(payload: {
+  runId: string
+  stage: string
+  percent?: number
+  message: string
+}): void {
+  for (const window of BrowserWindow.getAllWindows()) {
+    window.webContents.send('strum:progress', payload)
+  }
+}
+
 async function readRuntimeSettings(): Promise<RuntimeSettings> {
   try {
     return JSON.parse(await readFile(runtimeSettingsPath(), 'utf8')) as RuntimeSettings
@@ -144,10 +192,13 @@ async function readRegistry(): Promise<TrainingRegistry> {
     const registry = JSON.parse(await readFile(registryPath(), 'utf8')) as TrainingRegistry
     return {
       tasks: Array.isArray(registry.tasks) ? registry.tasks : [],
-      runs: Array.isArray(registry.runs) ? registry.runs : []
+      runs: Array.isArray(registry.runs) ? registry.runs : [],
+      profiles: Array.isArray(registry.profiles) ? registry.profiles : [],
+      defaultProfileId:
+        typeof registry.defaultProfileId === 'string' ? registry.defaultProfileId : undefined
     }
   } catch {
-    return { tasks: [], runs: [] }
+    return { tasks: [], runs: [], profiles: [] }
   }
 }
 
@@ -190,6 +241,21 @@ async function workerEnvironment(): Promise<NodeJS.ProcessEnv> {
   }
 }
 
+async function resolveWorkerInvocation(purpose: string): Promise<WorkerInvocation> {
+  const settings = await readRuntimeSettings()
+  const env = await workerEnvironment()
+  if (settings.installedWorkerPath) {
+    if (!existsSync(settings.installedWorkerPath)) {
+      throw new Error('The selected STRUM runtime is no longer available.')
+    }
+    return { command: settings.installedWorkerPath, baseArgs: [], env }
+  }
+  const python = await resolvePythonCommand(purpose)
+  const script = workerScriptPath()
+  if (!existsSync(script)) throw new Error('OCTAVE could not find its STRUM runtime adapter.')
+  return { command: python.command, baseArgs: [...python.baseArgs, script], env }
+}
+
 function normalizeRuntime(raw: unknown): TrainingRuntime {
   if (!raw || typeof raw !== 'object')
     throw new Error('STRUM did not return a runtime description.')
@@ -221,15 +287,12 @@ function normalizeRuntime(raw: unknown): TrainingRuntime {
 }
 
 async function runWorkerJson(args: string[]): Promise<Record<string, unknown>> {
-  const python = await resolvePythonCommand('training-probe')
-  const script = workerScriptPath()
-  if (!existsSync(script)) throw new Error('OCTAVE could not find its STRUM runtime adapter.')
-  const env = await workerEnvironment()
+  const worker = await resolveWorkerInvocation('training-probe')
   return await new Promise((resolve, reject) => {
     execFile(
-      python.command,
-      [...python.baseArgs, script, ...args],
-      { env, timeout: 20_000 },
+      worker.command,
+      [...worker.baseArgs, ...args],
+      { env: worker.env, timeout: 20_000 },
       (error, stdout) => {
         const line = stdout.split(/\r?\n/).find((entry) => entry.trim())
         if (error || !line) {
@@ -262,10 +325,40 @@ export async function enableDetectedDeveloperTrainingRuntime(): Promise<Training
   await mkdir(trainingRoot(), { recursive: true })
   await writeFile(
     runtimeSettingsPath(),
-    JSON.stringify({ developerSourceRoot: root }, null, 2) + '\n',
+    JSON.stringify({ developerSourceRoot: root, installedWorkerPath: undefined }, null, 2) + '\n',
     'utf8'
   )
   return await probeTrainingRuntime()
+}
+
+export async function chooseInstalledTrainingRuntime(): Promise<TrainingRuntime | null> {
+  const selection = await dialog.showOpenDialog({
+    title: 'Select a compatible STRUM worker',
+    properties: ['openFile'],
+    filters:
+      process.platform === 'win32'
+        ? [{ name: 'STRUM worker', extensions: ['exe', 'cmd', 'bat'] }]
+        : undefined
+  })
+  if (selection.canceled || selection.filePaths.length === 0) return null
+  const previous = await readRuntimeSettings()
+  const installedWorkerPath = selection.filePaths[0]
+  await mkdir(trainingRoot(), { recursive: true })
+  await writeFile(
+    runtimeSettingsPath(),
+    JSON.stringify({ installedWorkerPath, developerSourceRoot: undefined }, null, 2) + '\n',
+    'utf8'
+  )
+  try {
+    const runtime = await probeTrainingRuntime()
+    if (runtime.kind !== 'installed_runtime') {
+      throw new Error('The selected worker is not an installed STRUM runtime.')
+    }
+    return runtime
+  } catch {
+    await writeFile(runtimeSettingsPath(), JSON.stringify(previous, null, 2) + '\n', 'utf8')
+    return null
+  }
 }
 
 export async function listTrainingPipelines(): Promise<TrainingPipeline[]> {
@@ -316,6 +409,7 @@ export async function inspectTrainingCatalog(
 export async function listTrainingArtifacts(): Promise<{
   tasks: TrainingTask[]
   runs: TrainingRun[]
+  profiles: AutoChartProfile[]
 }> {
   const registry = await readRegistry()
   return {
@@ -340,8 +434,347 @@ export async function listTrainingArtifacts(): Promise<{
         deployable: run.deployable,
         checkpointManifestHash: run.checkpointManifestHash,
         createdAt: run.createdAt
+      })),
+    profiles: (registry.profiles ?? [])
+      .filter((profile) => existsSync(profile.checkpointRoot))
+      .map((profile) => ({
+        profileId: profile.profileId,
+        runId: profile.runId,
+        pipelineId: profile.pipelineId,
+        runtimeId: profile.runtimeId,
+        createdAt: profile.createdAt,
+        isDefault: profile.profileId === registry.defaultProfileId
       }))
   }
+}
+
+function normalizeCheckpoint(
+  payload: Record<string, unknown>,
+  run: TrainingRun
+): TrainingCheckpoint {
+  if (
+    payload.run_id !== run.runId ||
+    payload.pipeline_id !== run.pipelineId ||
+    payload.manifest_hash !== run.checkpointManifestHash
+  ) {
+    throw new Error('The checkpoint does not match the selected training run.')
+  }
+  const components = Array.isArray(payload.components)
+    ? payload.components.flatMap((component) => {
+        if (!component || typeof component !== 'object') return []
+        const value = component as Record<string, unknown>
+        const id = typeof value.id === 'string' ? value.id : ''
+        const sha256 = typeof value.sha256 === 'string' ? value.sha256 : ''
+        const byteLength = Number(value.byte_length)
+        return id &&
+          /^[a-z0-9_.-]{1,80}$/.test(id) &&
+          /^[a-f0-9]{64}$/.test(sha256) &&
+          Number.isSafeInteger(byteLength) &&
+          byteLength >= 0
+          ? [{ id, sha256, byteLength }]
+          : []
+      })
+    : []
+  if (components.length !== run.checkpointCount) {
+    throw new Error('The checkpoint bundle is incomplete.')
+  }
+  return {
+    runId: run.runId,
+    pipelineId: run.pipelineId,
+    runtimeId: String(payload.runtime_id ?? ''),
+    taskViewId: String(payload.task_view_id ?? ''),
+    taskViewHash: String(payload.task_view_hash ?? ''),
+    checkpointManifestHash: run.checkpointManifestHash,
+    deployable: payload.deployable === true,
+    deploymentReason:
+      typeof payload.deployment_reason === 'string' ? payload.deployment_reason : null,
+    components
+  }
+}
+
+export async function inspectTrainingCheckpoint(runId: string): Promise<TrainingCheckpoint> {
+  const registry = await readRegistry()
+  const run = registry.runs.find((entry) => entry.runId === runId && existsSync(entry.outputRoot))
+  if (!run) throw new Error('The selected training run is no longer available.')
+  return normalizeCheckpoint(
+    await runWorkerJson(['checkpoint', 'inspect', '--checkpoint', run.outputRoot, '--json']),
+    run
+  )
+}
+
+export async function saveAutoChartProfile(runId: string): Promise<AutoChartProfile> {
+  const checkpoint = await inspectTrainingCheckpoint(runId)
+  if (!checkpoint.deployable) {
+    throw new Error('This experiment is not compatible with OCTAVE Auto Chart.')
+  }
+  const registry = await readRegistry()
+  const run = registry.runs.find((entry) => entry.runId === runId && existsSync(entry.outputRoot))
+  if (!run) throw new Error('The selected training run is no longer available.')
+  const runtime = await probeTrainingRuntime()
+  if (runtime.runtimeId !== checkpoint.runtimeId || !runtime.capabilities.includes('chart')) {
+    throw new Error('The selected STRUM runtime cannot run deployed Auto Chart profiles.')
+  }
+  const profileId = `strum-profile-${randomUUID()}`
+  const requestPath = join(app.getPath('temp'), `octave-profile-${profileId}.json`)
+  try {
+    await writeFile(
+      requestPath,
+      JSON.stringify({ profile_id: profileId, checkpoint_root: run.outputRoot }),
+      'utf8'
+    )
+    const payload = await runWorkerJson([
+      'inference',
+      'profile',
+      'validate',
+      '--request',
+      requestPath,
+      '--json'
+    ])
+    if (payload.valid !== true) {
+      throw new Error('STRUM did not validate this checkpoint for Auto Chart.')
+    }
+    const profile = payload.profile
+    if (!profile || typeof profile !== 'object') {
+      throw new Error('STRUM did not return a valid Auto Chart profile.')
+    }
+    const value = profile as Record<string, unknown>
+    if (
+      value.profile_id !== profileId ||
+      value.pipeline_id !== checkpoint.pipelineId ||
+      value.runtime_id !== checkpoint.runtimeId
+    ) {
+      throw new Error('STRUM returned a profile that does not match this checkpoint.')
+    }
+    const saved: AutoChartProfile & { checkpointRoot: string } = {
+      profileId,
+      runId: checkpoint.runId,
+      pipelineId: checkpoint.pipelineId,
+      runtimeId: checkpoint.runtimeId,
+      createdAt: new Date().toISOString(),
+      isDefault: true,
+      checkpointRoot: run.outputRoot
+    }
+    registry.profiles = [
+      ...(registry.profiles ?? []).filter((entry) => entry.runId !== runId),
+      saved
+    ]
+    registry.defaultProfileId = profileId
+    await writeRegistry(registry)
+    return { ...saved, isDefault: true }
+  } finally {
+    try {
+      await unlink(requestPath)
+    } catch {
+      /* idempotent cleanup */
+    }
+  }
+}
+
+type ResolvedAutoChartProfile = AutoChartProfile & {
+  checkpointRoot: string
+}
+
+async function resolveDefaultAutoChartProfile(): Promise<ResolvedAutoChartProfile | null> {
+  const registry = await readRegistry()
+  const profile = (registry.profiles ?? []).find(
+    (entry) => entry.profileId === registry.defaultProfileId && existsSync(entry.checkpointRoot)
+  )
+  if (!profile) return null
+  const runtime = await probeTrainingRuntime()
+  if (runtime.runtimeId !== profile.runtimeId || !runtime.capabilities.includes('chart')) {
+    registry.defaultProfileId = undefined
+    await writeRegistry(registry)
+    return null
+  }
+  const requestPath = join(app.getPath('temp'), `octave-profile-check-${profile.profileId}.json`)
+  try {
+    await writeFile(
+      requestPath,
+      JSON.stringify({ profile_id: profile.profileId, checkpoint_root: profile.checkpointRoot }),
+      'utf8'
+    )
+    const validation = await runWorkerJson([
+      'inference',
+      'profile',
+      'validate',
+      '--request',
+      requestPath,
+      '--json'
+    ])
+    if (validation.valid !== true) {
+      registry.defaultProfileId = undefined
+      await writeRegistry(registry)
+      return null
+    }
+    return profile
+  } catch {
+    registry.defaultProfileId = undefined
+    await writeRegistry(registry)
+    return null
+  } finally {
+    try {
+      await unlink(requestPath)
+    } catch {
+      /* idempotent cleanup */
+    }
+  }
+}
+
+function safeProfiledAutoChartResult(
+  raw: Record<string, unknown>,
+  outputDir: string
+): AutoChartRunResult {
+  const songFolders = Array.isArray(raw.song_folders)
+    ? raw.song_folders.filter((value): value is string => typeof value === 'string')
+    : []
+  const errors =
+    Array.isArray(raw.errors) && raw.errors.length > 0
+      ? ['STRUM reported one or more charting errors.']
+      : []
+  return {
+    success: raw.success === true,
+    outputDir,
+    songFolders,
+    errors
+  }
+}
+
+async function runResolvedAutoChartProfile(
+  profile: ResolvedAutoChartProfile,
+  options: Omit<AutoChartRunOptions, 'cacheDir'>
+): Promise<AutoChartRunResult> {
+  const worker = await resolveWorkerInvocation(options.runId)
+  const requestPath = join(app.getPath('temp'), `octave-profile-chart-${options.runId}.json`)
+  const request = {
+    job_id: options.runId,
+    profile_id: profile.profileId,
+    model_root: profile.checkpointRoot,
+    output_root: options.outputDir,
+    inputs: {
+      files: options.files,
+      folders: options.folders,
+      stem_folders: options.stemFolders,
+      stem_songs: options.stemSongs,
+      urls: options.urls
+    },
+    options: {
+      enabled_tracks: options.enabledTracks,
+      include_keys: options.includeKeys,
+      difficulty_policy: 'expert_only',
+      disable_online_lookup: options.disableOnlineLookup,
+      keep_stems: options.keepStems,
+      star_power: options.starPower,
+      auto_tempo: options.autoTempo,
+      tempo_map: options.tempoMap,
+      manual_bpm: options.manualBpm
+    }
+  }
+  await writeFile(requestPath, JSON.stringify(request), 'utf8')
+  broadcastAutoChartProgress({
+    runId: options.runId,
+    stage: 'bootstrap',
+    percent: 0,
+    message: 'Starting the validated STRUM profile locally.'
+  })
+  return await new Promise((resolve, reject) => {
+    const child = spawn(
+      worker.command,
+      [...worker.baseArgs, 'chart', '--request', requestPath, '--json-events'],
+      { stdio: ['ignore', 'pipe', 'pipe'], env: worker.env, detached: process.platform !== 'win32' }
+    )
+    runningProfiledAutoCharts.set(options.runId, { process: child, requestPath })
+    let stdoutRemainder = ''
+    let stderrRemainder = ''
+    let terminalResult: AutoChartRunResult | null = null
+    let terminalError: Error | null = null
+    const consume = (chunk: Buffer, stream: 'stdout' | 'stderr'): void => {
+      const combined =
+        (stream === 'stdout' ? stdoutRemainder : stderrRemainder) + chunk.toString('utf8')
+      const lines = combined.split(/\r?\n/)
+      const remainder = lines.pop() ?? ''
+      if (stream === 'stdout') stdoutRemainder = remainder
+      else stderrRemainder = remainder
+      for (const line of lines) {
+        try {
+          const event = JSON.parse(line) as Record<string, unknown>
+          if (event.event === 'progress') {
+            const progress = Number(event.progress)
+            broadcastAutoChartProgress({
+              runId: options.runId,
+              stage: typeof event.stage === 'string' ? event.stage : 'bootstrap',
+              percent: Number.isFinite(progress)
+                ? Math.round(Math.max(0, Math.min(1, progress)) * 100)
+                : undefined,
+              message: 'STRUM is processing the validated local profile.'
+            })
+          } else if (event.event === 'terminal') {
+            if (event.state === 'succeeded' && event.result && typeof event.result === 'object') {
+              terminalResult = safeProfiledAutoChartResult(
+                event.result as Record<string, unknown>,
+                options.outputDir
+              )
+            } else {
+              terminalError = new Error(
+                'The validated STRUM profile could not complete this chart run.'
+              )
+            }
+          }
+        } catch {
+          // Reject non-protocol text without forwarding raw worker output to the UI.
+        }
+      }
+    }
+    child.stdout?.on('data', (chunk: Buffer) => consume(chunk, 'stdout'))
+    child.stderr?.on('data', (chunk: Buffer) => consume(chunk, 'stderr'))
+    const clean = async (): Promise<void> => {
+      runningProfiledAutoCharts.delete(options.runId)
+      try {
+        await unlink(requestPath)
+      } catch {
+        /* idempotent cleanup */
+      }
+    }
+    child.once('error', () => {
+      void clean().then(() =>
+        reject(new Error('The validated STRUM profile could not be started.'))
+      )
+    })
+    child.once('close', () => {
+      void clean().then(() => {
+        if (stdoutRemainder) consume(Buffer.from('\n'), 'stdout')
+        if (stderrRemainder) consume(Buffer.from('\n'), 'stderr')
+        if (terminalResult) {
+          resolve(terminalResult)
+        } else {
+          reject(terminalError ?? new Error('The validated STRUM profile ended unexpectedly.'))
+        }
+      })
+    })
+  })
+}
+
+export async function runDefaultAutoChartProfile(
+  options: Omit<AutoChartRunOptions, 'cacheDir'>
+): Promise<AutoChartRunResult | null> {
+  const profile = await resolveDefaultAutoChartProfile()
+  return profile ? await runResolvedAutoChartProfile(profile, options) : null
+}
+
+export async function cancelDefaultAutoChartProfile(runId: string): Promise<boolean> {
+  const job = runningProfiledAutoCharts.get(runId)
+  if (!job) return false
+  try {
+    if (process.platform !== 'win32' && job.process.pid) process.kill(-job.process.pid, 'SIGTERM')
+    else job.process.kill('SIGTERM')
+  } catch {
+    return false
+  }
+  try {
+    await unlink(job.requestPath)
+  } catch {
+    /* idempotent cleanup */
+  }
+  return true
 }
 
 async function startJsonEventJob(
@@ -351,18 +784,15 @@ async function startJsonEventJob(
   onSucceeded: (result: Record<string, unknown>) => Promise<Record<string, unknown>>,
   runId?: string
 ): Promise<void> {
-  const python = await resolvePythonCommand(jobId)
-  const script = workerScriptPath()
-  if (!existsSync(script)) throw new Error('OCTAVE could not find its STRUM runtime adapter.')
+  const worker = await resolveWorkerInvocation(jobId)
   const requestPath = join(app.getPath('temp'), `octave-training-${jobId}.json`)
   await writeFile(requestPath, JSON.stringify(request), 'utf8')
-  const env = await workerEnvironment()
   const child = spawn(
-    python.command,
-    [...python.baseArgs, script, ...args, '--request', requestPath, '--json-events'],
+    worker.command,
+    [...worker.baseArgs, ...args, '--request', requestPath, '--json-events'],
     {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env,
+      env: worker.env,
       detached: process.platform !== 'win32'
     }
   )
