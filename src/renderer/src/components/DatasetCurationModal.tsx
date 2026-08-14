@@ -498,41 +498,41 @@ export function TrainingModal({
         aria-modal="true"
         role="dialog"
       >
-        <header>
-          <div>
-            <h2>
-              <span aria-hidden="true">🧪</span> Training
-            </h2>
-            <p>Curate approved sources, prepare a training view, then run STRUM.</p>
-          </div>
+        <header className="training-header">
+          <h2>
+            <span aria-hidden="true">🧪</span> Training
+          </h2>
+          <nav className="training-steps" aria-label="Training steps">
+            {(['curate', 'prepare', 'train'] as const).map((step, index) => {
+              const activeStepIndex = ['curate', 'prepare', 'train'].indexOf(activeStep)
+              const available =
+                step === 'curate' ||
+                (step === 'prepare' && selectedCatalog !== null) ||
+                (step === 'train' && selectedCatalog !== null)
+              return (
+                <button
+                  key={step}
+                  className={
+                    activeStep === step ? 'active' : index < activeStepIndex ? 'complete' : ''
+                  }
+                  disabled={!available}
+                  onClick={() => setActiveStep(step)}
+                >
+                  <span className="training-step-orb" aria-hidden="true">
+                    <TrainingStepIcon step={step} complete={index < activeStepIndex} />
+                  </span>
+                  <span className="training-step-label">{step}</span>
+                </button>
+              )
+            })}
+          </nav>
           <button className="dataset-close" onClick={onClose} aria-label="Close">
             ×
           </button>
+          <p className="training-tagline">
+            Curate approved sources, prepare a training view, then run STRUM.
+          </p>
         </header>
-        <nav className="training-steps" aria-label="Training steps">
-          {(['curate', 'prepare', 'train'] as const).map((step, index) => {
-            const activeStepIndex = ['curate', 'prepare', 'train'].indexOf(activeStep)
-            const available =
-              step === 'curate' ||
-              (step === 'prepare' && selectedCatalog !== null) ||
-              (step === 'train' && selectedCatalog !== null)
-            return (
-              <button
-                key={step}
-                className={
-                  activeStep === step ? 'active' : index < activeStepIndex ? 'complete' : ''
-                }
-                disabled={!available}
-                onClick={() => setActiveStep(step)}
-              >
-                <span className="training-step-orb" aria-hidden="true">
-                  <TrainingStepIcon step={step} complete={index < activeStepIndex} />
-                </span>
-                <span className="training-step-label">{step}</span>
-              </button>
-            )
-          })}
-        </nav>
         <main>
           {error && <p className="dataset-message error">{error}</p>}
           {result && (
