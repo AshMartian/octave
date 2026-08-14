@@ -158,7 +158,9 @@ def _diagnose_basic_pitch_failure(exc: BaseException) -> None:
     )
 
 
-def _sanitize_string_to_latin1(s: str) -> str:
+def _sanitize_string_to_latin1(s):
+    if not isinstance(s, str):
+        return s
     if not s:
         return s
     _SMART_MAP = {
@@ -220,10 +222,12 @@ def _run_separation_subprocess(cmd: "list[str]", label: str) -> "tuple[int, int]
                     break
                 last_activity = time.time()
                 try:
-                    # Detect progress bar completion to bypass idle timeout during post-completion write.
+                    # A completed progress bar can legitimately be followed by
+                    # a quiet post-processing write. Re-arm the idle watchdog
+                    # when a later bar starts so a subsequent stall is caught.
                     text = chunk.decode("utf-8", errors="ignore")
-                    if "100%" in text:
-                        completed_progress = True
+                    for progress in re.finditer(r"(?<!\d)(100|[1-9]?\d)%", text):
+                        completed_progress = progress.group(1) == "100"
                 except Exception:
                     pass
                 try:
