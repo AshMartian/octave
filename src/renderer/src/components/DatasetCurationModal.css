@@ -107,8 +107,42 @@
   background: color-mix(in srgb, var(--text-secondary) 26%, transparent);
   border-radius: 999px;
 }
-.dataset-curation-modal .training-steps button:last-child::after {
+.training-step {
+  position: relative;
+  min-width: 0;
+}
+.training-step > button {
+  width: 100%;
+}
+.dataset-curation-modal .training-steps .training-step:last-child button::after {
   content: none;
+}
+.training-step-blocker {
+  position: absolute;
+  z-index: 5;
+  top: calc(100% + 6px);
+  left: 50%;
+  width: max-content;
+  max-width: 220px;
+  padding: 7px 9px;
+  color: #f6d99c;
+  background: var(--bg-primary);
+  border: 1px solid rgba(191, 143, 50, 0.42);
+  border-radius: 5px;
+  box-shadow: var(--shadow-lg);
+  font-size: 11px;
+  line-height: 1.35;
+  opacity: 0;
+  pointer-events: none;
+  transform: translate(-50%, -4px);
+  transition:
+    opacity 0.15s ease,
+    transform 0.15s ease;
+}
+.training-step.blocked:hover .training-step-blocker,
+.training-step.blocked:focus-visible .training-step-blocker {
+  opacity: 1;
+  transform: translate(-50%, 0);
 }
 .training-step-orb {
   position: relative;
@@ -169,7 +203,7 @@
     color-mix(in srgb, var(--text-secondary) 26%, transparent)
   );
 }
-.dataset-curation-modal .training-steps button.complete:has(+ button.active)::after {
+.dataset-curation-modal .training-steps button.complete:has(+ .training-step button.active)::after {
   background: linear-gradient(90deg, var(--success-color), #58a6ff);
 }
 .dataset-curation-modal > footer {
@@ -362,15 +396,21 @@
   border: 1px solid var(--border-color);
   border-radius: 5px;
 }
-.dataset-catalog-picker > button {
+.dataset-catalog-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+.dataset-catalog-select {
   display: grid;
+  flex: 1;
   gap: 2px;
   text-align: left;
 }
-.dataset-catalog-picker > button small {
+.dataset-catalog-select small {
   color: var(--text-secondary);
 }
-.dataset-catalog-picker > button.selected {
+.dataset-catalog-row.selected .dataset-catalog-select {
   border-color: var(--accent-color);
   background: color-mix(in srgb, var(--accent-color) 20%, var(--bg-tertiary));
 }

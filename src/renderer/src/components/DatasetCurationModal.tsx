@@ -29,6 +29,8 @@ export type TrainingActivity = {
 type ExistingCatalog = {
   catalogName: string
   catalogId: string
+  provenance: string
+  license: string
   recordCount: number
   libraryRecordCount: number
   externalRecordCount: number
@@ -288,6 +290,10 @@ export function TrainingModal({
       if (existingCatalog) {
         setSelectedCatalog(existingCatalog)
         setSaveMode('update')
+        setCatalogName(existingCatalog.catalogName)
+        setCatalogId(existingCatalog.catalogId)
+        setProvenance(existingCatalog.provenance)
+        setLicense(existingCatalog.license)
         setActiveStep('prepare')
       } else {
         setSelectedCatalog(null)
@@ -474,6 +480,8 @@ export function TrainingModal({
     setSaveMode('update')
     setCatalogName(catalog.catalogName)
     setCatalogId(catalog.catalogId)
+    setProvenance(catalog.provenance)
+    setLicense(catalog.license)
   }
 
   const startNewCatalog = (): void => {
@@ -610,26 +618,39 @@ export function TrainingModal({
           <nav className="training-steps" aria-label="Training steps">
             {TRAINING_STEPS.map((step, index) => {
               const activeStepIndex = TRAINING_STEPS.indexOf(activeStep)
-              const available =
-                step === 'learn' ||
-                step === 'curate' ||
-                (step === 'prepare' && selectedCatalog !== null) ||
-                (step === 'train' && selectedCatalog !== null) ||
-                (step === 'deploy' && selectedCatalog !== null)
+              const blocker =
+                step === 'prepare' && !selectedCatalog
+                  ? 'Create or select a catalog before preparing a dataset.'
+                  : step === 'train' && !selectedCatalog
+                    ? 'Select a catalog before training.'
+                    : step === 'deploy' && !selectedCatalog
+                      ? 'Select a catalog before deployment.'
+                      : null
               return (
-                <button
+                <span
                   key={step}
-                  className={
-                    activeStep === step ? 'active' : index < activeStepIndex ? 'complete' : ''
-                  }
-                  disabled={!available}
-                  onClick={() => setActiveStep(step)}
+                  className={`training-step ${activeStep === step ? 'active' : index < activeStepIndex ? 'complete' : ''}${blocker ? ' blocked' : ''}`}
+                  aria-describedby={blocker ? `${step}-blocker` : undefined}
+                  tabIndex={blocker ? 0 : undefined}
                 >
-                  <span className="training-step-orb" aria-hidden="true">
-                    <TrainingStepIcon step={step} complete={index < activeStepIndex} />
-                  </span>
-                  <span className="training-step-label">{step}</span>
-                </button>
+                  <button
+                    className={
+                      activeStep === step ? 'active' : index < activeStepIndex ? 'complete' : ''
+                    }
+                    disabled={blocker !== null}
+                    onClick={() => setActiveStep(step)}
+                  >
+                    <span className="training-step-orb" aria-hidden="true">
+                      <TrainingStepIcon step={step} complete={index < activeStepIndex} />
+                    </span>
+                    <span className="training-step-label">{step}</span>
+                  </button>
+                  {blocker && (
+                    <span className="training-step-blocker" id={`${step}-blocker`} role="tooltip">
+                      {blocker}
+                    </span>
+                  )}
+                </span>
               )
             })}
           </nav>
@@ -725,22 +746,36 @@ export function TrainingModal({
                       </button>
                     )}
                   </div>
-                  {existingCatalogs.map((catalog) => (
-                    <button
-                      className={
-                        selectedCatalog?.catalogName === catalog.catalogName ? 'selected' : ''
-                      }
-                      key={catalog.catalogName}
-                      onClick={() => chooseExistingCatalog(catalog)}
-                      disabled={exporting}
-                    >
-                      <strong>{catalog.catalogName}</strong>
-                      <small>
-                        {catalog.recordCount} records · {catalog.libraryRecordCount} library ·{' '}
-                        {catalog.externalRecordCount} external
-                      </small>
-                    </button>
-                  ))}
+                  {existingCatalogs.map((catalog) => {
+                    const isSelected = selectedCatalog?.catalogName === catalog.catalogName
+                    return (
+                      <div
+                        className={`dataset-catalog-row${isSelected ? ' selected' : ''}`}
+                        key={catalog.catalogName}
+                      >
+                        <button
+                          className="dataset-catalog-select"
+                          onClick={() => chooseExistingCatalog(catalog)}
+                          disabled={exporting}
+                        >
+                          <strong>{catalog.catalogName}</strong>
+                          <small>
+                            {catalog.recordCount} records · {catalog.libraryRecordCount} library ·{' '}
+                            {catalog.externalRecordCount} external
+                          </small>
+                        </button>
+                        {isSelected && saveMode === 'update' && (
+                          <button
+                            className="dataset-catalog-update"
+                            onClick={() => void buildCatalog()}
+                            disabled={exporting}
+                          >
+                            {exporting ? 'Updating…' : 'Update'}
+                          </button>
+                        )}
+                      </div>
+                    )
+                  })}
                 </div>
                 {saveMode === 'update' && selectedCatalog?.externalRecordCount ? (
                   <p className="dataset-message warning">
@@ -964,17 +999,15 @@ export function TrainingModal({
               </span>
               <button
                 className="dataset-primary"
-                onClick={() => void buildCatalog()}
-                disabled={exporting}
+                onClick={() => setActiveStep('prepare')}
+                disabled={exporting || !selectedCatalog}
+                title={
+                  selectedCatalog
+                    ? 'Prepare the selected catalog'
+                    : 'Select a catalog to prepare a dataset'
+                }
               >
-                {exporting
-                  ? 'Saving…'
-                  : saveMode === 'update'
-                    ? 'Update catalog'
-                    : saveMode === 'clone'
-                      ? 'Clone catalog revision'
-                      : 'Build source catalog'}{' '}
-                <span aria-hidden="true">→</span>
+                Prepare Dataset <span aria-hidden="true">→</span>
               </button>
             </>
           ) : (

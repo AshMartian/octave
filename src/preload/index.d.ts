@@ -70,6 +70,8 @@ interface ChartEditorAPI {
     Array<{
       catalogName: string
       catalogId: string
+      provenance: string
+      license: string
       recordCount: number
       libraryRecordCount: number
       externalRecordCount: number

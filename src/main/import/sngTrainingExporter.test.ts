@@ -555,7 +555,12 @@ describe('exportSngTrainingMidi', () => {
     })
     expect(updated).toMatchObject({ recordCount: 2 })
     expect(await listSongSourceCatalogs(parentDir)).toEqual([
-      expect.objectContaining({ catalogName: 'editable-catalog', recordCount: 2 })
+      expect.objectContaining({
+        catalogName: 'editable-catalog',
+        provenance: 'Reviewed',
+        license: 'test-only',
+        recordCount: 2
+      })
     ])
 
     const clone = await buildSongSourceCatalog({

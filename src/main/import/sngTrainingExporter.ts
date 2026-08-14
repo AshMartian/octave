@@ -152,6 +152,8 @@ export type SongSourceCatalogWriteMode = 'create' | 'update' | 'clone'
 export interface SongSourceCatalogSummary {
   catalogName: string
   catalogId: string
+  provenance: string
+  license: string
   recordCount: number
   libraryRecordCount: number
   externalRecordCount: number
@@ -980,12 +982,15 @@ export async function listSongSourceCatalogs(
           if (!validateCatalogManifestSchema(catalog)) return null
           await validateStagedCatalog(catalogRoot)
           const records = await readCatalogRecords(catalogRoot)
+          const rights = records[0].rights as { provenance: string; license: string }
           const libraryRecordCount = records.filter(
             (record) => (record.import as { kind?: string }).kind === 'song_folder'
           ).length
           return {
             catalogName: entry.name,
             catalogId: String(catalog.catalog_id),
+            provenance: rights.provenance,
+            license: rights.license,
             recordCount: records.length,
             libraryRecordCount,
             externalRecordCount: records.length - libraryRecordCount
