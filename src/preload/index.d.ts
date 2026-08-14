@@ -57,11 +57,15 @@ interface ChartEditorAPI {
       total: number
     }) => void
   ) => () => void
-  chooseDatasetCatalogParent: () => Promise<{ parentId: string; name: string } | null>
-  useDefaultDatasetCatalogParent: () => Promise<{ parentId: string; name: string } | null>
+  chooseDatasetCatalogParent: () => Promise<{ parentId: string; name: string; path: string } | null>
+  useDefaultDatasetCatalogParent: () => Promise<{
+    parentId: string
+    name: string
+    path: string
+  } | null>
   restoreDatasetCatalogParent: (
     parentId: string
-  ) => Promise<{ parentId: string; name: string } | null>
+  ) => Promise<{ parentId: string; name: string; path: string } | null>
   listDatasetCatalogs: (parentId: string) => Promise<
     Array<{
       catalogName: string
