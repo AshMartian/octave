@@ -1,28 +1,30 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
-import type { MetadataArtwork, SongMetadataSearchRequest, SongMetadataSearchResult } from '../shared/songMetadata'
+import type {
+  MetadataArtwork,
+  SongMetadataSearchRequest,
+  SongMetadataSearchResult
+} from '../shared/songMetadata'
 
 // Custom APIs for renderer
 const api = {
   // Dialog APIs
   openFolder: (): Promise<string | null> => ipcRenderer.invoke('dialog:openFolder'),
 
-  importSongPackage: (): Promise<string | null> =>
-    ipcRenderer.invoke('dialog:importSongPackage'),
+  importSongPackage: (): Promise<string | null> => ipcRenderer.invoke('dialog:importSongPackage'),
 
   // Folder APIs
-  scanFolder: (folderPath: string): Promise<Array<{ id: string; path: string; name: string; addedAt: number }>> =>
+  scanFolder: (
+    folderPath: string
+  ): Promise<Array<{ id: string; path: string; name: string; addedAt: number }>> =>
     ipcRenderer.invoke('folder:scan', folderPath),
 
   // Dialog APIs
-  openAudioDialog: (): Promise<string | null> =>
-    ipcRenderer.invoke('dialog:openAudio'),
+  openAudioDialog: (): Promise<string | null> => ipcRenderer.invoke('dialog:openAudio'),
 
-  openAudioFilesDialog: (): Promise<string[]> =>
-    ipcRenderer.invoke('dialog:openAudioFiles'),
+  openAudioFilesDialog: (): Promise<string[]> => ipcRenderer.invoke('dialog:openAudioFiles'),
 
-  openAudioFolderDialog: (): Promise<string | null> =>
-    ipcRenderer.invoke('dialog:openAudioFolder'),
+  openAudioFolderDialog: (): Promise<string | null> => ipcRenderer.invoke('dialog:openAudioFolder'),
 
   openOutputFolderDialog: (): Promise<string | null> =>
     ipcRenderer.invoke('dialog:openOutputFolder'),
@@ -33,17 +35,58 @@ const api = {
   getDefaultAutoChartOutputDir: (): Promise<string> =>
     ipcRenderer.invoke('strum:getDefaultOutputFolder'),
 
+  chooseDatasetPackageFolder: (): Promise<Array<{ path: string; name: string }>> =>
+    ipcRenderer.invoke('dataset:choosePackageFolder'),
+
+  chooseDatasetOutputFolder: (): Promise<string | null> =>
+    ipcRenderer.invoke('dataset:chooseOutputFolder'),
+
+  scanDatasetLibrary: (): Promise<
+    Array<{
+      path: string
+      name: string
+      artist: string
+      charter?: string
+      datasetOptIn: boolean
+      isStrumGenerated: boolean
+      hasNotesMidi: boolean
+    }>
+  > => ipcRenderer.invoke('dataset:scanLibrary'),
+
+  setDatasetSongOptIn: (songPath: string, optedIn: boolean): Promise<boolean> =>
+    ipcRenderer.invoke('dataset:setSongOptIn', songPath, optedIn),
+
+  exportTrainingDataset: (options: {
+    packagePaths: string[]
+    librarySongPaths: string[]
+    outputDir: string
+    datasetId: string
+    provenance: string
+    license: string
+  }): Promise<{
+    manifestPath: string
+    exported: Array<{ songId: string }>
+    skipped: Array<{ reason: string }>
+  }> => ipcRenderer.invoke('dataset:export', options),
+
   openLyricsFileDialog: (): Promise<{ filePath: string; content: string } | null> =>
     ipcRenderer.invoke('dialog:openLyricsFile'),
 
   // Song APIs
-  createSongFolder: (parentPath: string, folderName: string, audioPath?: string): Promise<{ id: string; path: string; name: string } | null> =>
+  createSongFolder: (
+    parentPath: string,
+    folderName: string,
+    audioPath?: string
+  ): Promise<{ id: string; path: string; name: string } | null> =>
     ipcRenderer.invoke('song:createFolder', parentPath, folderName, audioPath),
 
   deleteSongFolder: (songPath: string): Promise<boolean> =>
     ipcRenderer.invoke('song:deleteFolder', songPath),
 
-  importAudio: (songPath: string, audioSourcePath: string): Promise<{ filePath: string; filename: string } | null> =>
+  importAudio: (
+    songPath: string,
+    audioSourcePath: string
+  ): Promise<{ filePath: string; filename: string } | null> =>
     ipcRenderer.invoke('song:importAudio', songPath, audioSourcePath),
 
   readSongIni: (songPath: string): Promise<Record<string, string | number> | null> =>
@@ -81,8 +124,7 @@ const api = {
   ): Promise<{ success: boolean; error?: string }> =>
     ipcRenderer.invoke('song:exportCon', songPath, metadata, outputPath),
 
-  fileExists: (filePath: string): Promise<boolean> =>
-    ipcRenderer.invoke('fs:fileExists', filePath),
+  fileExists: (filePath: string): Promise<boolean> => ipcRenderer.invoke('fs:fileExists', filePath),
 
   // Album art APIs
   readAlbumArt: (songPath: string): Promise<string | null> =>
@@ -108,10 +150,12 @@ const api = {
     ipcRenderer.invoke('venue:writeJson', songPath, data),
 
   // Video APIs
-  openVideoDialog: (): Promise<string | null> =>
-    ipcRenderer.invoke('dialog:openVideo'),
+  openVideoDialog: (): Promise<string | null> => ipcRenderer.invoke('dialog:openVideo'),
 
-  importVideo: (songPath: string, videoSourcePath: string): Promise<{ filePath: string; filename: string } | null> =>
+  importVideo: (
+    songPath: string,
+    videoSourcePath: string
+  ): Promise<{ filePath: string; filename: string } | null> =>
     ipcRenderer.invoke('video:import', songPath, videoSourcePath),
 
   scanVideo: (songPath: string): Promise<{ filePath: string; filename: string } | null> =>
@@ -123,7 +167,10 @@ const api = {
   writeVideoJson: (songPath: string, data: unknown): Promise<boolean> =>
     ipcRenderer.invoke('video:writeJson', songPath, data),
 
-  downloadVideoUrl: (songPath: string, url: string): Promise<{ success: boolean; filePath?: string; error?: string }> =>
+  downloadVideoUrl: (
+    songPath: string,
+    url: string
+  ): Promise<{ success: boolean; filePath?: string; error?: string }> =>
     ipcRenderer.invoke('video:download-url', songPath, url),
 
   onDownloadProgress: (callback: (percent: number) => void): (() => void) => {
@@ -136,14 +183,16 @@ const api = {
     ipcRenderer.invoke('audio:waveform', songPath),
 
   // Export APIs
-  saveVideoDialog: (): Promise<string | null> =>
-    ipcRenderer.invoke('dialog:saveVideo'),
+  saveVideoDialog: (): Promise<string | null> => ipcRenderer.invoke('dialog:saveVideo'),
 
   exportVideo: (options: {
-    videoPath: string; audioPath: string; outputPath: string
-    offsetMs: number; trimStartMs: number; trimEndMs: number
-  }): Promise<{ success: boolean; error?: string }> =>
-    ipcRenderer.invoke('video:export', options),
+    videoPath: string
+    audioPath: string
+    outputPath: string
+    offsetMs: number
+    trimStartMs: number
+    trimEndMs: number
+  }): Promise<{ success: boolean; error?: string }> => ipcRenderer.invoke('video:export', options),
 
   onExportProgress: (callback: (percent: number) => void): (() => void) => {
     const handler = (_event: unknown, percent: number): void => callback(percent)
@@ -158,7 +207,20 @@ const api = {
     stemFolders?: string[]
     stemSongs?: Array<{
       name?: string
-      stems: Partial<Record<'drums' | 'bass' | 'vocals' | 'other' | 'guitar' | 'piano' | 'vocalsHarm2' | 'vocalsHarm3' | 'crowd', string>>
+      stems: Partial<
+        Record<
+          | 'drums'
+          | 'bass'
+          | 'vocals'
+          | 'other'
+          | 'guitar'
+          | 'piano'
+          | 'vocalsHarm2'
+          | 'vocalsHarm3'
+          | 'crowd',
+          string
+        >
+      >
       extras?: string[]
     }>
     urls: string[]
@@ -182,60 +244,69 @@ const api = {
       keys?: boolean
       proKeys?: boolean
     }
-  }): Promise<{ runId: string }> =>
-    ipcRenderer.invoke('strum:start', options),
+  }): Promise<{ runId: string }> => ipcRenderer.invoke('strum:start', options),
 
-  cancelAutoChart: (runId: string): Promise<boolean> =>
-    ipcRenderer.invoke('strum:cancel', runId),
+  cancelAutoChart: (runId: string): Promise<boolean> => ipcRenderer.invoke('strum:cancel', runId),
 
-  onAutoChartProgress: (callback: (event: {
-    runId: string
-    stage: string
-    message: string
-    percent?: number
-    currentItem?: string
-  }) => void): (() => void) => {
-    const handler = (_event: unknown, payload: {
+  onAutoChartProgress: (
+    callback: (event: {
       runId: string
       stage: string
       message: string
       percent?: number
       currentItem?: string
-    }): void => callback(payload)
+    }) => void
+  ): (() => void) => {
+    const handler = (
+      _event: unknown,
+      payload: {
+        runId: string
+        stage: string
+        message: string
+        percent?: number
+        currentItem?: string
+      }
+    ): void => callback(payload)
     ipcRenderer.on('strum:progress', handler)
     return () => ipcRenderer.removeListener('strum:progress', handler)
   },
 
-  onAutoChartComplete: (callback: (event: {
-    runId: string
-    success: boolean
-    outputDir: string
-    songFolders: string[]
-    errors: string[]
-    urlSongFolders?: Array<{ url: string; songFolder: string }>
-  }) => void): (() => void) => {
-    const handler = (_event: unknown, payload: {
+  onAutoChartComplete: (
+    callback: (event: {
       runId: string
       success: boolean
       outputDir: string
       songFolders: string[]
       errors: string[]
       urlSongFolders?: Array<{ url: string; songFolder: string }>
-    }): void => callback(payload)
+    }) => void
+  ): (() => void) => {
+    const handler = (
+      _event: unknown,
+      payload: {
+        runId: string
+        success: boolean
+        outputDir: string
+        songFolders: string[]
+        errors: string[]
+        urlSongFolders?: Array<{ url: string; songFolder: string }>
+      }
+    ): void => callback(payload)
     ipcRenderer.on('strum:complete', handler)
     return () => ipcRenderer.removeListener('strum:complete', handler)
   },
 
-  onAutoChartError: (callback: (event: {
-    runId: string
-    message: string
-    requirementsPath?: string
-  }) => void): (() => void) => {
-    const handler = (_event: unknown, payload: {
-      runId: string
-      message: string
-      requirementsPath?: string
-    }): void => callback(payload)
+  onAutoChartError: (
+    callback: (event: { runId: string; message: string; requirementsPath?: string }) => void
+  ): (() => void) => {
+    const handler = (
+      _event: unknown,
+      payload: {
+        runId: string
+        message: string
+        requirementsPath?: string
+      }
+    ): void => callback(payload)
     ipcRenderer.on('strum:error', handler)
     return () => ipcRenderer.removeListener('strum:error', handler)
   },
@@ -261,18 +332,37 @@ const api = {
     ipcRenderer.invoke('updater:setChannel', betaEnabled),
 
   // App updater events
-  onUpdaterStatus: (callback: (status: {
-    state: 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'not-available' | 'error'
-    version?: string
-    percent?: number
-    message?: string
-  }) => void): (() => void) => {
-    const handler = (_event: unknown, status: {
-      state: 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'not-available' | 'error'
+  onUpdaterStatus: (
+    callback: (status: {
+      state:
+        | 'idle'
+        | 'checking'
+        | 'available'
+        | 'downloading'
+        | 'downloaded'
+        | 'not-available'
+        | 'error'
       version?: string
       percent?: number
       message?: string
-    }): void => callback(status)
+    }) => void
+  ): (() => void) => {
+    const handler = (
+      _event: unknown,
+      status: {
+        state:
+          | 'idle'
+          | 'checking'
+          | 'available'
+          | 'downloading'
+          | 'downloaded'
+          | 'not-available'
+          | 'error'
+        version?: string
+        percent?: number
+        message?: string
+      }
+    ): void => callback(status)
     ipcRenderer.on('updater:status', handler)
     return () => ipcRenderer.removeListener('updater:status', handler)
   },

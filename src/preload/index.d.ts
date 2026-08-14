@@ -1,5 +1,9 @@
 import { ElectronAPI } from '@electron-toolkit/preload'
-import type { MetadataArtwork, SongMetadataSearchRequest, SongMetadataSearchResult } from '../shared/songMetadata'
+import type {
+  MetadataArtwork,
+  SongMetadataSearchRequest,
+  SongMetadataSearchResult
+} from '../shared/songMetadata'
 
 interface ChartEditorAPI {
   // Dialog APIs
@@ -7,7 +11,9 @@ interface ChartEditorAPI {
   importSongPackage: () => Promise<string | null>
 
   // Folder APIs
-  scanFolder: (folderPath: string) => Promise<Array<{ id: string; path: string; name: string; addedAt: number }>>
+  scanFolder: (
+    folderPath: string
+  ) => Promise<Array<{ id: string; path: string; name: string; addedAt: number }>>
 
   // Dialog APIs
   openAudioDialog: () => Promise<string | null>
@@ -16,10 +22,40 @@ interface ChartEditorAPI {
   openOutputFolderDialog: () => Promise<string | null>
   showItemInFolder: (filePath: string) => Promise<boolean>
   getDefaultAutoChartOutputDir: () => Promise<string>
+  chooseDatasetPackageFolder: () => Promise<Array<{ path: string; name: string }>>
+  chooseDatasetOutputFolder: () => Promise<string | null>
+  scanDatasetLibrary: () => Promise<
+    Array<{
+      path: string
+      name: string
+      artist: string
+      charter?: string
+      datasetOptIn: boolean
+      isStrumGenerated: boolean
+      hasNotesMidi: boolean
+    }>
+  >
+  setDatasetSongOptIn: (songPath: string, optedIn: boolean) => Promise<boolean>
+  exportTrainingDataset: (options: {
+    packagePaths: string[]
+    librarySongPaths: string[]
+    outputDir: string
+    datasetId: string
+    provenance: string
+    license: string
+  }) => Promise<{
+    manifestPath: string
+    exported: Array<{ songId: string }>
+    skipped: Array<{ reason: string }>
+  }>
   openLyricsFileDialog: () => Promise<{ filePath: string; content: string } | null>
 
   // Song APIs
-  createSongFolder: (parentPath: string, folderName: string, audioPath?: string) => Promise<{ id: string; path: string; name: string } | null>
+  createSongFolder: (
+    parentPath: string,
+    folderName: string,
+    audioPath?: string
+  ) => Promise<{ id: string; path: string; name: string } | null>
   deleteSongFolder: (songPath: string) => Promise<boolean>
   readSongIni: (songPath: string) => Promise<Record<string, string | number> | null>
   writeSongIni: (songPath: string, metadata: Record<string, unknown>) => Promise<boolean>
@@ -45,7 +81,10 @@ interface ChartEditorAPI {
   writeAlbumArt: (songPath: string, dataUrl: string) => Promise<boolean>
 
   // Audio APIs
-  importAudio: (songPath: string, audioSourcePath: string) => Promise<{ filePath: string; filename: string } | null>
+  importAudio: (
+    songPath: string,
+    audioSourcePath: string
+  ) => Promise<{ filePath: string; filename: string } | null>
   readAudio: (songPath: string) => Promise<{ filePath: string; filename: string }[] | null>
   readAudioJson: (songPath: string) => Promise<Record<string, unknown> | null>
   writeAudioJson: (songPath: string, data: unknown) => Promise<boolean>
@@ -54,19 +93,29 @@ interface ChartEditorAPI {
 
   // Video APIs
   openVideoDialog: () => Promise<string | null>
-  importVideo: (songPath: string, videoSourcePath: string) => Promise<{ filePath: string; filename: string } | null>
+  importVideo: (
+    songPath: string,
+    videoSourcePath: string
+  ) => Promise<{ filePath: string; filename: string } | null>
   scanVideo: (songPath: string) => Promise<{ filePath: string; filename: string } | null>
   readVideoJson: (songPath: string) => Promise<Record<string, unknown> | null>
   writeVideoJson: (songPath: string, data: unknown) => Promise<boolean>
-  downloadVideoUrl: (songPath: string, url: string) => Promise<{ success: boolean; filePath?: string; error?: string }>
+  downloadVideoUrl: (
+    songPath: string,
+    url: string
+  ) => Promise<{ success: boolean; filePath?: string; error?: string }>
   onDownloadProgress: (callback: (percent: number) => void) => () => void
   getWaveformSource: (songPath: string) => Promise<{ filePath: string } | null>
 
   // Export APIs
   saveVideoDialog: () => Promise<string | null>
   exportVideo: (options: {
-    videoPath: string; audioPath: string; outputPath: string
-    offsetMs: number; trimStartMs: number; trimEndMs: number
+    videoPath: string
+    audioPath: string
+    outputPath: string
+    offsetMs: number
+    trimStartMs: number
+    trimEndMs: number
   }) => Promise<{ success: boolean; error?: string }>
   onExportProgress: (callback: (percent: number) => void) => () => void
 
@@ -78,7 +127,20 @@ interface ChartEditorAPI {
     stemFolders?: string[]
     stemSongs?: Array<{
       name?: string
-      stems: Partial<Record<'drums' | 'bass' | 'vocals' | 'other' | 'guitar' | 'piano' | 'vocalsHarm2' | 'vocalsHarm3' | 'crowd', string>>
+      stems: Partial<
+        Record<
+          | 'drums'
+          | 'bass'
+          | 'vocals'
+          | 'other'
+          | 'guitar'
+          | 'piano'
+          | 'vocalsHarm2'
+          | 'vocalsHarm3'
+          | 'crowd',
+          string
+        >
+      >
       extras?: string[]
     }>
     urls: string[]
@@ -113,26 +175,28 @@ interface ChartEditorAPI {
     manualBpm?: number
   }) => Promise<{ runId: string }>
   cancelAutoChart: (runId: string) => Promise<boolean>
-  onAutoChartProgress: (callback: (event: {
-    runId: string
-    stage: string
-    message: string
-    percent?: number
-    currentItem?: string
-  }) => void) => () => void
-  onAutoChartComplete: (callback: (event: {
-    runId: string
-    success: boolean
-    outputDir: string
-    songFolders: string[]
-    errors: string[]
-    urlSongFolders?: Array<{ url: string; songFolder: string }>
-  }) => void) => () => void
-  onAutoChartError: (callback: (event: {
-    runId: string
-    message: string
-    requirementsPath?: string
-  }) => void) => () => void
+  onAutoChartProgress: (
+    callback: (event: {
+      runId: string
+      stage: string
+      message: string
+      percent?: number
+      currentItem?: string
+    }) => void
+  ) => () => void
+  onAutoChartComplete: (
+    callback: (event: {
+      runId: string
+      success: boolean
+      outputDir: string
+      songFolders: string[]
+      errors: string[]
+      urlSongFolders?: Array<{ url: string; songFolder: string }>
+    }) => void
+  ) => () => void
+  onAutoChartError: (
+    callback: (event: { runId: string; message: string; requirementsPath?: string }) => void
+  ) => () => void
 
   // Bootstrapped Python runtime (managed in userData on packaged builds)
   getRuntimeStatus: () => Promise<{
@@ -151,12 +215,21 @@ interface ChartEditorAPI {
   setUpdateChannel: (betaEnabled: boolean) => Promise<{ ok: boolean; betaChannel: boolean }>
 
   // App updater events
-  onUpdaterStatus: (callback: (status: {
-    state: 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'not-available' | 'error'
-    version?: string
-    percent?: number
-    message?: string
-  }) => void) => () => void
+  onUpdaterStatus: (
+    callback: (status: {
+      state:
+        | 'idle'
+        | 'checking'
+        | 'available'
+        | 'downloading'
+        | 'downloaded'
+        | 'not-available'
+        | 'error'
+      version?: string
+      percent?: number
+      message?: string
+    }) => void
+  ) => () => void
 
   // App menu events
   onMenuCommand: (callback: (command: string, payload?: unknown) => void) => () => void

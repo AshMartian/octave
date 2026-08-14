@@ -2,8 +2,9 @@ import { existsSync } from 'fs'
 import { mkdir, readFile, rm, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { packRb3con } from '../conPacker'
 import { packSng } from '../sngPacker'
-import { exportSngTrainingMidi } from './sngTrainingExporter'
+import { exportSngTrainingMidi, listDatasetLibrarySongs } from './sngTrainingExporter'
 
 describe('exportSngTrainingMidi', () => {
   const testDir = join(__dirname, '../../../out/sng_training_exporter_test_temp')
@@ -68,7 +69,7 @@ describe('exportSngTrainingMidi', () => {
     expect(await readFile(join(outputDir, song.midi))).toEqual(validMidi)
     expect(existsSync(join(outputDir, 'songs', song.songId, 'guitar.ogg'))).toBe(false)
     const manifest = await readFile(result.manifestPath, 'utf8')
-    expect(manifest).toContain('octave-sng-midi-export/v1')
+    expect(manifest).toContain('octave-training-midi-export/v1')
     expect(manifest).not.toContain(sngPath)
     expect(manifest).not.toContain('/private/metadata/path')
     const metadata = await readFile(
@@ -160,5 +161,67 @@ describe('exportSngTrainingMidi', () => {
     expect(result.skipped).toEqual([
       { sourceIndex: 0, reason: 'Package could not be read or exported' }
     ])
+  })
+
+  it('requires an explicit song.ini opt-in before exporting Octave library songs', async () => {
+    const optedIn = join(testDir, 'library-opted-in')
+    const optedOut = join(testDir, 'library-opted-out')
+    await mkdir(optedIn, { recursive: true })
+    await mkdir(optedOut, { recursive: true })
+    await writeFile(join(optedIn, 'notes.mid'), validMidi)
+    await writeFile(join(optedOut, 'notes.mid'), validMidi)
+    await writeFile(
+      join(optedIn, 'song.ini'),
+      '[song]\nname = Reviewed\nartist = Tester\ndataset_opt_in = true\n'
+    )
+    await writeFile(
+      join(optedOut, 'song.ini'),
+      '[song]\nname = Generated\nartist = Tester\ncharter = STRUM\nstrum_generated = true\ndataset_opt_in = false\n'
+    )
+
+    const librarySongs = await listDatasetLibrarySongs(testDir)
+    expect(librarySongs.find((song) => song.path === optedIn)?.datasetOptIn).toBe(true)
+    expect(librarySongs.find((song) => song.path === optedOut)).toMatchObject({
+      datasetOptIn: false,
+      isStrumGenerated: true
+    })
+
+    const outputDir = join(testDir, 'library-dataset')
+    const result = await exportSngTrainingMidi({
+      sngPaths: [],
+      librarySongPaths: [optedIn, optedOut],
+      outputDir,
+      datasetId: 'reviewed-library',
+      provenance: 'local review',
+      license: 'test-only'
+    })
+
+    expect(result.exported).toHaveLength(1)
+    expect(result.exported[0].source).toBe('octave-library')
+    expect(result.skipped).toEqual([
+      { sourceIndex: 1, reason: 'Song is not opted into dataset curation' }
+    ])
+  })
+
+  it('exports MIDI directly from an explicitly selected RB3CON package', async () => {
+    const songDir = join(testDir, 'con-source')
+    await mkdir(songDir, { recursive: true })
+    await writeFile(join(songDir, 'notes.mid'), validMidi)
+    await writeFile(join(songDir, 'song.ogg'), Buffer.from('OggS'))
+    const conPath = join(testDir, 'source.rb3con')
+    await packRb3con(songDir, { name: 'CON Song', artist: 'CON Artist' }, conPath)
+
+    const result = await exportSngTrainingMidi({
+      sngPaths: [],
+      conPaths: [conPath],
+      outputDir: join(testDir, 'con-dataset'),
+      datasetId: 'con-export',
+      provenance: 'synthetic test fixture',
+      license: 'test-only'
+    })
+
+    expect(result.exported).toHaveLength(1)
+    expect(result.exported[0]).toMatchObject({ source: 'rb3con', metadata: { name: 'CON Song' } })
+    expect(await readFile(join(testDir, 'con-dataset', result.exported[0].midi))).toEqual(validMidi)
   })
 })

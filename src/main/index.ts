@@ -15,6 +15,7 @@ import { packSng } from './sngPacker'
 import { packRb3con } from './conPacker'
 import { importSng } from './import/sngImporter'
 import { importCon } from './import/conImporter'
+import { exportSngTrainingMidi, listDatasetLibrarySongs } from './import/sngTrainingExporter'
 import {
   ImportCancelledError,
   PartialImportError,
@@ -75,6 +76,8 @@ app.on('before-quit', () => {
 
 // Track the currently opened project folder for path validation
 let allowedProjectPath: string | null = null
+const approvedDatasetPackagePaths = new Set<string>()
+const approvedDatasetOutputPaths = new Set<string>()
 
 type UpdaterState = {
   state: 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'not-available' | 'error'
@@ -718,6 +721,121 @@ ipcMain.handle('dialog:openOutputFolder', async () => {
   if (result.canceled || result.filePaths.length === 0) return null
   return result.filePaths[0]
 })
+
+async function findDatasetPackages(folderPath: string): Promise<string[]> {
+  const packages: string[] = []
+  const pending = [resolve(folderPath)]
+  while (pending.length > 0) {
+    const current = pending.pop()!
+    const entries = await readdir(current, { withFileTypes: true })
+    for (const entry of entries) {
+      const entryPath = join(current, entry.name)
+      if (entry.isDirectory()) {
+        pending.push(entryPath)
+        continue
+      }
+      if (!entry.isFile()) continue
+      const extension = pathExtname(entry.name)
+      if (extension === '.sng' || extension === '.con' || extension === '.rb3con') {
+        packages.push(entryPath)
+      }
+    }
+  }
+  return packages.sort((left, right) => left.localeCompare(right))
+}
+
+function pathExtname(fileName: string): string {
+  const index = fileName.lastIndexOf('.')
+  return index === -1 ? '' : fileName.slice(index).toLowerCase()
+}
+
+ipcMain.handle('dataset:choosePackageFolder', async () => {
+  const result = await dialog.showOpenDialog({
+    properties: ['openDirectory'],
+    title: 'Select Folder of .sng / .rb3con Packages'
+  })
+  if (result.canceled || result.filePaths.length === 0) return []
+  try {
+    const packagePaths = await findDatasetPackages(result.filePaths[0])
+    for (const packagePath of packagePaths) approvedDatasetPackagePaths.add(resolve(packagePath))
+    return packagePaths.map((packagePath) => ({ path: packagePath, name: basename(packagePath) }))
+  } catch (error) {
+    console.error('Failed to scan dataset package folder:', error)
+    return []
+  }
+})
+
+ipcMain.handle('dataset:chooseOutputFolder', async () => {
+  const result = await dialog.showOpenDialog({
+    properties: ['openDirectory', 'createDirectory'],
+    title: 'Select Empty Dataset Export Folder'
+  })
+  if (result.canceled || result.filePaths.length === 0) return null
+  const outputPath = resolve(result.filePaths[0])
+  approvedDatasetOutputPaths.add(outputPath)
+  return outputPath
+})
+
+ipcMain.handle('dataset:scanLibrary', async () => {
+  if (!allowedProjectPath) return []
+  try {
+    return await listDatasetLibrarySongs(allowedProjectPath)
+  } catch (error) {
+    console.error('Failed to scan library for dataset curation:', error)
+    return []
+  }
+})
+
+ipcMain.handle('dataset:setSongOptIn', async (_event, songPath: string, optedIn: boolean) => {
+  if (!isPathAllowed(songPath)) return false
+  try {
+    const iniPath = join(songPath, 'song.ini')
+    const metadata = parseIniFile(await readFile(iniPath, 'utf8'))
+    metadata.dataset_opt_in = optedIn ? 'true' : 'false'
+    await writeFile(iniPath, serializeIniFile(metadata), 'utf8')
+    return true
+  } catch (error) {
+    console.error('Failed to update dataset opt-in:', error)
+    return false
+  }
+})
+
+ipcMain.handle(
+  'dataset:export',
+  async (
+    _event,
+    options: {
+      packagePaths: string[]
+      librarySongPaths: string[]
+      outputDir: string
+      datasetId: string
+      provenance: string
+      license: string
+    }
+  ) => {
+    const packagePaths = options.packagePaths.map((packagePath) => resolve(packagePath))
+    const librarySongPaths = options.librarySongPaths.map((songPath) => resolve(songPath))
+    const outputDir = resolve(options.outputDir)
+    if (!approvedDatasetOutputPaths.has(outputDir)) {
+      throw new Error('Choose an output folder through the dataset curation dialog.')
+    }
+    if (!packagePaths.every((packagePath) => approvedDatasetPackagePaths.has(packagePath))) {
+      throw new Error('Choose package folders through the dataset curation dialog.')
+    }
+    if (!librarySongPaths.every(isPathAllowed)) {
+      throw new Error('A library song is outside the open Octave library.')
+    }
+    return await exportSngTrainingMidi({
+      sngPaths: packagePaths.filter((packagePath) => pathExtname(packagePath) === '.sng'),
+      conPaths: packagePaths.filter((packagePath) => pathExtname(packagePath) !== '.sng'),
+      librarySongPaths,
+      outputDir,
+      datasetId: options.datasetId,
+      provenance: options.provenance,
+      license: options.license
+    })
+  }
+)
 
 // Reveal file in OS file explorer
 ipcMain.handle('dialog:showItemInFolder', async (_event, filePath: string) => {
