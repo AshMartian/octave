@@ -486,7 +486,6 @@
 .training-learn {
   display: grid;
   gap: 16px;
-  max-width: 720px;
 }
 .training-learn-intro {
   display: grid;
@@ -513,9 +512,6 @@
   border: 1px solid var(--border-color);
   border-radius: 7px;
   background: var(--bg-tertiary);
-}
-.training-learn-path li:last-child {
-  grid-column: 1 / -1;
 }
 .training-learn-path li > span {
   display: grid;
@@ -592,9 +588,6 @@
   .dataset-editor-fields,
   .training-learn-path {
     grid-template-columns: 1fr;
-  }
-  .training-learn-path li:last-child {
-    grid-column: auto;
   }
   .dataset-curation-modal footer {
     align-items: start;
