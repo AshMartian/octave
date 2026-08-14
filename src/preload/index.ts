@@ -93,15 +93,21 @@ const api = {
     return () => ipcRenderer.removeListener('dataset:saveProgress', listener)
   },
 
-  chooseDatasetCatalogParent: (): Promise<{ parentId: string; name: string } | null> =>
-    ipcRenderer.invoke('dataset:chooseCatalogParent'),
+  chooseDatasetCatalogParent: (): Promise<{
+    parentId: string
+    name: string
+    path: string
+  } | null> => ipcRenderer.invoke('dataset:chooseCatalogParent'),
 
-  useDefaultDatasetCatalogParent: (): Promise<{ parentId: string; name: string } | null> =>
-    ipcRenderer.invoke('dataset:useDefaultCatalogParent'),
+  useDefaultDatasetCatalogParent: (): Promise<{
+    parentId: string
+    name: string
+    path: string
+  } | null> => ipcRenderer.invoke('dataset:useDefaultCatalogParent'),
 
   restoreDatasetCatalogParent: (
     parentId: string
-  ): Promise<{ parentId: string; name: string } | null> =>
+  ): Promise<{ parentId: string; name: string; path: string } | null> =>
     ipcRenderer.invoke('dataset:restoreCatalogParent', parentId),
 
   listDatasetCatalogs: (

@@ -106,16 +106,18 @@ async function rememberDatasetCatalogParent(
 ): Promise<{
   parentId: string
   name: string
+  path: string
 }> {
   const bookmark = { parentId: randomUUID(), name, path: parentPath }
   datasetCatalogParents.set(bookmark.parentId, bookmark.path)
   await writeFile(datasetCatalogParentBookmarkPath(), JSON.stringify(bookmark), 'utf8')
-  return { parentId: bookmark.parentId, name: bookmark.name }
+  return { parentId: bookmark.parentId, name: bookmark.name, path: bookmark.path }
 }
 
 async function restoreDatasetCatalogParent(parentId: string): Promise<{
   parentId: string
   name: string
+  path: string
 } | null> {
   try {
     const bookmark = JSON.parse(
@@ -124,7 +126,7 @@ async function restoreDatasetCatalogParent(parentId: string): Promise<{
     if (bookmark.parentId !== parentId) return null
     if (!(await stat(bookmark.path)).isDirectory()) return null
     datasetCatalogParents.set(bookmark.parentId, bookmark.path)
-    return { parentId: bookmark.parentId, name: bookmark.name }
+    return { parentId: bookmark.parentId, name: bookmark.name, path: bookmark.path }
   } catch {
     return null
   }

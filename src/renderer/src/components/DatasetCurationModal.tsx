@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
 import './DatasetCurationModal.css'
 
 type SourceCandidate = {
@@ -91,9 +91,11 @@ export function TrainingModal({
   const [songs, setSongs] = useState<SourceCandidate[]>([])
   const [packageGroups, setPackageGroups] = useState<PackageGroup[]>([])
   const [selectedPackages, setSelectedPackages] = useState<Set<string>>(new Set())
-  const [catalogParent, setCatalogParent] = useState<{ parentId: string; name: string } | null>(
-    null
-  )
+  const [catalogParent, setCatalogParent] = useState<{
+    parentId: string
+    name: string
+    path: string
+  } | null>(null)
   const [existingCatalogs, setExistingCatalogs] = useState<ExistingCatalog[]>([])
   const [selectedCatalog, setSelectedCatalog] = useState<ExistingCatalog | null>(null)
   const [saveMode, setSaveMode] = useState<CatalogSaveMode>('create')
@@ -469,7 +471,7 @@ export function TrainingModal({
               (step === 'prepare' && selectedCatalog !== null) ||
               (step === 'train' && selectedCatalog !== null)
             return (
-              <div className="training-step-item" key={step}>
+              <Fragment key={step}>
                 <button
                   className={
                     activeStep === step ? 'active' : index < activeStepIndex ? 'complete' : ''
@@ -478,12 +480,18 @@ export function TrainingModal({
                   onClick={() => setActiveStep(step)}
                 >
                   <span className="training-step-orb" aria-hidden="true">
-                    {index < activeStepIndex ? '✓' : index + 1}
+                    {index < activeStepIndex
+                      ? '✓'
+                      : step === 'curate'
+                        ? '🗂'
+                        : step === 'prepare'
+                          ? '⚙'
+                          : '⚡'}
                   </span>
                   <span className="training-step-label">{step}</span>
                 </button>
                 {index < 2 && <span className="training-step-connector" aria-hidden="true" />}
-              </div>
+              </Fragment>
             )
           })}
         </nav>
@@ -521,7 +529,7 @@ export function TrainingModal({
                   Catalog parent
                   <div className="dataset-output">
                     <input
-                      value={catalogParent?.name ?? ''}
+                      value={catalogParent?.path ?? ''}
                       readOnly
                       placeholder="Preparing Catalog Parent"
                     />
@@ -664,13 +672,15 @@ export function TrainingModal({
                     </p>
                   </div>
                   <button
+                    aria-label={scanningPackages ? 'Scanning package folder' : 'Add package folder'}
+                    className="dataset-icon-button"
                     onClick={() => void addPackageFolder()}
                     disabled={exporting || scanningPackages}
+                    title={scanningPackages ? 'Scanning package folder' : 'Add package folder'}
                   >
                     <span className={scanningPackages ? 'dataset-spin' : ''} aria-hidden="true">
                       {scanningPackages ? '↻' : '＋'}
-                    </span>{' '}
-                    {scanningPackages ? 'Scanning…' : 'Add folder'}
+                    </span>
                   </button>
                 </div>
                 <div className="dataset-package-list">
