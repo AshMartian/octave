@@ -78,7 +78,8 @@ export default defineConfig({
           items: [
             { text: 'Keyboard Shortcuts', link: '/reference/keyboard-shortcuts' },
             { text: 'Settings', link: '/reference/settings' },
-            { text: 'File Formats', link: '/reference/file-formats' }
+            { text: 'File Formats', link: '/reference/file-formats' },
+            { text: 'Song Source Catalog', link: '/reference/song-source-catalog' }
           ]
         }
       ],
