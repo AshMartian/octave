@@ -24,6 +24,7 @@ import { parseIniFile } from '../../shared/iniFile'
 import catalogSchema from '../../../docs/reference/song-source-catalog.schema.json'
 import { StfsParser } from './conImporter'
 import { parseDta } from './dtaParser'
+import { decryptMoggBuffer } from './moggDecrypt'
 
 const EXPORT_FORMAT = 'octave-training-midi-export/v1'
 const NOTES_MIDI = 'notes.mid'
@@ -375,6 +376,23 @@ function findConMidi(
   return null
 }
 
+function findConMogg(
+  entries: Record<string, Buffer>,
+  shortname: string,
+  allowGlobalFallback: boolean
+): Buffer | null {
+  const short = shortname.toLowerCase()
+  for (const [entryPath, value] of Object.entries(entries)) {
+    const normalized = entryPath.toLowerCase().replace(/\\/g, '/')
+    if (normalized === `${short}.mogg` || normalized.endsWith(`/${short}.mogg`)) return value
+  }
+  if (!allowGlobalFallback) return null
+  for (const [entryPath, value] of Object.entries(entries)) {
+    if (entryPath.toLowerCase().endsWith('.mogg')) return value
+  }
+  return null
+}
+
 async function extractConNotesMidi(conPath: string): Promise<
   Array<{
     midi: Buffer
@@ -393,6 +411,17 @@ async function extractConNotesMidi(conPath: string): Promise<
   return songs.flatMap((song) => {
     const midi = findConMidi(entries, song.shortname, isSingleSongPack)
     if (!midi) return []
+    const mogg = findConMogg(entries, song.shortname, isSingleSongPack)
+    let audio: Partial<Record<CatalogAudioRole, CatalogAudioInput>> = {}
+    if (mogg) {
+      try {
+        const ogg = decryptMoggBuffer(mogg)
+        const input = catalogAudioInput('song.ogg', ogg)
+        if (input) audio = { [input[0]]: input[1] }
+      } catch {
+        // A catalog can contain a valid chart without an audio mix.
+      }
+    }
     return [
       {
         midi,
@@ -404,7 +433,7 @@ async function extractConNotesMidi(conPath: string): Promise<
           year: song.year,
           charter: 'C3'
         }),
-        audio: {}
+        audio
       }
     ]
   })
