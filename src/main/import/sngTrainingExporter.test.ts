@@ -4,7 +4,11 @@ import { join } from 'path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { packRb3con } from '../conPacker'
 import { packSng } from '../sngPacker'
-import { exportSngTrainingMidi, listDatasetLibrarySongs } from './sngTrainingExporter'
+import {
+  buildSongSourceCatalog,
+  exportSngTrainingMidi,
+  listDatasetLibrarySongs
+} from './sngTrainingExporter'
 
 describe('exportSngTrainingMidi', () => {
   const testDir = join(__dirname, '../../../out/sng_training_exporter_test_temp')
@@ -223,5 +227,68 @@ describe('exportSngTrainingMidi', () => {
     expect(result.exported).toHaveLength(1)
     expect(result.exported[0]).toMatchObject({ source: 'rb3con', metadata: { name: 'CON Song' } })
     expect(await readFile(join(testDir, 'con-dataset', result.exported[0].midi))).toEqual(validMidi)
+  })
+
+  it('materializes a path-free atomically created source catalog for STRUM', async () => {
+    const songDir = join(testDir, 'catalog-library-song')
+    const parentDir = join(testDir, 'catalog-parent')
+    await mkdir(songDir, { recursive: true })
+    await mkdir(parentDir, { recursive: true })
+    await writeFile(join(songDir, 'notes.mid'), validMidi)
+    await writeFile(
+      join(songDir, 'song.ini'),
+      '[song]\nname = Catalog Song\nartist = Catalog Artist\ndataset_opt_in = true\n'
+    )
+
+    const result = await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: songDir }],
+      parentDir,
+      catalogName: 'strum-reviewed',
+      catalogId: 'strum-reviewed',
+      provenance: 'Reviewed local collection',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+
+    expect(result).toMatchObject({ recordCount: 1, reviewRequiredCount: 0, skipped: [] })
+    const catalogPath = join(parentDir, 'strum-reviewed')
+    const catalog = await readFile(join(catalogPath, 'catalog.json'), 'utf8')
+    const records = await readFile(join(catalogPath, 'records.jsonl'), 'utf8')
+    expect(catalog).toContain('octave-song-source-catalog/v1')
+    expect(catalog).not.toContain(songDir)
+    expect(records).not.toContain(songDir)
+    expect(records).toContain('"training_use":"allowed"')
+    const record = JSON.parse(records) as { chart: { notes_midi: { relative_path: string } } }
+    expect(await readFile(join(catalogPath, record.chart.notes_midi.relative_path))).toEqual(
+      validMidi
+    )
+    expect(existsSync(join(parentDir, '.strum-reviewed.staging'))).toBe(false)
+  })
+
+  it('keeps unreviewed STRUM output in the catalog with review_required rights', async () => {
+    const songDir = join(testDir, 'catalog-strum-song')
+    const parentDir = join(testDir, 'catalog-strum-parent')
+    await mkdir(songDir, { recursive: true })
+    await mkdir(parentDir, { recursive: true })
+    await writeFile(join(songDir, 'notes.mid'), validMidi)
+    await writeFile(
+      join(songDir, 'song.ini'),
+      '[song]\nname = Generated\nartist = STRUM\nstrum_generated = true\ndataset_opt_in = false\n'
+    )
+
+    const result = await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: songDir }],
+      parentDir,
+      catalogName: 'strum-review-required',
+      catalogId: 'strum-review-required',
+      provenance: 'Reviewed local collection',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+
+    expect(result).toMatchObject({ recordCount: 1, reviewRequiredCount: 1 })
+    expect(
+      await readFile(join(parentDir, 'strum-review-required', 'records.jsonl'), 'utf8')
+    ).toContain('"training_use":"review_required"')
   })
 })

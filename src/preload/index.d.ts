@@ -22,30 +22,50 @@ interface ChartEditorAPI {
   openOutputFolderDialog: () => Promise<string | null>
   showItemInFolder: (filePath: string) => Promise<boolean>
   getDefaultAutoChartOutputDir: () => Promise<string>
-  chooseDatasetPackageFolder: () => Promise<Array<{ path: string; name: string }>>
-  chooseDatasetOutputFolder: () => Promise<string | null>
-  scanDatasetLibrary: () => Promise<
+  chooseDatasetPackageFolder: () => Promise<
     Array<{
-      path: string
-      name: string
-      artist: string
-      charter?: string
-      datasetOptIn: boolean
-      isStrumGenerated: boolean
-      hasNotesMidi: boolean
+      candidateId: string
+      kind: 'octave-library' | 'sng' | 'rb3con'
+      songCount: number
+      metadata: Record<string, string>
+      midiValid: boolean
+      instruments: Record<
+        string,
+        { status: 'present' | 'absent'; difficulties: string[]; trackNames: string[] }
+      >
+      trainingUse: 'allowed' | 'review_required'
+      warnings: Array<{ code: string }>
     }>
   >
-  setDatasetSongOptIn: (songPath: string, optedIn: boolean) => Promise<boolean>
-  exportTrainingDataset: (options: {
-    packagePaths: string[]
-    librarySongPaths: string[]
-    outputDir: string
-    datasetId: string
+  chooseDatasetCatalogParent: () => Promise<{ parentId: string; name: string } | null>
+  scanDatasetLibrary: () => Promise<
+    Array<{
+      candidateId: string
+      kind: 'octave-library' | 'sng' | 'rb3con'
+      songCount: number
+      metadata: Record<string, string>
+      midiValid: boolean
+      instruments: Record<
+        string,
+        { status: 'present' | 'absent'; difficulties: string[]; trackNames: string[] }
+      >
+      trainingUse: 'allowed' | 'review_required'
+      warnings: Array<{ code: string }>
+      isStrumGenerated: boolean
+    }>
+  >
+  setDatasetSongOptIn: (candidateId: string, optedIn: boolean) => Promise<boolean>
+  buildSongSourceCatalog: (options: {
+    candidateIds: string[]
+    parentId: string
+    catalogName: string
+    catalogId: string
     provenance: string
     license: string
   }) => Promise<{
-    manifestPath: string
-    exported: Array<{ songId: string }>
+    catalogPath: string
+    recordCount: number
+    reviewRequiredCount: number
     skipped: Array<{ reason: string }>
   }>
   openLyricsFileDialog: () => Promise<{ filePath: string; content: string } | null>
