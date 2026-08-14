@@ -358,6 +358,9 @@ export function TrainingModal({
       setCatalogParent(selected)
       setSelectedCatalog(null)
       setSaveMode('create')
+      setExistingCatalogs([])
+      setResult(null)
+      setSaveProgress(null)
     }
   }
 
@@ -420,22 +423,25 @@ export function TrainingModal({
         mode: saveMode,
         sourceCatalogName: selectedCatalog?.catalogName
       })
-      setResult({
-        records: response.recordCount,
-        skipped: response.skipped.length
-      })
       const refreshedCatalogs = await window.api.listDatasetCatalogs(catalogParent.parentId)
       setExistingCatalogs(refreshedCatalogs)
       const savedCatalog = refreshedCatalogs.find(
         (catalog) => catalog.catalogName === catalogName.trim()
       )
-      if (savedCatalog) {
-        setSelectedCatalog(savedCatalog)
-        setSaveMode('update')
+      if (!savedCatalog) {
+        throw new Error('Catalog build completed without publishing the requested catalog.')
       }
+      setResult({
+        records: response.recordCount,
+        skipped: response.skipped.length
+      })
+      setSelectedCatalog(savedCatalog)
+      setSaveMode('update')
       setActiveStep('prepare')
     } catch {
-      setError('Catalog build failed. Check the catalog name and choose a new destination.')
+      setError(
+        'Catalog was not published. It may have been interrupted; restart OCTAVE and retry with a new catalog name.'
+      )
     } finally {
       setExporting(false)
       setSaveProgress(null)
