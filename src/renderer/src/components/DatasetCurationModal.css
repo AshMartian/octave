@@ -40,11 +40,13 @@
 }
 .dataset-curation-modal .training-steps button {
   display: grid;
-  place-items: center;
+  grid-template-rows: 42px 16px;
+  align-content: start;
+  justify-items: center;
   gap: 7px;
   width: 92px;
   min-height: 88px;
-  padding: 10px 8px;
+  padding: 12px 8px 10px;
   color: var(--text-secondary);
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
@@ -101,7 +103,7 @@
 .training-step-connector {
   height: 3px;
   width: 100%;
-  margin-top: 32px;
+  margin-top: 31.5px;
   background: color-mix(in srgb, var(--text-secondary) 26%, transparent);
   border-radius: 999px;
 }
@@ -443,7 +445,7 @@
     padding-inline: 4px;
   }
   .training-step-connector {
-    margin-top: 32px;
+    margin-top: 31.5px;
   }
   .dataset-details,
   .dataset-editor-fields {
