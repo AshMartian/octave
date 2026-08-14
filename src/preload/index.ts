@@ -54,6 +54,26 @@ const api = {
   chooseDatasetCatalogParent: (): Promise<{ parentId: string; name: string } | null> =>
     ipcRenderer.invoke('dataset:chooseCatalogParent'),
 
+  useDefaultDatasetCatalogParent: (): Promise<{ parentId: string; name: string } | null> =>
+    ipcRenderer.invoke('dataset:useDefaultCatalogParent'),
+
+  restoreDatasetCatalogParent: (
+    parentId: string
+  ): Promise<{ parentId: string; name: string } | null> =>
+    ipcRenderer.invoke('dataset:restoreCatalogParent', parentId),
+
+  listDatasetCatalogs: (
+    parentId: string
+  ): Promise<
+    Array<{
+      catalogName: string
+      catalogId: string
+      recordCount: number
+      libraryRecordCount: number
+      externalRecordCount: number
+    }>
+  > => ipcRenderer.invoke('dataset:listCatalogs', parentId),
+
   scanDatasetLibrary: (): Promise<
     Array<{
       candidateId: string
@@ -77,6 +97,9 @@ const api = {
   setDatasetPackageApproved: (candidateId: string, approved: boolean): Promise<boolean> =>
     ipcRenderer.invoke('dataset:setPackageApproved', candidateId, approved),
 
+  readDatasetCandidateArtwork: (candidateId: string): Promise<string | null> =>
+    ipcRenderer.invoke('dataset:readCandidateArtwork', candidateId),
+
   buildSongSourceCatalog: (options: {
     candidateIds: string[]
     parentId: string
@@ -84,6 +107,8 @@ const api = {
     catalogId: string
     provenance: string
     license: string
+    mode: 'create' | 'update' | 'clone'
+    sourceCatalogName?: string
   }): Promise<{
     recordCount: number
     reviewRequiredCount: number

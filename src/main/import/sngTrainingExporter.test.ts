@@ -9,6 +9,7 @@ import {
   buildSongSourceCatalog,
   exportSngTrainingMidi,
   listDatasetLibrarySongs,
+  listSongSourceCatalogs,
   summarizeDatasetSource
 } from './sngTrainingExporter'
 
@@ -253,6 +254,7 @@ describe('exportSngTrainingMidi', () => {
     await mkdir(songDir, { recursive: true })
     await mkdir(parentDir, { recursive: true })
     await writeFile(join(songDir, 'notes.mid'), validMidi)
+    await writeFile(join(songDir, 'song.ogg'), Buffer.from('OggS catalog audio'))
     await writeFile(
       join(songDir, 'song.ini'),
       '[song]\nname = Catalog Song\nartist = Catalog Artist\ndataset_opt_in = true\n'
@@ -276,10 +278,17 @@ describe('exportSngTrainingMidi', () => {
     expect(catalog).not.toContain(songDir)
     expect(records).not.toContain(songDir)
     expect(records).toContain('"training_use":"allowed"')
-    const record = JSON.parse(records) as { chart: { notes_midi: { relative_path: string } } }
+    const record = JSON.parse(records) as {
+      chart: { notes_midi: { relative_path: string } }
+      audio: { mix: { relative_path: string; media_type: string } }
+    }
     expect(await readFile(join(catalogPath, record.chart.notes_midi.relative_path))).toEqual(
       validMidi
     )
+    expect(await readFile(join(catalogPath, record.audio.mix.relative_path), 'utf8')).toBe(
+      'OggS catalog audio'
+    )
+    expect(record.audio.mix.media_type).toBe('audio/ogg')
     expect(existsSync(join(parentDir, '.strum-reviewed.staging'))).toBe(false)
   })
 
@@ -439,5 +448,55 @@ describe('exportSngTrainingMidi', () => {
       })
     ).rejects.toThrow('already exists')
     expect(await readdir(destination)).toEqual([])
+  })
+
+  it('updates a selected catalog in place and clones it as a revision', async () => {
+    const parentDir = join(testDir, 'catalog-editor-parent')
+    const firstSong = join(testDir, 'catalog-editor-first')
+    const secondSong = join(testDir, 'catalog-editor-second')
+    await mkdir(parentDir, { recursive: true })
+    await mkdir(firstSong, { recursive: true })
+    await mkdir(secondSong, { recursive: true })
+    await writeFile(join(firstSong, 'notes.mid'), validMidi)
+    await writeFile(join(secondSong, 'notes.mid'), guitarMidi())
+    await writeFile(join(firstSong, 'song.ini'), '[song]\nname = First\ndataset_opt_in = true\n')
+    await writeFile(join(secondSong, 'song.ini'), '[song]\nname = Second\ndataset_opt_in = true\n')
+
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: firstSong }],
+      parentDir,
+      catalogName: 'editable-catalog',
+      catalogId: 'editable-catalog',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    const updated = await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: secondSong }],
+      parentDir,
+      catalogName: 'editable-catalog',
+      catalogId: 'ignored-when-updating',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test',
+      mode: 'update'
+    })
+    expect(updated).toMatchObject({ recordCount: 2 })
+    expect(await listSongSourceCatalogs(parentDir)).toEqual([
+      expect.objectContaining({ catalogName: 'editable-catalog', recordCount: 2 })
+    ])
+
+    const clone = await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: secondSong }],
+      parentDir,
+      catalogName: 'editable-catalog-revision',
+      catalogId: 'editable-catalog-revision',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test',
+      mode: 'clone',
+      sourceCatalogName: 'editable-catalog'
+    })
+    expect(clone).toMatchObject({ recordCount: 2 })
   })
 })

@@ -16,10 +16,50 @@ type SourceCandidate = {
   isStrumGenerated?: boolean
 }
 
+type CatalogSaveMode = 'create' | 'update' | 'clone'
+
+type ExistingCatalog = {
+  catalogName: string
+  catalogId: string
+  recordCount: number
+  libraryRecordCount: number
+  externalRecordCount: number
+}
+
+const CATALOG_PARENT_STORAGE_KEY = 'octave.datasetCatalogParent'
+
 function candidateLabel(candidate: SourceCandidate): string {
   const artist = candidate.metadata.artist
   const name = candidate.metadata.name
   return artist && name ? `${artist} — ${name}` : `${candidate.kind} source`
+}
+
+function DatasetArtwork({
+  candidateId,
+  label
+}: {
+  candidateId: string
+  label: string
+}): React.JSX.Element {
+  const [artwork, setArtwork] = useState<string | null>(null)
+
+  useEffect(() => {
+    let current = true
+    void window.api.readDatasetCandidateArtwork(candidateId).then((dataUrl) => {
+      if (current) setArtwork(dataUrl)
+    })
+    return () => {
+      current = false
+    }
+  }, [candidateId])
+
+  return artwork ? (
+    <img className="dataset-artwork" src={artwork} alt={`${label} artwork`} />
+  ) : (
+    <span className="dataset-artwork dataset-artwork-placeholder" aria-hidden="true">
+      ♪
+    </span>
+  )
 }
 
 export function DatasetCurationModal({
@@ -35,6 +75,9 @@ export function DatasetCurationModal({
   const [catalogParent, setCatalogParent] = useState<{ parentId: string; name: string } | null>(
     null
   )
+  const [existingCatalogs, setExistingCatalogs] = useState<ExistingCatalog[]>([])
+  const [selectedCatalog, setSelectedCatalog] = useState<ExistingCatalog | null>(null)
+  const [saveMode, setSaveMode] = useState<CatalogSaveMode>('create')
   const [catalogName, setCatalogName] = useState('octave-curated-catalog')
   const [catalogId, setCatalogId] = useState('octave-curated-dataset')
   const [provenance, setProvenance] = useState('Curated in Octave')
@@ -64,10 +107,38 @@ export function DatasetCurationModal({
     if (isOpen) void refreshLibrary()
   }, [isOpen, refreshLibrary])
 
+  useEffect(() => {
+    if (!isOpen || catalogParent) return
+    const storedParentId = localStorage.getItem(CATALOG_PARENT_STORAGE_KEY)
+    const restore = storedParentId
+      ? window.api.restoreDatasetCatalogParent(storedParentId)
+      : window.api.useDefaultDatasetCatalogParent()
+    void restore.then((parent) => {
+      if (parent) {
+        setCatalogParent(parent)
+        return
+      }
+      void window.api.useDefaultDatasetCatalogParent().then((defaultParent) => {
+        if (defaultParent) setCatalogParent(defaultParent)
+      })
+    })
+  }, [catalogParent, isOpen])
+
+  useEffect(() => {
+    if (!catalogParent) return
+    localStorage.setItem(CATALOG_PARENT_STORAGE_KEY, catalogParent.parentId)
+    void window.api.listDatasetCatalogs(catalogParent.parentId).then(setExistingCatalogs)
+  }, [catalogParent])
+
   const allowedLibrarySongs = useMemo(
     () => songs.filter((song) => song.trainingUse === 'allowed' && song.midiValid),
     [songs]
   )
+
+  const selectableLibrarySongs = useMemo(() => songs.filter((song) => song.midiValid), [songs])
+  const allLibrarySongsSelected =
+    selectableLibrarySongs.length > 0 &&
+    selectableLibrarySongs.every((song) => song.trainingUse === 'allowed')
 
   if (!isOpen) return null
 
@@ -90,6 +161,41 @@ export function DatasetCurationModal({
         )
       )
       setError('Could not save that song’s dataset consent setting.')
+    }
+  }
+
+  const toggleAllLibrarySongs = async (): Promise<void> => {
+    const optedIn = !allLibrarySongsSelected
+    const previousTrainingUse = new Map(
+      selectableLibrarySongs.map((song) => [song.candidateId, song.trainingUse])
+    )
+    setError(null)
+    setSongs((current) =>
+      current.map((song) =>
+        song.midiValid ? { ...song, trainingUse: optedIn ? 'allowed' : 'review_required' } : song
+      )
+    )
+    const results = await Promise.all(
+      selectableLibrarySongs.map(async (song) => [
+        song.candidateId,
+        await window.api.setDatasetSongOptIn(song.candidateId, optedIn)
+      ])
+    )
+    const failedIds = new Set(
+      results.filter(([, succeeded]) => !succeeded).map(([candidateId]) => candidateId)
+    )
+    if (failedIds.size) {
+      setSongs((current) =>
+        current.map((song) =>
+          failedIds.has(song.candidateId)
+            ? {
+                ...song,
+                trainingUse: previousTrainingUse.get(song.candidateId) ?? song.trainingUse
+              }
+            : song
+        )
+      )
+      setError('Could not save consent for every selected song.')
     }
   }
 
@@ -119,7 +225,30 @@ export function DatasetCurationModal({
 
   const chooseCatalogParent = async (): Promise<void> => {
     const selected = await window.api.chooseDatasetCatalogParent()
-    if (selected) setCatalogParent(selected)
+    if (selected) {
+      setCatalogParent(selected)
+      setSelectedCatalog(null)
+      setSaveMode('create')
+    }
+  }
+
+  const chooseExistingCatalog = (catalog: ExistingCatalog): void => {
+    setSelectedCatalog(catalog)
+    setSaveMode('update')
+    setCatalogName(catalog.catalogName)
+    setCatalogId(catalog.catalogId)
+  }
+
+  const startNewCatalog = (): void => {
+    setSelectedCatalog(null)
+    setSaveMode('create')
+  }
+
+  const cloneCatalogRevision = (): void => {
+    if (!selectedCatalog) return
+    setSaveMode('clone')
+    setCatalogName(`${selectedCatalog.catalogName}-revision`)
+    setCatalogId(`${selectedCatalog.catalogId}-revision`)
   }
 
   const buildCatalog = async (): Promise<void> => {
@@ -133,6 +262,10 @@ export function DatasetCurationModal({
       setError(
         'Catalog ID, catalog name, provenance, license, and a parent directory are required.'
       )
+      return
+    }
+    if ((saveMode === 'update' || saveMode === 'clone') && !selectedCatalog) {
+      setError('Select an existing catalog to update or clone.')
       return
     }
     setExporting(true)
@@ -152,7 +285,9 @@ export function DatasetCurationModal({
         catalogName: catalogName.trim(),
         catalogId: catalogId.trim(),
         provenance: provenance.trim(),
-        license: license.trim()
+        license: license.trim(),
+        mode: saveMode,
+        sourceCatalogName: selectedCatalog?.catalogName
       })
       setResult({
         records: response.recordCount,
@@ -184,6 +319,9 @@ export function DatasetCurationModal({
           }
         }}
       />
+      {!selectable && (
+        <DatasetArtwork candidateId={candidate.candidateId} label={candidateLabel(candidate)} />
+      )}
       <span>
         <strong>{candidateLabel(candidate)}</strong>
         <small>
@@ -233,6 +371,87 @@ export function DatasetCurationModal({
               skipped {result.skipped}.
             </p>
           )}
+          <section className="dataset-section dataset-details">
+            <h3>Catalog editor</h3>
+            <label>
+              Catalog parent
+              <div className="dataset-output">
+                <input
+                  value={catalogParent?.name ?? ''}
+                  readOnly
+                  placeholder="Preparing Catalog Parent"
+                />
+                <button onClick={() => void chooseCatalogParent()} disabled={exporting}>
+                  Choose
+                </button>
+              </div>
+            </label>
+            <div className="dataset-catalog-picker">
+              <div className="dataset-section-actions">
+                <button onClick={startNewCatalog} disabled={exporting}>
+                  New catalog
+                </button>
+                {selectedCatalog && (
+                  <button onClick={cloneCatalogRevision} disabled={exporting}>
+                    Clone as revision
+                  </button>
+                )}
+              </div>
+              {existingCatalogs.map((catalog) => (
+                <button
+                  className={selectedCatalog?.catalogName === catalog.catalogName ? 'selected' : ''}
+                  key={catalog.catalogName}
+                  onClick={() => chooseExistingCatalog(catalog)}
+                  disabled={exporting}
+                >
+                  <strong>{catalog.catalogName}</strong>
+                  <small>
+                    {catalog.recordCount} records · {catalog.libraryRecordCount} library ·{' '}
+                    {catalog.externalRecordCount} external
+                  </small>
+                </button>
+              ))}
+            </div>
+            {saveMode === 'update' && selectedCatalog?.externalRecordCount ? (
+              <p className="dataset-message warning">
+                This catalog contains {selectedCatalog.externalRecordCount} package-backed records.
+                Updates retain them; removing them requires a separate confirmed action.
+              </p>
+            ) : null}
+            <label>
+              Catalog ID
+              <input
+                value={catalogId}
+                onChange={(event) => setCatalogId(event.target.value)}
+                disabled={exporting || saveMode === 'update'}
+              />
+            </label>
+            <label>
+              Catalog name
+              <input
+                value={catalogName}
+                onChange={(event) => setCatalogName(event.target.value)}
+                disabled={exporting || saveMode === 'update'}
+              />
+            </label>
+            <label>
+              Provenance
+              <input
+                value={provenance}
+                onChange={(event) => setProvenance(event.target.value)}
+                disabled={exporting}
+              />
+            </label>
+            <label>
+              License / permission basis
+              <input
+                placeholder="e.g. CC BY 4.0 or internal consent record"
+                value={license}
+                onChange={(event) => setLicense(event.target.value)}
+                disabled={exporting}
+              />
+            </label>
+          </section>
           <section className="dataset-section">
             <div className="dataset-section-heading">
               <div>
@@ -242,9 +461,17 @@ export function DatasetCurationModal({
                   song stores explicit consent in <code>song.ini</code>.
                 </p>
               </div>
-              <button onClick={() => void refreshLibrary()} disabled={loading || exporting}>
-                Refresh
-              </button>
+              <div className="dataset-section-actions">
+                <button
+                  onClick={() => void toggleAllLibrarySongs()}
+                  disabled={loading || exporting || selectableLibrarySongs.length === 0}
+                >
+                  {allLibrarySongsSelected ? 'Clear all' : 'Select all'}
+                </button>
+                <button onClick={() => void refreshLibrary()} disabled={loading || exporting}>
+                  Refresh
+                </button>
+              </div>
             </div>
             <div className="dataset-song-list">
               {songs.map((song) => renderCandidate(song, false))}
@@ -271,55 +498,6 @@ export function DatasetCurationModal({
               {packages.map((entry) => renderCandidate(entry, true))}
             </div>
           </section>
-          <section className="dataset-section dataset-details">
-            <h3>New source catalog</h3>
-            <label>
-              Catalog ID
-              <input
-                value={catalogId}
-                onChange={(event) => setCatalogId(event.target.value)}
-                disabled={exporting}
-              />
-            </label>
-            <label>
-              Catalog name
-              <input
-                value={catalogName}
-                onChange={(event) => setCatalogName(event.target.value)}
-                disabled={exporting}
-              />
-            </label>
-            <label>
-              Provenance
-              <input
-                value={provenance}
-                onChange={(event) => setProvenance(event.target.value)}
-                disabled={exporting}
-              />
-            </label>
-            <label>
-              License / permission basis
-              <input
-                placeholder="e.g. CC BY 4.0 or internal consent record"
-                value={license}
-                onChange={(event) => setLicense(event.target.value)}
-                disabled={exporting}
-              />
-            </label>
-            <label>
-              Catalog parent
-              <div className="dataset-output">
-                <input
-                  value={catalogParent?.name ?? ''}
-                  readOnly
-                  placeholder="Choose a parent directory"
-                />
-                <button onClick={() => void chooseCatalogParent()} disabled={exporting}>
-                  Choose
-                </button>
-              </div>
-            </label>
-          </section>
         </main>
         <footer>
           <span>
@@ -331,7 +509,13 @@ export function DatasetCurationModal({
             onClick={() => void buildCatalog()}
             disabled={exporting}
           >
-            {exporting ? 'Building…' : 'Build source catalog'}
+            {exporting
+              ? 'Saving…'
+              : saveMode === 'update'
+                ? 'Update catalog'
+                : saveMode === 'clone'
+                  ? 'Clone catalog revision'
+                  : 'Build source catalog'}
           </button>
         </footer>
       </section>
