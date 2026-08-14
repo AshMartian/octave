@@ -5,6 +5,7 @@ import { createReadStream, existsSync } from 'fs'
 import { mkdir, readFile, stat, unlink, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { resolvePythonCommand } from './runner'
+import { sanitizeTrainingSchemaValues } from './trainingSchema'
 import type { AutoChartRunOptions, AutoChartRunResult } from './types'
 
 const PROTOCOL_MAJOR = 1
@@ -468,6 +469,13 @@ export async function listTrainingPipelines(): Promise<TrainingPipeline[]> {
       typeof (pipeline as Record<string, unknown>).id === 'string'
     )
   )
+}
+
+async function resolveTrainingPipeline(pipelineId: string): Promise<TrainingPipeline> {
+  const pipeline = (await listTrainingPipelines()).find((candidate) => candidate.id === pipelineId)
+  if (!pipeline)
+    throw new Error('That training pipeline is not available in the selected STRUM runtime.')
+  return pipeline
 }
 
 export async function inspectTrainingCatalog(
@@ -1015,8 +1023,10 @@ export async function startTrainingPrepare(options: {
   catalogId: string
   catalogName: string
   pipelineId: string
-  splitSeed?: number
+  prepare: Record<string, unknown>
 }): Promise<{ jobId: string; taskViewId: string }> {
+  const pipeline = await resolveTrainingPipeline(options.pipelineId)
+  const prepare = sanitizeTrainingSchemaValues(pipeline.prepare_schema, options.prepare, 'prepare')
   const jobId = randomUUID()
   const taskViewId = `task-${randomUUID()}`
   const taskRoot = join(trainingRoot(), 'tasks', taskViewId)
@@ -1030,7 +1040,7 @@ export async function startTrainingPrepare(options: {
       catalog_root: options.catalogRoot,
       task_root: taskRoot,
       pipeline_id: options.pipelineId,
-      prepare: { split_seed: options.splitSeed ?? 20260814 }
+      prepare
     },
     async (result) => {
       const registry = await readRegistry()
@@ -1056,7 +1066,7 @@ export async function startTrainingPrepare(options: {
 export async function startTrainingRun(options: {
   taskViewId: string
   pipelineId: string
-  train: { epochs: number; batchSize: number; device: string; seed: number }
+  train: Record<string, unknown>
 }): Promise<{ jobId: string; runId: string }> {
   const registry = await readRegistry()
   const task = registry.tasks.find(
@@ -1070,6 +1080,8 @@ export async function startTrainingRun(options: {
   if (task.pipelineId !== options.pipelineId) {
     throw new Error('The selected task view belongs to a different training pipeline.')
   }
+  const pipeline = await resolveTrainingPipeline(options.pipelineId)
+  const train = sanitizeTrainingSchemaValues(pipeline.train_schema, options.train, 'train')
   const jobId = randomUUID()
   const runId = `run-${randomUUID()}`
   const outputRoot = join(trainingRoot(), 'runs', runId)
@@ -1084,12 +1096,7 @@ export async function startTrainingRun(options: {
       catalog_root: task.catalogRoot,
       output_root: outputRoot,
       pipeline_id: options.pipelineId,
-      train: {
-        epochs: options.train.epochs,
-        batch_size: options.train.batchSize,
-        device: options.train.device,
-        seed: options.train.seed
-      }
+      train
     },
     async (result) => {
       const current = await readRegistry()

@@ -226,12 +226,12 @@ interface ChartEditorAPI {
     catalogId: string
     catalogName: string
     pipelineId: string
-    splitSeed?: number
+    prepare: Record<string, unknown>
   }) => Promise<{ jobId: string; taskViewId: string }>
   startTrainingRun: (options: {
     taskViewId: string
     pipelineId: string
-    train: { epochs: number; batchSize: number; device: string; seed: number }
+    train: Record<string, unknown>
   }) => Promise<{ jobId: string; runId: string }>
   cancelTrainingJob: (jobId: string) => Promise<boolean>
   onTrainingProgress: (
