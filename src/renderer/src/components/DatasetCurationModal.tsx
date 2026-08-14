@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type Dispatch,
+  type SetStateAction
+} from 'react'
 import './DatasetCurationModal.css'
 
 type SourceCandidate = {
@@ -72,6 +79,17 @@ type TrainingPipeline = {
   train_schema: Record<string, unknown>
   checkpoint_outputs: string[]
   inference_capability: string | null
+}
+
+type TrainingControlValue = string | number | boolean
+
+type TrainingSchemaControl = {
+  key: string
+  type: 'integer' | 'number' | 'boolean' | 'string'
+  enumValues: TrainingControlValue[]
+  defaultValue: TrainingControlValue | undefined
+  minimum: number | undefined
+  maximum: number | undefined
 }
 
 type TrainingTask = {
@@ -183,6 +201,143 @@ function candidateLabel(candidate: SourceCandidate): string {
   const artist = candidate.metadata.artist
   const name = candidate.metadata.name
   return artist && name ? `${artist} — ${name}` : `${candidate.kind} source`
+}
+
+function trainingSchemaControls(schema: Record<string, unknown>): TrainingSchemaControl[] {
+  const properties = schema.properties
+  if (!properties || typeof properties !== 'object' || Array.isArray(properties)) return []
+  return Object.entries(properties).flatMap(([key, property]) => {
+    if (!property || typeof property !== 'object' || Array.isArray(property)) return []
+    const definition = property as Record<string, unknown>
+    const type = definition.type
+    if (!['integer', 'number', 'boolean', 'string'].includes(String(type))) return []
+    const defaultValue = definition.default
+    const validDefault =
+      typeof defaultValue === 'string' ||
+      typeof defaultValue === 'number' ||
+      typeof defaultValue === 'boolean'
+        ? defaultValue
+        : undefined
+    return [
+      {
+        key,
+        type: type as TrainingSchemaControl['type'],
+        enumValues: Array.isArray(definition.enum)
+          ? definition.enum.filter(
+              (value): value is TrainingControlValue =>
+                typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'
+            )
+          : [],
+        defaultValue: validDefault,
+        minimum: typeof definition.minimum === 'number' ? definition.minimum : undefined,
+        maximum: typeof definition.maximum === 'number' ? definition.maximum : undefined
+      }
+    ]
+  })
+}
+
+function schemaControlLabel(key: string): string {
+  return key
+    .split('_')
+    .map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`)
+    .join(' ')
+}
+
+function schemaConfig(
+  controls: TrainingSchemaControl[],
+  values: Record<string, TrainingControlValue>
+): Record<string, TrainingControlValue> {
+  return Object.fromEntries(
+    controls.flatMap((control) => {
+      const value = values[control.key] ?? control.defaultValue
+      return value === undefined ? [] : [[control.key, value]]
+    })
+  )
+}
+
+function TrainingSchemaControls({
+  controls,
+  values,
+  setValues
+}: {
+  controls: TrainingSchemaControl[]
+  values: Record<string, TrainingControlValue>
+  setValues: Dispatch<SetStateAction<Record<string, TrainingControlValue>>>
+}): React.JSX.Element | null {
+  if (controls.length === 0) return null
+  return (
+    <div className="training-config-grid">
+      {controls.map((control) => {
+        const value = values[control.key] ?? control.defaultValue
+        const setValue = (next: TrainingControlValue): void => {
+          setValues((current) => ({ ...current, [control.key]: next }))
+        }
+        if (control.type === 'boolean') {
+          return (
+            <label className="training-toggle-control" key={control.key}>
+              <input
+                checked={Boolean(value)}
+                type="checkbox"
+                onChange={(event) => setValue(event.target.checked)}
+              />
+              <span>{schemaControlLabel(control.key)}</span>
+            </label>
+          )
+        }
+        if (control.enumValues.length > 0) {
+          return (
+            <label key={control.key}>
+              {schemaControlLabel(control.key)}
+              <select
+                value={String(value ?? '')}
+                onChange={(event) => {
+                  const selected = control.enumValues.find(
+                    (candidate) => String(candidate) === event.target.value
+                  )
+                  if (selected !== undefined) setValue(selected)
+                }}
+              >
+                {control.enumValues.map((option) => (
+                  <option key={String(option)} value={String(option)}>
+                    {String(option)}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )
+        }
+        if (control.type === 'integer' || control.type === 'number') {
+          return (
+            <label key={control.key}>
+              {schemaControlLabel(control.key)}
+              <input
+                max={control.maximum}
+                min={control.minimum}
+                step={control.type === 'integer' ? 1 : 'any'}
+                type="number"
+                value={typeof value === 'number' ? value : ''}
+                onChange={(event) => {
+                  const next = Number(event.target.value)
+                  if (!Number.isFinite(next)) return
+                  setValue(control.type === 'integer' ? Math.trunc(next) : next)
+                }}
+              />
+            </label>
+          )
+        }
+        return (
+          <label key={control.key}>
+            {schemaControlLabel(control.key)}
+            <input
+              type="text"
+              value={typeof value === 'string' ? value : ''}
+              onChange={(event) => setValue(event.target.value)}
+            />
+          </label>
+        )
+      })}
+    </div>
+  )
 }
 
 function TrainingStepIcon({
@@ -336,12 +491,35 @@ export function TrainingModal({
   const [selectedCheckpoint, setSelectedCheckpoint] = useState<TrainingCheckpoint | null>(null)
   const [savingAutoChartProfile, setSavingAutoChartProfile] = useState(false)
   const [trainingJob, setTrainingJob] = useState<TrainingJob | null>(null)
-  const [trainConfig, setTrainConfig] = useState({
-    epochs: 20,
-    batchSize: 16,
-    device: 'auto',
-    seed: 20260814
-  })
+  const [prepareConfig, setPrepareConfig] = useState<Record<string, TrainingControlValue>>({})
+  const [trainConfig, setTrainConfig] = useState<Record<string, TrainingControlValue>>({})
+
+  const selectedPipeline = useMemo(
+    () => trainingPipelines.find((pipeline) => pipeline.id === selectedPipelineId) ?? null,
+    [selectedPipelineId, trainingPipelines]
+  )
+  const prepareControls = useMemo(
+    () => trainingSchemaControls(selectedPipeline?.prepare_schema ?? {}),
+    [selectedPipeline]
+  )
+  const trainControls = useMemo(
+    () => trainingSchemaControls(selectedPipeline?.train_schema ?? {}),
+    [selectedPipeline]
+  )
+  const resolvedPrepareConfig = useMemo(
+    () => schemaConfig(prepareControls, prepareConfig),
+    [prepareConfig, prepareControls]
+  )
+  const resolvedTrainConfig = useMemo(
+    () => schemaConfig(trainControls, trainConfig),
+    [trainConfig, trainControls]
+  )
+  const selectedPipelineTasks = useMemo(
+    () => trainingTasks.filter((task) => task.pipelineId === selectedPipelineId),
+    [selectedPipelineId, trainingTasks]
+  )
+  const selectedPipelineName = selectedPipeline?.display_name ?? 'STRUM'
+  const selectedInstrument = selectedPipeline?.catalog_requirements.instrument ?? 'training'
 
   const refreshLibrary = useCallback(async (): Promise<void> => {
     setLoading(true)
@@ -463,6 +641,14 @@ export function TrainingModal({
   useEffect(() => {
     if (isOpen) void refreshTrainingState()
   }, [isOpen, refreshTrainingState])
+
+  useEffect(() => {
+    setSelectedTaskViewId((current) =>
+      selectedPipelineTasks.some((task) => task.taskViewId === current)
+        ? current
+        : (selectedPipelineTasks[0]?.taskViewId ?? '')
+    )
+  }, [selectedPipelineTasks])
 
   useEffect(() => {
     const unsubscribe = window.api.onTrainingProgress((event) => {
@@ -839,7 +1025,7 @@ export function TrainingModal({
         catalogId: selectedCatalog.catalogId,
         catalogName: selectedCatalog.catalogName,
         pipelineId: selectedPipelineId,
-        splitSeed: trainConfig.seed
+        prepare: resolvedPrepareConfig
       })
       setTrainingJob({
         jobId: started.jobId,
@@ -861,7 +1047,7 @@ export function TrainingModal({
       const started = await window.api.startTrainingRun({
         taskViewId: selectedTaskViewId,
         pipelineId: selectedPipelineId,
-        train: trainConfig
+        train: resolvedTrainConfig
       })
       setTrainingJob({
         jobId: started.jobId,
@@ -879,6 +1065,19 @@ export function TrainingModal({
   const cancelActiveTrainingJob = async (): Promise<void> => {
     if (!trainingJob) return
     await window.api.cancelTrainingJob(trainingJob.jobId)
+  }
+
+  const trainingStepBlocker = (step: TrainingStep): string | null => {
+    if (step === 'prepare' && !selectedCatalog) {
+      return 'Create or select a catalog before preparing a dataset.'
+    }
+    if (step === 'train' && selectedPipelineTasks.length === 0) {
+      return 'Prepare a task view for the selected pipeline before training.'
+    }
+    if (step === 'deploy' && trainingRuns.length === 0) {
+      return 'Complete a training run before deployment can be evaluated.'
+    }
+    return null
   }
 
   const renderCandidate = (candidate: SourceCandidate, selectable: boolean): React.JSX.Element => (
@@ -938,14 +1137,7 @@ export function TrainingModal({
           <nav className="training-steps" aria-label="Training steps">
             {TRAINING_STEPS.map((step, index) => {
               const activeStepIndex = TRAINING_STEPS.indexOf(activeStep)
-              const blocker =
-                step === 'prepare' && !selectedCatalog
-                  ? 'Create or select a catalog before preparing a dataset.'
-                  : step === 'train' && !selectedCatalog
-                    ? 'Select a catalog before training.'
-                    : step === 'deploy' && !selectedCatalog
-                      ? 'Select a catalog before deployment.'
-                      : null
+              const blocker = trainingStepBlocker(step)
               return (
                 <span
                   key={step}
@@ -1350,13 +1542,18 @@ export function TrainingModal({
                       ))}
                     </select>
                   </label>
+                  <TrainingSchemaControls
+                    controls={prepareControls}
+                    setValues={setPrepareConfig}
+                    values={resolvedPrepareConfig}
+                  />
                   <div className="training-inspection-grid">
                     <div>
                       <span>Catalog</span>
                       <strong>{selectedCatalog.catalogName}</strong>
                     </div>
                     <div>
-                      <span>Eligible Guitar songs</span>
+                      <span>Eligible {selectedInstrument} songs</span>
                       <strong>{catalogInspection?.eligibleCount ?? 'Checking…'}</strong>
                     </div>
                     <div>
@@ -1365,7 +1562,12 @@ export function TrainingModal({
                     </div>
                     <div>
                       <span>Split</span>
-                      <strong>Song-disjoint · seed {trainConfig.seed}</strong>
+                      <strong>
+                        Song-disjoint
+                        {typeof resolvedPrepareConfig.split_seed === 'number'
+                          ? ` · seed ${resolvedPrepareConfig.split_seed}`
+                          : ''}
+                      </strong>
                     </div>
                   </div>
                   {catalogInspection &&
@@ -1375,8 +1577,8 @@ export function TrainingModal({
                           (sum, count) => sum + count,
                           0
                         )}{' '}
-                        records are excluded because they are missing Guitar Expert labels, approved
-                        audio, or a verified asset.
+                        records are excluded because they are missing the pipeline’s required
+                        labels, approved audio, or a verified asset.
                       </p>
                     )}
                   <button
@@ -1390,7 +1592,7 @@ export function TrainingModal({
                       )
                     }
                   >
-                    Prepare Guitar Dataset <span aria-hidden="true">→</span>
+                    Prepare {selectedPipelineName} Dataset <span aria-hidden="true">→</span>
                   </button>
                 </>
               )}
@@ -1405,7 +1607,7 @@ export function TrainingModal({
                     >
                       <span>
                         <strong>{task.catalogName}</strong>
-                        <small>{task.eligibleCount} Guitar records · immutable task view</small>
+                        <small>{task.eligibleCount} records · immutable task view</small>
                       </span>
                       <span aria-hidden="true">
                         {selectedTaskViewId === task.taskViewId ? '✓' : '○'}
@@ -1419,11 +1621,10 @@ export function TrainingModal({
             <section className="training-step-panel">
               <div className="training-panel-heading">
                 <div>
-                  <h3>Train Guitar locally</h3>
+                  <h3>Train {selectedPipelineName} locally</h3>
                   <p>
-                    A fresh two-stage run trains onset and fret components from the selected task
-                    view. Metrics, task identity, configuration, and checkpoint hashes are recorded
-                    locally.
+                    STRUM trains the selected immutable task view. Metrics, task identity,
+                    configuration, and checkpoint hashes are recorded locally.
                   </p>
                 </div>
                 {trainingJob &&
@@ -1436,9 +1637,9 @@ export function TrainingModal({
                     </button>
                   )}
               </div>
-              {trainingTasks.length === 0 ? (
+              {selectedPipelineTasks.length === 0 ? (
                 <p className="dataset-message warning">
-                  Prepare a Guitar task view before starting training.
+                  Prepare a {selectedPipelineName} task view before starting training.
                 </p>
               ) : (
                 <>
@@ -1448,75 +1649,21 @@ export function TrainingModal({
                       value={selectedTaskViewId}
                       onChange={(event) => setSelectedTaskViewId(event.target.value)}
                     >
-                      {trainingTasks.map((task) => (
+                      {selectedPipelineTasks.map((task) => (
                         <option key={task.taskViewId} value={task.taskViewId}>
-                          {task.catalogName} · {task.eligibleCount} Guitar songs
+                          {task.catalogName} · {task.eligibleCount} records
                         </option>
                       ))}
                     </select>
                   </label>
-                  <div className="training-config-grid">
-                    <label>
-                      Epochs
-                      <input
-                        type="number"
-                        min="1"
-                        max="500"
-                        value={trainConfig.epochs}
-                        onChange={(event) =>
-                          setTrainConfig((current) => ({
-                            ...current,
-                            epochs: Number(event.target.value) || 1
-                          }))
-                        }
-                      />
-                    </label>
-                    <label>
-                      Batch size
-                      <input
-                        type="number"
-                        min="1"
-                        max="256"
-                        value={trainConfig.batchSize}
-                        onChange={(event) =>
-                          setTrainConfig((current) => ({
-                            ...current,
-                            batchSize: Number(event.target.value) || 1
-                          }))
-                        }
-                      />
-                    </label>
-                    <label>
-                      Device
-                      <select
-                        value={trainConfig.device}
-                        onChange={(event) =>
-                          setTrainConfig((current) => ({ ...current, device: event.target.value }))
-                        }
-                      >
-                        <option value="auto">Auto</option>
-                        <option value="cuda">CUDA</option>
-                        <option value="mps">Apple Silicon</option>
-                        <option value="cpu">CPU</option>
-                      </select>
-                    </label>
-                    <label>
-                      Seed
-                      <input
-                        type="number"
-                        value={trainConfig.seed}
-                        onChange={(event) =>
-                          setTrainConfig((current) => ({
-                            ...current,
-                            seed: Number(event.target.value) || 1
-                          }))
-                        }
-                      />
-                    </label>
-                  </div>
+                  <TrainingSchemaControls
+                    controls={trainControls}
+                    setValues={setTrainConfig}
+                    values={resolvedTrainConfig}
+                  />
                   <p className="training-inline-note">
-                    Runs are local and resumability is intentionally disabled until STRUM validates
-                    parent checkpoint compatibility.
+                    OCTAVE submits only values declared by this STRUM pipeline. Any resume or
+                    fine-tune option remains unavailable until STRUM advertises compatible parents.
                   </p>
                   <button
                     className="dataset-primary"
@@ -1526,7 +1673,7 @@ export function TrainingModal({
                       !['succeeded', 'failed', 'cancelled'].includes(trainingJob.state ?? '')
                     )}
                   >
-                    Start local Guitar run <span aria-hidden="true">⚡</span>
+                    Start local {selectedPipelineName} run <span aria-hidden="true">⚡</span>
                   </button>
                 </>
               )}

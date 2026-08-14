@@ -317,6 +317,24 @@
   border: 1px solid var(--border-color);
   border-radius: 6px;
 }
+.training-config-grid .training-toggle-control {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 38px;
+  padding: 8px 10px;
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.training-config-grid .training-toggle-control input {
+  width: 16px;
+  min-height: 16px;
+  padding: 0;
+  accent-color: var(--accent-color);
+}
 .training-inspection-grid,
 .training-config-grid {
   display: grid;
