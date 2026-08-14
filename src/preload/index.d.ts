@@ -25,7 +25,7 @@ interface ChartEditorAPI {
   chooseDatasetPackageFolder: () => Promise<
     Array<{
       candidateId: string
-      kind: 'octave-library' | 'sng' | 'rb3con'
+      kind: 'octave-library' | 'sng' | 'rb3con' | 'zip'
       songCount: number
       metadata: Record<string, string>
       midiValid: boolean
@@ -41,7 +41,7 @@ interface ChartEditorAPI {
   scanDatasetLibrary: () => Promise<
     Array<{
       candidateId: string
-      kind: 'octave-library' | 'sng' | 'rb3con'
+      kind: 'octave-library' | 'sng' | 'rb3con' | 'zip'
       songCount: number
       metadata: Record<string, string>
       midiValid: boolean
@@ -55,6 +55,7 @@ interface ChartEditorAPI {
     }>
   >
   setDatasetSongOptIn: (candidateId: string, optedIn: boolean) => Promise<boolean>
+  setDatasetPackageApproved: (candidateId: string, approved: boolean) => Promise<boolean>
   buildSongSourceCatalog: (options: {
     candidateIds: string[]
     parentId: string
@@ -63,7 +64,6 @@ interface ChartEditorAPI {
     provenance: string
     license: string
   }) => Promise<{
-    catalogPath: string
     recordCount: number
     reviewRequiredCount: number
     skipped: Array<{ reason: string }>

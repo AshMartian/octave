@@ -38,7 +38,7 @@ const api = {
   chooseDatasetPackageFolder: (): Promise<
     Array<{
       candidateId: string
-      kind: 'octave-library' | 'sng' | 'rb3con'
+      kind: 'octave-library' | 'sng' | 'rb3con' | 'zip'
       songCount: number
       metadata: Record<string, string>
       midiValid: boolean
@@ -57,7 +57,7 @@ const api = {
   scanDatasetLibrary: (): Promise<
     Array<{
       candidateId: string
-      kind: 'octave-library' | 'sng' | 'rb3con'
+      kind: 'octave-library' | 'sng' | 'rb3con' | 'zip'
       songCount: number
       metadata: Record<string, string>
       midiValid: boolean
@@ -74,6 +74,9 @@ const api = {
   setDatasetSongOptIn: (candidateId: string, optedIn: boolean): Promise<boolean> =>
     ipcRenderer.invoke('dataset:setSongOptIn', candidateId, optedIn),
 
+  setDatasetPackageApproved: (candidateId: string, approved: boolean): Promise<boolean> =>
+    ipcRenderer.invoke('dataset:setPackageApproved', candidateId, approved),
+
   buildSongSourceCatalog: (options: {
     candidateIds: string[]
     parentId: string
@@ -82,7 +85,6 @@ const api = {
     provenance: string
     license: string
   }): Promise<{
-    catalogPath: string
     recordCount: number
     reviewRequiredCount: number
     skipped: Array<{ reason: string }>

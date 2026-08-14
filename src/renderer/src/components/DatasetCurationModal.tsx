@@ -3,7 +3,7 @@ import './DatasetCurationModal.css'
 
 type SourceCandidate = {
   candidateId: string
-  kind: 'octave-library' | 'sng' | 'rb3con'
+  kind: 'octave-library' | 'sng' | 'rb3con' | 'zip'
   songCount: number
   metadata: Record<string, string>
   midiValid: boolean
@@ -96,9 +96,25 @@ export function DatasetCurationModal({
   const addPackageFolder = async (): Promise<void> => {
     const discovered = await window.api.chooseDatasetPackageFolder()
     setPackages((current) => [...current, ...discovered])
-    setSelectedPackages(
-      (current) => new Set([...current, ...discovered.map((entry) => entry.candidateId)])
-    )
+  }
+
+  const togglePackage = async (candidate: SourceCandidate): Promise<void> => {
+    const approved = !selectedPackages.has(candidate.candidateId)
+    setSelectedPackages((current) => {
+      const next = new Set(current)
+      if (approved) next.add(candidate.candidateId)
+      else next.delete(candidate.candidateId)
+      return next
+    })
+    if (!(await window.api.setDatasetPackageApproved(candidate.candidateId, approved))) {
+      setSelectedPackages((current) => {
+        const next = new Set(current)
+        if (approved) next.delete(candidate.candidateId)
+        else next.add(candidate.candidateId)
+        return next
+      })
+      setError('Could not save that package review decision.')
+    }
   }
 
   const chooseCatalogParent = async (): Promise<void> => {
@@ -125,7 +141,9 @@ export function DatasetCurationModal({
     try {
       const response = await window.api.buildSongSourceCatalog({
         candidateIds: [
-          ...songs.filter((song) => song.midiValid).map((song) => song.candidateId),
+          ...songs
+            .filter((song) => song.midiValid && song.trainingUse === 'allowed')
+            .map((song) => song.candidateId),
           ...packages
             .filter((entry) => selectedPackages.has(entry.candidateId))
             .map((entry) => entry.candidateId)
@@ -160,13 +178,7 @@ export function DatasetCurationModal({
         disabled={!candidate.midiValid || exporting}
         onChange={() => {
           if (selectable) {
-            setSelectedPackages((current) => {
-              const next = new Set(current)
-              next.has(candidate.candidateId)
-                ? next.delete(candidate.candidateId)
-                : next.add(candidate.candidateId)
-              return next
-            })
+            void togglePackage(candidate)
           } else {
             void toggleSong(candidate)
           }
@@ -246,9 +258,9 @@ export function DatasetCurationModal({
               <div>
                 <h3>Additional packages</h3>
                 <p>
-                  Choose folders containing <code>.sng</code>, <code>.con</code>, or{' '}
-                  <code>.rb3con</code>. OCTAVE parses and normalizes them in the main process; this
-                  UI receives no source locations.
+                  Choose folders containing <code>.sng</code>, <code>.con</code>,{' '}
+                  <code>.rb3con</code>, or <code>.zip</code>. OCTAVE parses and normalizes them in
+                  the main process; this UI receives no source locations.
                 </p>
               </div>
               <button onClick={() => void addPackageFolder()} disabled={exporting}>

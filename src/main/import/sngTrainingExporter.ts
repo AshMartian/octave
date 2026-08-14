@@ -1,11 +1,26 @@
 import { createHash, randomUUID } from 'crypto'
 import { createReadStream } from 'fs'
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'fs/promises'
+import {
+  lstat,
+  mkdir,
+  open,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  rm,
+  stat,
+  unlink,
+  writeFile
+} from 'fs/promises'
 import * as path from 'path'
 import { Readable } from 'stream'
 import { Midi } from '@tonejs/midi'
+import AdmZip from 'adm-zip'
+import Ajv2020 from 'ajv/dist/2020'
 import { SngStream, type SngHeader } from 'parse-sng'
 import { parseIniFile } from '../../shared/iniFile'
+import catalogSchema from '../../../docs/reference/song-source-catalog.schema.json'
 import { StfsParser } from './conImporter'
 import { parseDta } from './dtaParser'
 
@@ -13,6 +28,15 @@ const EXPORT_FORMAT = 'octave-training-midi-export/v1'
 const NOTES_MIDI = 'notes.mid'
 const EXPORTED_METADATA_KEYS = ['name', 'artist', 'album', 'genre', 'year', 'charter'] as const
 const MAX_METADATA_VALUE_LENGTH = 512
+const MAX_ZIP_ENTRIES = 2_000
+const MAX_ZIP_ENTRY_BYTES = 64 * 1024 * 1024
+const CATALOG_SCHEMA_ID =
+  'https://octavestudio.tools/schemas/song-source-catalog/v1/catalog.schema.json'
+const catalogAjv = new Ajv2020({ allErrors: true, strict: false })
+const validateCatalogManifestSchema = catalogAjv.compile(catalogSchema)
+const validateCatalogRecordSchema = catalogAjv.compile({
+  $ref: `${CATALOG_SCHEMA_ID}#/$defs/record`
+})
 
 export interface SngTrainingExportOptions {
   /** Explicitly selected Clone Hero packages. */
@@ -53,12 +77,14 @@ export interface DatasetLibrarySong {
   hasNotesMidi: boolean
 }
 
-export type DatasetSourceKind = 'octave-library' | 'sng' | 'rb3con'
+export type DatasetSourceKind = 'octave-library' | 'sng' | 'rb3con' | 'zip'
 
 /** Source locations stay in the main process and are never rendered or written to a catalog. */
 export interface DatasetCatalogSource {
   kind: DatasetSourceKind
   sourcePath: string
+  /** Set only by the main-process review gate immediately before catalog build. */
+  trainingUse?: 'allowed' | 'review_required'
 }
 
 export interface DatasetSourceSummary {
@@ -299,6 +325,7 @@ function redactLocationText(value: string, fallback = 'Unknown'): string {
     .join('')
     .replace(/(?:https?|smb|file):\/\/\S+/gi, '[redacted]')
     .replace(/(?:^|\s)(?:~?\/|[A-Za-z]:[\\/]|\\\\)[^\s]*/g, ' [redacted]')
+    .replace(/\\/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, MAX_METADATA_VALUE_LENGTH)
@@ -329,6 +356,7 @@ function discoverInstrumentCoverage(midiBytes: Buffer): DatasetSourceSummary['in
     const trackName = track.name.trim()
     const mapped = TRACK_INSTRUMENTS.find(([prefix]) => trackName.toUpperCase().startsWith(prefix))
     if (!mapped || track.notes.length === 0) continue
+    const safeTrackName = redactLocationText(trackName, mapped[0])
     const [, instrument] = mapped
     const difficulties = new Set<string>()
     for (const note of track.notes) {
@@ -343,10 +371,54 @@ function discoverInstrumentCoverage(midiBytes: Buffer): DatasetSourceSummary['in
     coverage[instrument] = {
       status: 'present',
       difficulties: [...difficulties],
-      trackNames: [...new Set([...(coverage[instrument]?.trackNames ?? []), trackName])]
+      trackNames: [...new Set([...(coverage[instrument]?.trackNames ?? []), safeTrackName])]
     }
   }
   return coverage
+}
+
+function safeZipEntryName(entryName: string): string | null {
+  const normalized = entryName.replace(/\\/g, '/')
+  if (
+    !normalized ||
+    normalized.startsWith('/') ||
+    /^[A-Za-z]:\//.test(normalized) ||
+    normalized.split('/').some((part) => part === '..')
+  ) {
+    return null
+  }
+  return normalized
+}
+
+function extractZipNotesMidi(
+  sourcePath: string
+): Array<{ midi: Buffer; metadata: Record<string, string> }> {
+  const archive = new AdmZip(sourcePath)
+  const entries = archive.getEntries()
+  if (entries.length > MAX_ZIP_ENTRIES) throw new Error('ZIP archive has too many entries.')
+  const files = new Map<string, AdmZip.IZipEntry>()
+  for (const entry of entries) {
+    const name = safeZipEntryName(entry.entryName)
+    if (!name || entry.isDirectory) continue
+    if (!Number.isSafeInteger(entry.header.size) || entry.header.size > MAX_ZIP_ENTRY_BYTES) {
+      throw new Error('ZIP archive entry is too large.')
+    }
+    files.set(name.toLowerCase(), entry)
+  }
+
+  const candidates: Array<{ midi: Buffer; metadata: Record<string, string> }> = []
+  for (const [name, entry] of files) {
+    if (!name.endsWith(`/${NOTES_MIDI}`) && name !== NOTES_MIDI) continue
+    const midi = entry.getData()
+    if (midi.length > MAX_ZIP_ENTRY_BYTES) throw new Error('ZIP archive entry is too large.')
+    const directory = name.slice(0, -NOTES_MIDI.length)
+    const songIni = files.get(`${directory}song.ini`)
+    const metadata = songIni
+      ? sanitizeMetadata(parseIniFile(songIni.getData().toString('utf8')))
+      : {}
+    candidates.push({ midi, metadata })
+  }
+  return candidates
 }
 
 async function inspectDatasetSource(source: DatasetCatalogSource): Promise<CatalogCandidate[]> {
@@ -359,7 +431,7 @@ async function inspectDatasetSource(source: DatasetCatalogSource): Promise<Catal
         midi: extracted.midi,
         metadata: redactMetadata(extracted.metadata),
         containerSha256: await sha256File(source.sourcePath),
-        trainingUse: 'allowed'
+        trainingUse: source.trainingUse ?? 'review_required'
       }
     ]
   }
@@ -370,7 +442,17 @@ async function inspectDatasetSource(source: DatasetCatalogSource): Promise<Catal
       midi: candidate.midi,
       metadata: redactMetadata(candidate.metadata),
       containerSha256,
-      trainingUse: 'allowed'
+      trainingUse: source.trainingUse ?? 'review_required'
+    }))
+  }
+  if (source.kind === 'zip') {
+    const containerSha256 = await sha256File(source.sourcePath)
+    return extractZipNotesMidi(source.sourcePath).map((candidate) => ({
+      kind: source.kind,
+      midi: candidate.midi,
+      metadata: redactMetadata(candidate.metadata),
+      containerSha256,
+      trainingUse: source.trainingUse ?? 'review_required'
     }))
   }
   const metadata = parseIniFile(await readFile(path.join(source.sourcePath, 'song.ini'), 'utf8'))
@@ -448,7 +530,9 @@ function catalogRecord(
         ? 'octave-sng/1'
         : candidate.kind === 'rb3con'
           ? 'octave-rb3con/1'
-          : 'octave-song-folder/1'
+          : candidate.kind === 'zip'
+            ? 'octave-zip/1'
+            : 'octave-song-folder/1'
   }
   if (candidate.containerSha256) importRecord.container_sha256 = candidate.containerSha256
   return {
@@ -456,18 +540,31 @@ function catalogRecord(
     import: importRecord,
     rights: { training_use: candidate.trainingUse, provenance: '', license: '' },
     metadata: candidate.metadata,
-    chart: { notes_midi: notesAsset, instruments: discoverInstrumentCoverage(candidate.midi) }
+    chart: {
+      notes_midi: notesAsset,
+      instruments: Object.fromEntries(
+        Object.entries(discoverInstrumentCoverage(candidate.midi)).map(([instrument, coverage]) => [
+          instrument,
+          {
+            status: coverage.status,
+            difficulties: coverage.difficulties,
+            track_names: coverage.trackNames
+          }
+        ])
+      )
+    }
   }
 }
 
 function validateCatalogRecord(record: Record<string, unknown>): void {
+  if (!validateCatalogRecordSchema(record)) throw new Error('Catalog record validation failed.')
   const sourceId = record.source_id
   const rights = record.rights as { training_use?: string; provenance?: string; license?: string }
   const chart = record.chart as {
     notes_midi?: CatalogAsset
     instruments?: Record<
       string,
-      { status?: string; difficulties?: unknown[]; trackNames?: unknown[] }
+      { status?: string; difficulties?: unknown[]; track_names?: unknown[] }
     >
   }
   if (typeof sourceId !== 'string' || !/^octave-src-[a-z0-9][a-z0-9-]{7,127}$/.test(sourceId)) {
@@ -513,10 +610,54 @@ function validateCatalogRecord(record: Record<string, unknown>): void {
     if (
       coverage.status !== 'present' ||
       !coverage.difficulties?.length ||
-      !coverage.trackNames?.length
+      !coverage.track_names?.length
     ) {
       throw new Error('Catalog record validation failed.')
     }
+  }
+}
+
+function assertPathWithinCatalogRoot(catalogRoot: string, candidatePath: string): void {
+  const relative = path.relative(catalogRoot, candidatePath)
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new Error('Catalog asset validation failed.')
+  }
+}
+
+async function validateMaterializedAsset(catalogRoot: string, asset: CatalogAsset): Promise<void> {
+  if (!new RegExp(`^assets/sha256/${asset.sha256}/[A-Za-z0-9._-]+$`).test(asset.relative_path)) {
+    throw new Error('Catalog asset validation failed.')
+  }
+  const assetPath = path.resolve(catalogRoot, ...asset.relative_path.split('/'))
+  assertPathWithinCatalogRoot(catalogRoot, assetPath)
+  const assetInfo = await lstat(assetPath)
+  if (assetInfo.isSymbolicLink() || !assetInfo.isFile() || assetInfo.size !== asset.byte_length) {
+    throw new Error('Catalog asset validation failed.')
+  }
+  const realAssetPath = await realpath(assetPath)
+  assertPathWithinCatalogRoot(catalogRoot, realAssetPath)
+  const bytes = await readFile(realAssetPath)
+  if (sha256Buffer(bytes) !== asset.sha256 || asset.asset_id !== `sha256:${asset.sha256}`) {
+    throw new Error('Catalog asset validation failed.')
+  }
+}
+
+async function validateStagedCatalog(catalogRoot: string): Promise<void> {
+  const catalog = JSON.parse(
+    await readFile(path.join(catalogRoot, 'catalog.json'), 'utf8')
+  ) as Record<string, unknown>
+  if (!validateCatalogManifestSchema(catalog)) {
+    throw new Error('Catalog manifest validation failed.')
+  }
+  const lines = (await readFile(path.join(catalogRoot, 'records.jsonl'), 'utf8'))
+    .split('\n')
+    .filter(Boolean)
+  if (!lines.length) throw new Error('Catalog manifest validation failed.')
+  for (const line of lines) {
+    const record = JSON.parse(line) as Record<string, unknown>
+    validateCatalogRecord(record)
+    const chart = record.chart as { notes_midi: CatalogAsset }
+    await validateMaterializedAsset(catalogRoot, chart.notes_midi)
   }
 }
 
@@ -535,16 +676,30 @@ export async function buildSongSourceCatalog(options: {
 }): Promise<SongSourceCatalogResult> {
   if (!options.sources.length) throw new Error('Select at least one reviewed source.')
   const catalogName = validateCatalogName(options.catalogName)
-  const catalogId = redactLocationText(options.catalogId, 'octave-catalog')
+  const catalogId = redactLocationText(options.catalogId, 'octave-catalog').slice(0, 128)
   const provenance = redactLocationText(options.provenance, 'Reviewed in Octave')
   const license = redactLocationText(options.license, 'Permission recorded by catalog owner')
   const parentDir = path.resolve(options.parentDir)
   const catalogPath = path.join(parentDir, catalogName)
+  const reservationPath = path.join(parentDir, `.${catalogName}.catalog-reservation`)
+  let reservation: Awaited<ReturnType<typeof open>>
+  try {
+    reservation = await open(reservationPath, 'wx')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+      throw new Error('A catalog build with that name is already in progress.')
+    }
+    throw error
+  }
   try {
     await stat(catalogPath)
     throw new Error('A catalog with that name already exists.')
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      await reservation.close()
+      await unlink(reservationPath)
+      throw error
+    }
   }
 
   const stagingPath = path.join(parentDir, `.${catalogName}.staging-${randomUUID()}`)
@@ -552,7 +707,9 @@ export async function buildSongSourceCatalog(options: {
   const skipped: SongSourceCatalogResult['skipped'] = []
   const seenMidi = new Set<string>()
   try {
-    await mkdir(path.join(stagingPath, 'assets', 'sha256'), { recursive: true })
+    await mkdir(stagingPath)
+    const stagingRoot = await realpath(stagingPath)
+    await mkdir(path.join(stagingRoot, 'assets', 'sha256'), { recursive: true })
     for (const [sourceIndex, source] of options.sources.entries()) {
       let candidates: CatalogCandidate[]
       try {
@@ -576,12 +733,12 @@ export async function buildSongSourceCatalog(options: {
           continue
         }
         const relativePath = path.posix.join('assets', 'sha256', notesSha256, NOTES_MIDI)
-        const assetPath = path.join(stagingPath, ...relativePath.split('/'))
+        const assetPath = path.resolve(stagingRoot, ...relativePath.split('/'))
+        assertPathWithinCatalogRoot(stagingRoot, assetPath)
         await mkdir(path.dirname(assetPath), { recursive: true })
+        const realAssetDir = await realpath(path.dirname(assetPath))
+        assertPathWithinCatalogRoot(stagingRoot, realAssetDir)
         await writeFile(assetPath, candidate.midi, { flag: 'wx' })
-        const materialized = await readFile(assetPath)
-        if (sha256Buffer(materialized) !== notesSha256)
-          throw new Error('Catalog asset hash verification failed.')
         const notesAsset: CatalogAsset = {
           asset_id: `sha256:${notesSha256}`,
           sha256: notesSha256,
@@ -589,6 +746,7 @@ export async function buildSongSourceCatalog(options: {
           byte_length: candidate.midi.length,
           media_type: 'audio/midi'
         }
+        await validateMaterializedAsset(stagingRoot, notesAsset)
         const record = catalogRecord(candidate, notesAsset, notesSha256) as {
           rights: { training_use: string; provenance: string; license: string }
         }
@@ -617,11 +775,22 @@ export async function buildSongSourceCatalog(options: {
       JSON.stringify(catalog, null, 2) + '\n',
       'utf8'
     )
-    await rename(stagingPath, catalogPath)
+    await validateStagedCatalog(stagingRoot)
+    try {
+      await stat(catalogPath)
+      throw new Error('A catalog with that name already exists.')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+    await rename(stagingRoot, catalogPath)
   } catch (error) {
     await rm(stagingPath, { recursive: true, force: true })
+    await reservation.close()
+    await unlink(reservationPath)
     throw error
   }
+  await reservation.close()
+  await unlink(reservationPath)
   return {
     catalogPath,
     recordCount: records.length,
