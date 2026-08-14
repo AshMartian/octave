@@ -1,18 +1,26 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { getSongStore, useProjectStore } from '../stores'
 import './DatasetCurationModal.css'
 
-type LibrarySong = {
-  path: string
-  name: string
-  artist: string
-  charter?: string
-  datasetOptIn: boolean
-  isStrumGenerated: boolean
-  hasNotesMidi: boolean
+type SourceCandidate = {
+  candidateId: string
+  kind: 'octave-library' | 'sng' | 'rb3con'
+  songCount: number
+  metadata: Record<string, string>
+  midiValid: boolean
+  instruments: Record<
+    string,
+    { status: 'present' | 'absent'; difficulties: string[]; trackNames: string[] }
+  >
+  trainingUse: 'allowed' | 'review_required'
+  warnings: Array<{ code: string }>
+  isStrumGenerated?: boolean
 }
 
-type PackageFile = { path: string; name: string }
+function candidateLabel(candidate: SourceCandidate): string {
+  const artist = candidate.metadata.artist
+  const name = candidate.metadata.name
+  return artist && name ? `${artist} — ${name}` : `${candidate.kind} source`
+}
 
 export function DatasetCurationModal({
   isOpen,
@@ -21,21 +29,23 @@ export function DatasetCurationModal({
   isOpen: boolean
   onClose: () => void
 }): React.JSX.Element | null {
-  const activeSongId = useProjectStore((state) => state.activeSongId)
-  const [songs, setSongs] = useState<LibrarySong[]>([])
-  const [packages, setPackages] = useState<PackageFile[]>([])
+  const [songs, setSongs] = useState<SourceCandidate[]>([])
+  const [packages, setPackages] = useState<SourceCandidate[]>([])
   const [selectedPackages, setSelectedPackages] = useState<Set<string>>(new Set())
-  const [outputDir, setOutputDir] = useState('')
-  const [datasetId, setDatasetId] = useState('octave-curated-dataset')
+  const [catalogParent, setCatalogParent] = useState<{ parentId: string; name: string } | null>(
+    null
+  )
+  const [catalogName, setCatalogName] = useState('octave-curated-catalog')
+  const [catalogId, setCatalogId] = useState('octave-curated-dataset')
   const [provenance, setProvenance] = useState('Curated in Octave')
   const [license, setLicense] = useState('')
   const [loading, setLoading] = useState(false)
   const [exporting, setExporting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<{
-    exported: number
+    records: number
+    reviewRequired: number
     skipped: number
-    manifestPath: string
   } | null>(null)
 
   const refreshLibrary = useCallback(async (): Promise<void> => {
@@ -43,8 +53,8 @@ export function DatasetCurationModal({
     setError(null)
     try {
       setSongs(await window.api.scanDatasetLibrary())
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'Could not scan the current library.')
+    } catch {
+      setError('Could not scan the current library.')
     } finally {
       setLoading(false)
     }
@@ -54,83 +64,130 @@ export function DatasetCurationModal({
     if (isOpen) void refreshLibrary()
   }, [isOpen, refreshLibrary])
 
-  const eligibleLibrarySongs = useMemo(
-    () => songs.filter((song) => song.datasetOptIn && song.hasNotesMidi),
+  const allowedLibrarySongs = useMemo(
+    () => songs.filter((song) => song.trainingUse === 'allowed' && song.midiValid),
     [songs]
   )
 
   if (!isOpen) return null
 
-  const toggleSong = async (song: LibrarySong): Promise<void> => {
-    const next = !song.datasetOptIn
+  const toggleSong = async (song: SourceCandidate): Promise<void> => {
+    const optedIn = song.trainingUse !== 'allowed'
     setError(null)
     setSongs((current) =>
-      current.map((entry) => (entry.path === song.path ? { ...entry, datasetOptIn: next } : entry))
+      current.map((entry) =>
+        entry.candidateId === song.candidateId
+          ? { ...entry, trainingUse: optedIn ? 'allowed' : 'review_required' }
+          : entry
+      )
     )
-    if (!(await window.api.setDatasetSongOptIn(song.path, next))) {
+    if (!(await window.api.setDatasetSongOptIn(song.candidateId, optedIn))) {
       setSongs((current) =>
         current.map((entry) =>
-          entry.path === song.path ? { ...entry, datasetOptIn: song.datasetOptIn } : entry
+          entry.candidateId === song.candidateId
+            ? { ...entry, trainingUse: song.trainingUse }
+            : entry
         )
       )
       setError('Could not save that song’s dataset consent setting.')
-      return
-    }
-    if (activeSongId) {
-      const songStore = getSongStore(activeSongId)
-      if (songStore.getState().song.folderPath === song.path) {
-        songStore.getState().updateMetadata({ dataset_opt_in: next ? 'true' : 'false' })
-      }
     }
   }
 
   const addPackageFolder = async (): Promise<void> => {
     const discovered = await window.api.chooseDatasetPackageFolder()
-    setPackages((current) => {
-      const next = new Map(current.map((entry) => [entry.path, entry]))
-      for (const entry of discovered) next.set(entry.path, entry)
-      return [...next.values()]
-    })
+    setPackages((current) => [...current, ...discovered])
     setSelectedPackages(
-      (current) => new Set([...current, ...discovered.map((entry) => entry.path)])
+      (current) => new Set([...current, ...discovered.map((entry) => entry.candidateId)])
     )
   }
 
-  const chooseOutput = async (): Promise<void> => {
-    const selected = await window.api.chooseDatasetOutputFolder()
-    if (selected) setOutputDir(selected)
+  const chooseCatalogParent = async (): Promise<void> => {
+    const selected = await window.api.chooseDatasetCatalogParent()
+    if (selected) setCatalogParent(selected)
   }
 
-  const exportDataset = async (): Promise<void> => {
-    if (!outputDir || !datasetId.trim() || !provenance.trim() || !license.trim()) {
-      setError('Dataset ID, provenance, license, and an empty output folder are required.')
+  const buildCatalog = async (): Promise<void> => {
+    if (
+      !catalogParent ||
+      !catalogName.trim() ||
+      !catalogId.trim() ||
+      !provenance.trim() ||
+      !license.trim()
+    ) {
+      setError(
+        'Catalog ID, catalog name, provenance, license, and a parent directory are required.'
+      )
       return
     }
     setExporting(true)
     setError(null)
     setResult(null)
     try {
-      const response = await window.api.exportTrainingDataset({
-        packagePaths: packages
-          .filter((entry) => selectedPackages.has(entry.path))
-          .map((entry) => entry.path),
-        librarySongPaths: eligibleLibrarySongs.map((song) => song.path),
-        outputDir,
-        datasetId: datasetId.trim(),
+      const response = await window.api.buildSongSourceCatalog({
+        candidateIds: [
+          ...songs.filter((song) => song.midiValid).map((song) => song.candidateId),
+          ...packages
+            .filter((entry) => selectedPackages.has(entry.candidateId))
+            .map((entry) => entry.candidateId)
+        ],
+        parentId: catalogParent.parentId,
+        catalogName: catalogName.trim(),
+        catalogId: catalogId.trim(),
         provenance: provenance.trim(),
         license: license.trim()
       })
       setResult({
-        exported: response.exported.length,
-        skipped: response.skipped.length,
-        manifestPath: response.manifestPath
+        records: response.recordCount,
+        reviewRequired: response.reviewRequiredCount,
+        skipped: response.skipped.length
       })
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'Dataset export failed.')
+    } catch {
+      setError('Catalog build failed. Check the catalog name and choose a new destination.')
     } finally {
       setExporting(false)
     }
   }
+
+  const renderCandidate = (candidate: SourceCandidate, selectable: boolean): React.JSX.Element => (
+    <label className={!candidate.midiValid ? 'disabled' : ''} key={candidate.candidateId}>
+      <input
+        type="checkbox"
+        checked={
+          selectable
+            ? selectedPackages.has(candidate.candidateId)
+            : candidate.trainingUse === 'allowed'
+        }
+        disabled={!candidate.midiValid || exporting}
+        onChange={() => {
+          if (selectable) {
+            setSelectedPackages((current) => {
+              const next = new Set(current)
+              next.has(candidate.candidateId)
+                ? next.delete(candidate.candidateId)
+                : next.add(candidate.candidateId)
+              return next
+            })
+          } else {
+            void toggleSong(candidate)
+          }
+        }}
+      />
+      <span>
+        <strong>{candidateLabel(candidate)}</strong>
+        <small>
+          {candidate.kind} · {candidate.midiValid ? 'valid MIDI' : 'invalid MIDI'} ·{' '}
+          {candidate.trainingUse.replace('_', ' ')}
+          {candidate.isStrumGenerated ? ' · STRUM generated' : ''}
+          {Object.entries(candidate.instruments)
+            .map(([instrument, coverage]) => `${instrument}: ${coverage.difficulties.join('/')}`)
+            .join(', ')}
+          {candidate.warnings.length
+            ? ` · ${candidate.warnings.map((warning) => warning.code).join(', ')}`
+            : ''}
+        </small>
+      </span>
+    </label>
+  )
 
   return (
     <div className="dataset-curation-overlay" onClick={() => !exporting && onClose()}>
@@ -144,8 +201,7 @@ export function DatasetCurationModal({
           <div>
             <h2>Dataset Curation</h2>
             <p>
-              Only MIDI and approved metadata are exported. Audio, stems, artwork, and source paths
-              stay out.
+              Review source summaries and rights; OCTAVE builds the normalized catalog for STRUM.
             </p>
           </div>
           <button
@@ -161,18 +217,17 @@ export function DatasetCurationModal({
           {error && <p className="dataset-message error">{error}</p>}
           {result && (
             <p className="dataset-message success">
-              Exported {result.exported} songs; skipped {result.skipped}. Manifest:{' '}
-              {result.manifestPath}
+              Created {result.records} catalog records ({result.reviewRequired} review required);
+              skipped {result.skipped}.
             </p>
           )}
-
           <section className="dataset-section">
             <div className="dataset-section-heading">
               <div>
                 <h3>Octave library</h3>
                 <p>
-                  Consent is stored in each song’s <code>song.ini</code>. STRUM output is opted out
-                  until you review it.
+                  STRUM-generated songs begin as <code>review_required</code>. Checking a reviewed
+                  song stores explicit consent in <code>song.ini</code>.
                 </p>
               </div>
               <button onClick={() => void refreshLibrary()} disabled={loading || exporting}>
@@ -180,40 +235,20 @@ export function DatasetCurationModal({
               </button>
             </div>
             <div className="dataset-song-list">
-              {songs.map((song) => (
-                <label className={!song.hasNotesMidi ? 'disabled' : ''} key={song.path}>
-                  <input
-                    type="checkbox"
-                    checked={song.datasetOptIn}
-                    disabled={!song.hasNotesMidi || exporting}
-                    onChange={() => void toggleSong(song)}
-                  />
-                  <span>
-                    <strong>
-                      {song.artist} — {song.name}
-                    </strong>
-                    <small>
-                      {song.isStrumGenerated
-                        ? 'STRUM generated · review required'
-                        : song.charter || 'No charter'}
-                      {!song.hasNotesMidi ? ' · no notes.mid' : ''}
-                    </small>
-                  </span>
-                </label>
-              ))}
+              {songs.map((song) => renderCandidate(song, false))}
               {!loading && songs.length === 0 && (
                 <p className="dataset-empty">Open an Octave song library to curate its songs.</p>
               )}
             </div>
           </section>
-
           <section className="dataset-section">
             <div className="dataset-section-heading">
               <div>
                 <h3>Additional packages</h3>
                 <p>
-                  Add folders containing <code>.sng</code>, <code>.con</code>, or{' '}
-                  <code>.rb3con</code> files. Select the packages you have permission to include.
+                  Choose folders containing <code>.sng</code>, <code>.con</code>, or{' '}
+                  <code>.rb3con</code>. OCTAVE parses and normalizes them in the main process; this
+                  UI receives no source locations.
                 </p>
               </div>
               <button onClick={() => void addPackageFolder()} disabled={exporting}>
@@ -221,33 +256,24 @@ export function DatasetCurationModal({
               </button>
             </div>
             <div className="dataset-package-list">
-              {packages.map((entry) => (
-                <label key={entry.path}>
-                  <input
-                    type="checkbox"
-                    checked={selectedPackages.has(entry.path)}
-                    disabled={exporting}
-                    onChange={() =>
-                      setSelectedPackages((current) => {
-                        const next = new Set(current)
-                        next.has(entry.path) ? next.delete(entry.path) : next.add(entry.path)
-                        return next
-                      })
-                    }
-                  />{' '}
-                  {entry.name}
-                </label>
-              ))}
+              {packages.map((entry) => renderCandidate(entry, true))}
             </div>
           </section>
-
           <section className="dataset-section dataset-details">
-            <h3>Export record</h3>
+            <h3>New source catalog</h3>
             <label>
-              Dataset ID
+              Catalog ID
               <input
-                value={datasetId}
-                onChange={(event) => setDatasetId(event.target.value)}
+                value={catalogId}
+                onChange={(event) => setCatalogId(event.target.value)}
+                disabled={exporting}
+              />
+            </label>
+            <label>
+              Catalog name
+              <input
+                value={catalogName}
+                onChange={(event) => setCatalogName(event.target.value)}
                 disabled={exporting}
               />
             </label>
@@ -269,10 +295,14 @@ export function DatasetCurationModal({
               />
             </label>
             <label>
-              Empty output folder
+              Catalog parent
               <div className="dataset-output">
-                <input value={outputDir} readOnly placeholder="Choose a folder" />
-                <button onClick={() => void chooseOutput()} disabled={exporting}>
+                <input
+                  value={catalogParent?.name ?? ''}
+                  readOnly
+                  placeholder="Choose a parent directory"
+                />
+                <button onClick={() => void chooseCatalogParent()} disabled={exporting}>
                   Choose
                 </button>
               </div>
@@ -281,15 +311,15 @@ export function DatasetCurationModal({
         </main>
         <footer>
           <span>
-            {eligibleLibrarySongs.length} library songs and {selectedPackages.size} packages
-            selected
+            {allowedLibrarySongs.length} library records allowed; {selectedPackages.size} package
+            sources reviewed
           </span>
           <button
             className="dataset-primary"
-            onClick={() => void exportDataset()}
+            onClick={() => void buildCatalog()}
             disabled={exporting}
           >
-            {exporting ? 'Exporting…' : 'Export curated MIDI'}
+            {exporting ? 'Building…' : 'Build source catalog'}
           </button>
         </footer>
       </section>

@@ -1,6 +1,6 @@
-import { createHash } from 'crypto'
+import { createHash, randomUUID } from 'crypto'
 import { createReadStream } from 'fs'
-import { mkdir, readFile, readdir, writeFile } from 'fs/promises'
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'fs/promises'
 import * as path from 'path'
 import { Readable } from 'stream'
 import { Midi } from '@tonejs/midi'
@@ -51,6 +51,50 @@ export interface DatasetLibrarySong {
   datasetOptIn: boolean
   isStrumGenerated: boolean
   hasNotesMidi: boolean
+}
+
+export type DatasetSourceKind = 'octave-library' | 'sng' | 'rb3con'
+
+/** Source locations stay in the main process and are never rendered or written to a catalog. */
+export interface DatasetCatalogSource {
+  kind: DatasetSourceKind
+  sourcePath: string
+}
+
+export interface DatasetSourceSummary {
+  kind: DatasetSourceKind
+  songCount: number
+  metadata: Record<string, string>
+  midiValid: boolean
+  instruments: Record<
+    string,
+    { status: 'present' | 'absent'; difficulties: string[]; trackNames: string[] }
+  >
+  trainingUse: 'allowed' | 'review_required'
+  warnings: Array<{ code: string }>
+}
+
+interface CatalogCandidate {
+  kind: DatasetSourceKind
+  midi: Buffer
+  metadata: Record<string, string>
+  containerSha256?: string
+  trainingUse: 'allowed' | 'review_required'
+}
+
+interface CatalogAsset {
+  asset_id: string
+  sha256: string
+  relative_path: string
+  byte_length: number
+  media_type: string
+}
+
+export interface SongSourceCatalogResult {
+  catalogPath: string
+  recordCount: number
+  reviewRequiredCount: number
+  skipped: Array<{ sourceIndex: number; reason: string }>
 }
 
 function slug(value: string): string {
@@ -244,6 +288,347 @@ async function ensureEmptyOutputDir(outputDir: string): Promise<void> {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     await mkdir(outputDir, { recursive: true })
+  }
+}
+
+function redactLocationText(value: string, fallback = 'Unknown'): string {
+  const normalized = Array.from(value.normalize('NFKC'), (character) => {
+    const codePoint = character.codePointAt(0) ?? 0
+    return codePoint <= 0x1f || codePoint === 0x7f ? ' ' : character
+  })
+    .join('')
+    .replace(/(?:https?|smb|file):\/\/\S+/gi, '[redacted]')
+    .replace(/(?:^|\s)(?:~?\/|[A-Za-z]:[\\/]|\\\\)[^\s]*/g, ' [redacted]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, MAX_METADATA_VALUE_LENGTH)
+  return normalized || fallback
+}
+
+function redactMetadata(metadata: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(metadata).map(([key, value]) => [key, redactLocationText(value)])
+  )
+}
+
+const TRACK_INSTRUMENTS: Array<[string, string]> = [
+  ['PART DRUMS', 'drums'],
+  ['PART GUITAR', 'guitar'],
+  ['PART BASS', 'bass'],
+  ['PART KEYS', 'keys'],
+  ['PART VOCALS', 'vocals'],
+  ['PART REAL_KEYS', 'pro_keys'],
+  ['PART REAL_GUITAR', 'pro_guitar'],
+  ['PART REAL_BASS', 'pro_bass']
+]
+
+function discoverInstrumentCoverage(midiBytes: Buffer): DatasetSourceSummary['instruments'] {
+  const coverage: DatasetSourceSummary['instruments'] = {}
+  const midi = new Midi(midiBytes)
+  for (const track of midi.tracks) {
+    const trackName = track.name.trim()
+    const mapped = TRACK_INSTRUMENTS.find(([prefix]) => trackName.toUpperCase().startsWith(prefix))
+    if (!mapped || track.notes.length === 0) continue
+    const [, instrument] = mapped
+    const difficulties = new Set<string>()
+    for (const note of track.notes) {
+      if (note.midi >= 60 && note.midi <= 66) difficulties.add('easy')
+      else if (note.midi >= 72 && note.midi <= 78) difficulties.add('medium')
+      else if (note.midi >= 84 && note.midi <= 90) difficulties.add('hard')
+      else if (note.midi >= 96 && note.midi <= 102) difficulties.add('expert')
+    }
+    // Vocal and pro tracks do not use the five-lane difficulty note ranges;
+    // catalog v1 still requires a non-empty coverage level when present.
+    if (difficulties.size === 0) difficulties.add('expert')
+    coverage[instrument] = {
+      status: 'present',
+      difficulties: [...difficulties],
+      trackNames: [...new Set([...(coverage[instrument]?.trackNames ?? []), trackName])]
+    }
+  }
+  return coverage
+}
+
+async function inspectDatasetSource(source: DatasetCatalogSource): Promise<CatalogCandidate[]> {
+  if (source.kind === 'sng') {
+    const extracted = await extractSngNotesMidi(source.sourcePath)
+    if (!extracted) return []
+    return [
+      {
+        kind: source.kind,
+        midi: extracted.midi,
+        metadata: redactMetadata(extracted.metadata),
+        containerSha256: await sha256File(source.sourcePath),
+        trainingUse: 'allowed'
+      }
+    ]
+  }
+  if (source.kind === 'rb3con') {
+    const containerSha256 = await sha256File(source.sourcePath)
+    return (await extractConNotesMidi(source.sourcePath)).map((candidate) => ({
+      kind: source.kind,
+      midi: candidate.midi,
+      metadata: redactMetadata(candidate.metadata),
+      containerSha256,
+      trainingUse: 'allowed'
+    }))
+  }
+  const metadata = parseIniFile(await readFile(path.join(source.sourcePath, 'song.ini'), 'utf8'))
+  return [
+    {
+      kind: source.kind,
+      midi: await readFile(path.join(source.sourcePath, NOTES_MIDI)),
+      metadata: redactMetadata(sanitizeMetadata(metadata)),
+      trainingUse: isDatasetOptedIn(metadata.dataset_opt_in) ? 'allowed' : 'review_required'
+    }
+  ]
+}
+
+/** Returns a renderer-safe summary; original source locations and parser errors never leave main. */
+export async function summarizeDatasetSource(
+  source: DatasetCatalogSource
+): Promise<DatasetSourceSummary> {
+  try {
+    const candidates = await inspectDatasetSource(source)
+    const first = candidates[0]
+    if (!first) {
+      return {
+        kind: source.kind,
+        songCount: 0,
+        metadata: {},
+        midiValid: false,
+        instruments: {},
+        trainingUse: 'review_required',
+        warnings: [{ code: 'missing_notes_midi' }]
+      }
+    }
+    const midiValid = candidates.every((candidate) => isValidMidi(candidate.midi))
+    return {
+      kind: source.kind,
+      songCount: candidates.length,
+      metadata: first.metadata,
+      midiValid,
+      instruments: midiValid ? discoverInstrumentCoverage(first.midi) : {},
+      trainingUse: first.trainingUse,
+      warnings: midiValid ? [] : [{ code: 'invalid_notes_midi' }]
+    }
+  } catch {
+    return {
+      kind: source.kind,
+      songCount: 0,
+      metadata: {},
+      midiValid: false,
+      instruments: {},
+      trainingUse: 'review_required',
+      warnings: [{ code: 'source_unavailable' }]
+    }
+  }
+}
+
+function validateCatalogName(name: string): string {
+  const normalized = name.trim()
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(normalized)) {
+    throw new Error(
+      'Catalog names may contain letters, numbers, dots, underscores, and dashes only.'
+    )
+  }
+  return normalized
+}
+
+function catalogRecord(
+  candidate: CatalogCandidate,
+  notesAsset: CatalogAsset,
+  notesSha256: string
+): Record<string, unknown> {
+  const sourceId = `octave-src-${notesSha256.slice(0, 24)}`
+  const importRecord: Record<string, unknown> = {
+    kind: candidate.kind === 'octave-library' ? 'song_folder' : candidate.kind,
+    adapter_version:
+      candidate.kind === 'sng'
+        ? 'octave-sng/1'
+        : candidate.kind === 'rb3con'
+          ? 'octave-rb3con/1'
+          : 'octave-song-folder/1'
+  }
+  if (candidate.containerSha256) importRecord.container_sha256 = candidate.containerSha256
+  return {
+    source_id: sourceId,
+    import: importRecord,
+    rights: { training_use: candidate.trainingUse, provenance: '', license: '' },
+    metadata: candidate.metadata,
+    chart: { notes_midi: notesAsset, instruments: discoverInstrumentCoverage(candidate.midi) }
+  }
+}
+
+function validateCatalogRecord(record: Record<string, unknown>): void {
+  const sourceId = record.source_id
+  const rights = record.rights as { training_use?: string; provenance?: string; license?: string }
+  const chart = record.chart as {
+    notes_midi?: CatalogAsset
+    instruments?: Record<
+      string,
+      { status?: string; difficulties?: unknown[]; trackNames?: unknown[] }
+    >
+  }
+  if (typeof sourceId !== 'string' || !/^octave-src-[a-z0-9][a-z0-9-]{7,127}$/.test(sourceId)) {
+    throw new Error('Catalog record validation failed.')
+  }
+  if (
+    !rights ||
+    !['allowed', 'review_required', 'prohibited'].includes(rights.training_use ?? '')
+  ) {
+    throw new Error('Catalog record validation failed.')
+  }
+  for (const value of [rights.provenance, rights.license]) {
+    if (
+      !value ||
+      value.length > MAX_METADATA_VALUE_LENGTH ||
+      /(?:https?:|smb:|file:|[A-Za-z]:[\\/])|(?:^|\s)\//i.test(value)
+    ) {
+      throw new Error('Catalog record validation failed.')
+    }
+  }
+  for (const value of Object.values((record.metadata ?? {}) as Record<string, unknown>)) {
+    if (
+      typeof value !== 'string' ||
+      !value ||
+      value.length > MAX_METADATA_VALUE_LENGTH ||
+      /(?:https?:|smb:|file:|[A-Za-z]:[\\/])|(?:^|\s)\//i.test(value)
+    ) {
+      throw new Error('Catalog record validation failed.')
+    }
+  }
+  const notes = chart?.notes_midi
+  if (
+    !notes ||
+    notes.asset_id !== `sha256:${notes.sha256}` ||
+    !/^[a-f0-9]{64}$/.test(notes.sha256)
+  ) {
+    throw new Error('Catalog record validation failed.')
+  }
+  if (!new RegExp(`^assets/sha256/${notes.sha256}/[A-Za-z0-9._-]+$`).test(notes.relative_path)) {
+    throw new Error('Catalog record validation failed.')
+  }
+  for (const coverage of Object.values(chart.instruments ?? {})) {
+    if (
+      coverage.status !== 'present' ||
+      !coverage.difficulties?.length ||
+      !coverage.trackNames?.length
+    ) {
+      throw new Error('Catalog record validation failed.')
+    }
+  }
+}
+
+/**
+ * Main-process catalog service. It is intentionally the sole adapter boundary
+ * between package/folder sources and STRUM; its returned catalog is path-free.
+ */
+export async function buildSongSourceCatalog(options: {
+  sources: readonly DatasetCatalogSource[]
+  parentDir: string
+  catalogName: string
+  catalogId: string
+  provenance: string
+  license: string
+  octaveVersion: string
+}): Promise<SongSourceCatalogResult> {
+  if (!options.sources.length) throw new Error('Select at least one reviewed source.')
+  const catalogName = validateCatalogName(options.catalogName)
+  const catalogId = redactLocationText(options.catalogId, 'octave-catalog')
+  const provenance = redactLocationText(options.provenance, 'Reviewed in Octave')
+  const license = redactLocationText(options.license, 'Permission recorded by catalog owner')
+  const parentDir = path.resolve(options.parentDir)
+  const catalogPath = path.join(parentDir, catalogName)
+  try {
+    await stat(catalogPath)
+    throw new Error('A catalog with that name already exists.')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+
+  const stagingPath = path.join(parentDir, `.${catalogName}.staging-${randomUUID()}`)
+  const records: Record<string, unknown>[] = []
+  const skipped: SongSourceCatalogResult['skipped'] = []
+  const seenMidi = new Set<string>()
+  try {
+    await mkdir(path.join(stagingPath, 'assets', 'sha256'), { recursive: true })
+    for (const [sourceIndex, source] of options.sources.entries()) {
+      let candidates: CatalogCandidate[]
+      try {
+        candidates = await inspectDatasetSource(source)
+      } catch {
+        skipped.push({ sourceIndex, reason: 'Source could not be normalized' })
+        continue
+      }
+      if (!candidates.length) {
+        skipped.push({ sourceIndex, reason: 'Source has no notes.mid' })
+        continue
+      }
+      for (const candidate of candidates) {
+        if (!isValidMidi(candidate.midi)) {
+          skipped.push({ sourceIndex, reason: 'Source has invalid notes.mid' })
+          continue
+        }
+        const notesSha256 = sha256Buffer(candidate.midi)
+        if (seenMidi.has(notesSha256)) {
+          skipped.push({ sourceIndex, reason: 'Duplicate MIDI asset' })
+          continue
+        }
+        const relativePath = path.posix.join('assets', 'sha256', notesSha256, NOTES_MIDI)
+        const assetPath = path.join(stagingPath, ...relativePath.split('/'))
+        await mkdir(path.dirname(assetPath), { recursive: true })
+        await writeFile(assetPath, candidate.midi, { flag: 'wx' })
+        const materialized = await readFile(assetPath)
+        if (sha256Buffer(materialized) !== notesSha256)
+          throw new Error('Catalog asset hash verification failed.')
+        const notesAsset: CatalogAsset = {
+          asset_id: `sha256:${notesSha256}`,
+          sha256: notesSha256,
+          relative_path: relativePath,
+          byte_length: candidate.midi.length,
+          media_type: 'audio/midi'
+        }
+        const record = catalogRecord(candidate, notesAsset, notesSha256) as {
+          rights: { training_use: string; provenance: string; license: string }
+        }
+        record.rights = { training_use: candidate.trainingUse, provenance, license }
+        validateCatalogRecord(record)
+        records.push(record)
+        seenMidi.add(notesSha256)
+      }
+    }
+    const recordsPath = path.join(stagingPath, 'records.jsonl')
+    await writeFile(
+      recordsPath,
+      records.map((record) => JSON.stringify(record)).join('\n') + (records.length ? '\n' : ''),
+      'utf8'
+    )
+    const catalog = {
+      schema_version: 1,
+      format: 'octave-song-source-catalog/v1',
+      catalog_id: catalogId,
+      records: 'records.jsonl',
+      created_by: { product: 'octave', version: options.octaveVersion }
+    }
+    if (!records.length) throw new Error('No valid source records were available for the catalog.')
+    await writeFile(
+      path.join(stagingPath, 'catalog.json'),
+      JSON.stringify(catalog, null, 2) + '\n',
+      'utf8'
+    )
+    await rename(stagingPath, catalogPath)
+  } catch (error) {
+    await rm(stagingPath, { recursive: true, force: true })
+    throw error
+  }
+  return {
+    catalogPath,
+    recordCount: records.length,
+    reviewRequiredCount: records.filter(
+      (record) => (record.rights as { training_use: string }).training_use === 'review_required'
+    ).length,
+    skipped
   }
 }
 

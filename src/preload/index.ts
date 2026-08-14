@@ -35,37 +35,56 @@ const api = {
   getDefaultAutoChartOutputDir: (): Promise<string> =>
     ipcRenderer.invoke('strum:getDefaultOutputFolder'),
 
-  chooseDatasetPackageFolder: (): Promise<Array<{ path: string; name: string }>> =>
-    ipcRenderer.invoke('dataset:choosePackageFolder'),
+  chooseDatasetPackageFolder: (): Promise<
+    Array<{
+      candidateId: string
+      kind: 'octave-library' | 'sng' | 'rb3con'
+      songCount: number
+      metadata: Record<string, string>
+      midiValid: boolean
+      instruments: Record<
+        string,
+        { status: 'present' | 'absent'; difficulties: string[]; trackNames: string[] }
+      >
+      trainingUse: 'allowed' | 'review_required'
+      warnings: Array<{ code: string }>
+    }>
+  > => ipcRenderer.invoke('dataset:choosePackageFolder'),
 
-  chooseDatasetOutputFolder: (): Promise<string | null> =>
-    ipcRenderer.invoke('dataset:chooseOutputFolder'),
+  chooseDatasetCatalogParent: (): Promise<{ parentId: string; name: string } | null> =>
+    ipcRenderer.invoke('dataset:chooseCatalogParent'),
 
   scanDatasetLibrary: (): Promise<
     Array<{
-      path: string
-      name: string
-      artist: string
-      charter?: string
-      datasetOptIn: boolean
+      candidateId: string
+      kind: 'octave-library' | 'sng' | 'rb3con'
+      songCount: number
+      metadata: Record<string, string>
+      midiValid: boolean
+      instruments: Record<
+        string,
+        { status: 'present' | 'absent'; difficulties: string[]; trackNames: string[] }
+      >
+      trainingUse: 'allowed' | 'review_required'
+      warnings: Array<{ code: string }>
       isStrumGenerated: boolean
-      hasNotesMidi: boolean
     }>
   > => ipcRenderer.invoke('dataset:scanLibrary'),
 
-  setDatasetSongOptIn: (songPath: string, optedIn: boolean): Promise<boolean> =>
-    ipcRenderer.invoke('dataset:setSongOptIn', songPath, optedIn),
+  setDatasetSongOptIn: (candidateId: string, optedIn: boolean): Promise<boolean> =>
+    ipcRenderer.invoke('dataset:setSongOptIn', candidateId, optedIn),
 
-  exportTrainingDataset: (options: {
-    packagePaths: string[]
-    librarySongPaths: string[]
-    outputDir: string
-    datasetId: string
+  buildSongSourceCatalog: (options: {
+    candidateIds: string[]
+    parentId: string
+    catalogName: string
+    catalogId: string
     provenance: string
     license: string
   }): Promise<{
-    manifestPath: string
-    exported: Array<{ songId: string }>
+    catalogPath: string
+    recordCount: number
+    reviewRequiredCount: number
     skipped: Array<{ reason: string }>
   }> => ipcRenderer.invoke('dataset:export', options),
 

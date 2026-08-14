@@ -15,7 +15,12 @@ import { packSng } from './sngPacker'
 import { packRb3con } from './conPacker'
 import { importSng } from './import/sngImporter'
 import { importCon } from './import/conImporter'
-import { exportSngTrainingMidi, listDatasetLibrarySongs } from './import/sngTrainingExporter'
+import {
+  buildSongSourceCatalog,
+  listDatasetLibrarySongs,
+  summarizeDatasetSource,
+  type DatasetCatalogSource
+} from './import/sngTrainingExporter'
 import {
   ImportCancelledError,
   PartialImportError,
@@ -76,8 +81,8 @@ app.on('before-quit', () => {
 
 // Track the currently opened project folder for path validation
 let allowedProjectPath: string | null = null
-const approvedDatasetPackagePaths = new Set<string>()
-const approvedDatasetOutputPaths = new Set<string>()
+const datasetSources = new Map<string, DatasetCatalogSource>()
+const datasetCatalogParents = new Map<string, string>()
 
 type UpdaterState = {
   state: 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'not-available' | 'error'
@@ -757,45 +762,68 @@ ipcMain.handle('dataset:choosePackageFolder', async () => {
   if (result.canceled || result.filePaths.length === 0) return []
   try {
     const packagePaths = await findDatasetPackages(result.filePaths[0])
-    for (const packagePath of packagePaths) approvedDatasetPackagePaths.add(resolve(packagePath))
-    return packagePaths.map((packagePath) => ({ path: packagePath, name: basename(packagePath) }))
-  } catch (error) {
-    console.error('Failed to scan dataset package folder:', error)
+    return await Promise.all(
+      packagePaths.map(async (packagePath) => {
+        const source: DatasetCatalogSource = {
+          kind: pathExtname(packagePath) === '.sng' ? 'sng' : 'rb3con',
+          sourcePath: resolve(packagePath)
+        }
+        const candidateId = randomUUID()
+        datasetSources.set(candidateId, source)
+        return { candidateId, ...(await summarizeDatasetSource(source)) }
+      })
+    )
+  } catch {
+    console.error('Dataset package scan failed.')
     return []
   }
 })
 
-ipcMain.handle('dataset:chooseOutputFolder', async () => {
+ipcMain.handle('dataset:chooseCatalogParent', async () => {
   const result = await dialog.showOpenDialog({
-    properties: ['openDirectory', 'createDirectory'],
-    title: 'Select Empty Dataset Export Folder'
+    properties: ['openDirectory'],
+    title: 'Select Parent Directory for New Catalog'
   })
   if (result.canceled || result.filePaths.length === 0) return null
-  const outputPath = resolve(result.filePaths[0])
-  approvedDatasetOutputPaths.add(outputPath)
-  return outputPath
+  const parentId = randomUUID()
+  const parentPath = resolve(result.filePaths[0])
+  datasetCatalogParents.set(parentId, parentPath)
+  return { parentId, name: basename(parentPath) }
 })
 
 ipcMain.handle('dataset:scanLibrary', async () => {
   if (!allowedProjectPath) return []
   try {
-    return await listDatasetLibrarySongs(allowedProjectPath)
-  } catch (error) {
-    console.error('Failed to scan library for dataset curation:', error)
+    const librarySongs = await listDatasetLibrarySongs(allowedProjectPath)
+    return await Promise.all(
+      librarySongs.map(async (song) => {
+        const source: DatasetCatalogSource = { kind: 'octave-library', sourcePath: song.path }
+        const candidateId = randomUUID()
+        datasetSources.set(candidateId, source)
+        return {
+          candidateId,
+          ...(await summarizeDatasetSource(source)),
+          isStrumGenerated: song.isStrumGenerated
+        }
+      })
+    )
+  } catch {
+    console.error('Dataset library scan failed.')
     return []
   }
 })
 
-ipcMain.handle('dataset:setSongOptIn', async (_event, songPath: string, optedIn: boolean) => {
-  if (!isPathAllowed(songPath)) return false
+ipcMain.handle('dataset:setSongOptIn', async (_event, candidateId: string, optedIn: boolean) => {
+  const source = datasetSources.get(candidateId)
+  if (!source || source.kind !== 'octave-library' || !isPathAllowed(source.sourcePath)) return false
   try {
-    const iniPath = join(songPath, 'song.ini')
+    const iniPath = join(source.sourcePath, 'song.ini')
     const metadata = parseIniFile(await readFile(iniPath, 'utf8'))
     metadata.dataset_opt_in = optedIn ? 'true' : 'false'
     await writeFile(iniPath, serializeIniFile(metadata), 'utf8')
     return true
-  } catch (error) {
-    console.error('Failed to update dataset opt-in:', error)
+  } catch {
+    console.error('Dataset opt-in update failed.')
     return false
   }
 })
@@ -805,34 +833,28 @@ ipcMain.handle(
   async (
     _event,
     options: {
-      packagePaths: string[]
-      librarySongPaths: string[]
-      outputDir: string
-      datasetId: string
+      candidateIds: string[]
+      parentId: string
+      catalogName: string
+      catalogId: string
       provenance: string
       license: string
     }
   ) => {
-    const packagePaths = options.packagePaths.map((packagePath) => resolve(packagePath))
-    const librarySongPaths = options.librarySongPaths.map((songPath) => resolve(songPath))
-    const outputDir = resolve(options.outputDir)
-    if (!approvedDatasetOutputPaths.has(outputDir)) {
-      throw new Error('Choose an output folder through the dataset curation dialog.')
+    const parentDir = datasetCatalogParents.get(options.parentId)
+    const sources = options.candidateIds.map((candidateId) => datasetSources.get(candidateId))
+    if (!parentDir) throw new Error('Choose a catalog parent directory through Dataset Curation.')
+    if (sources.some((source) => !source)) {
+      throw new Error('Refresh the curation candidates and try again.')
     }
-    if (!packagePaths.every((packagePath) => approvedDatasetPackagePaths.has(packagePath))) {
-      throw new Error('Choose package folders through the dataset curation dialog.')
-    }
-    if (!librarySongPaths.every(isPathAllowed)) {
-      throw new Error('A library song is outside the open Octave library.')
-    }
-    return await exportSngTrainingMidi({
-      sngPaths: packagePaths.filter((packagePath) => pathExtname(packagePath) === '.sng'),
-      conPaths: packagePaths.filter((packagePath) => pathExtname(packagePath) !== '.sng'),
-      librarySongPaths,
-      outputDir,
-      datasetId: options.datasetId,
+    return await buildSongSourceCatalog({
+      sources: sources as DatasetCatalogSource[],
+      parentDir,
+      catalogName: options.catalogName,
+      catalogId: options.catalogId,
       provenance: options.provenance,
-      license: options.license
+      license: options.license,
+      octaveVersion: app.getVersion()
     })
   }
 )
@@ -1130,7 +1152,15 @@ ipcMain.handle('song:writeIni', async (_event, songPath: string, metadata: Recor
   const iniPath = join(songPath, 'song.ini')
 
   try {
-    const content = serializeIniFile(metadata)
+    // Dataset curation may update consent while the editor has an older in-memory
+    // metadata snapshot. Preserve those durable fields unless replaced explicitly.
+    let persisted: Record<string, string | number> = {}
+    try {
+      persisted = parseIniFile(await readFile(iniPath, 'utf8'))
+    } catch {
+      // A new song can legitimately have no prior song.ini.
+    }
+    const content = serializeIniFile({ ...persisted, ...metadata })
     await writeFile(iniPath, content, 'utf-8')
     return true
   } catch (error) {
