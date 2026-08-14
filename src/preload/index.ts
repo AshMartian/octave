@@ -164,6 +164,147 @@ const api = {
     skipped: Array<{ reason: string }>
   }> => ipcRenderer.invoke('dataset:export', options),
 
+  getTrainingRuntime: (): Promise<{
+    runtimeId: string
+    displayName: string
+    kind: 'bundled_inference' | 'developer_override' | 'managed_checkout' | 'installed_runtime'
+    protocolVersion: string
+    capabilities: string[]
+    pipelineIds: string[]
+    deviceSupport: string[]
+    trainingSetupRequired: boolean
+    dirty: boolean
+    sourceRevision: string | null
+  } | null> => ipcRenderer.invoke('training:runtime'),
+
+  enableDeveloperTrainingRuntime: (): Promise<{
+    runtimeId: string
+    displayName: string
+    kind: 'bundled_inference' | 'developer_override' | 'managed_checkout' | 'installed_runtime'
+    protocolVersion: string
+    capabilities: string[]
+    pipelineIds: string[]
+    deviceSupport: string[]
+    trainingSetupRequired: boolean
+    dirty: boolean
+    sourceRevision: string | null
+  } | null> => ipcRenderer.invoke('training:enableDeveloperRuntime'),
+
+  listTrainingPipelines: (): Promise<
+    Array<{
+      id: string
+      display_name: string
+      kind: string
+      catalog_requirements: {
+        instrument: string
+        difficulties: string[]
+        audio_roles: string[]
+        audio_policy: string
+      }
+      prepare_schema: Record<string, unknown>
+      train_schema: Record<string, unknown>
+      checkpoint_outputs: string[]
+      inference_capability: string | null
+    }>
+  > => ipcRenderer.invoke('training:pipelines'),
+
+  listTrainingArtifacts: (): Promise<{
+    tasks: Array<{
+      taskViewId: string
+      catalogId: string
+      catalogName: string
+      pipelineId: string
+      eligibleCount: number
+      contentHash: string
+      createdAt: string
+    }>
+    runs: Array<{
+      runId: string
+      taskViewId: string
+      pipelineId: string
+      checkpointCount: number
+      deployable: boolean
+      checkpointManifestHash: string
+      createdAt: string
+    }>
+  }> => ipcRenderer.invoke('training:artifacts'),
+
+  inspectTrainingCatalog: (options: {
+    parentId: string
+    catalogName: string
+    pipelineId: string
+  }): Promise<{
+    pipelineId: string
+    eligibleCount: number
+    recordCount: number
+    excluded: Record<string, number>
+    audioPolicy: string
+    estimatedStorageBytes: number
+  }> => ipcRenderer.invoke('training:inspectCatalog', options),
+
+  prepareTrainingDataset: (options: {
+    parentId: string
+    catalogId: string
+    catalogName: string
+    pipelineId: string
+    splitSeed?: number
+  }): Promise<{ jobId: string; taskViewId: string }> =>
+    ipcRenderer.invoke('training:prepare', options),
+
+  startTrainingRun: (options: {
+    taskViewId: string
+    pipelineId: string
+    train: { epochs: number; batchSize: number; device: string; seed: number }
+  }): Promise<{ jobId: string; runId: string }> => ipcRenderer.invoke('training:start', options),
+
+  cancelTrainingJob: (jobId: string): Promise<boolean> =>
+    ipcRenderer.invoke('training:cancel', jobId),
+
+  onTrainingProgress: (
+    callback: (event: {
+      jobId: string
+      sequence: number
+      stage: string
+      progress?: number
+      state?:
+        | 'queued'
+        | 'validating'
+        | 'provisioning'
+        | 'running'
+        | 'cancelling'
+        | 'succeeded'
+        | 'failed'
+        | 'cancelled'
+      code?: string
+      message: string
+      result?: Record<string, unknown>
+    }) => void
+  ): (() => void) => {
+    const listener = (
+      _event: Electron.IpcRendererEvent,
+      progress: {
+        jobId: string
+        sequence: number
+        stage: string
+        progress?: number
+        state?:
+          | 'queued'
+          | 'validating'
+          | 'provisioning'
+          | 'running'
+          | 'cancelling'
+          | 'succeeded'
+          | 'failed'
+          | 'cancelled'
+        code?: string
+        message: string
+        result?: Record<string, unknown>
+      }
+    ): void => callback(progress)
+    ipcRenderer.on('training:progress', listener)
+    return () => ipcRenderer.removeListener('training:progress', listener)
+  },
+
   openLyricsFileDialog: (): Promise<{ filePath: string; content: string } | null> =>
     ipcRenderer.invoke('dialog:openLyricsFile'),
 

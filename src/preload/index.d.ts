@@ -109,6 +109,112 @@ interface ChartEditorAPI {
     recordCount: number
     skipped: Array<{ reason: string }>
   }>
+  getTrainingRuntime: () => Promise<{
+    runtimeId: string
+    displayName: string
+    kind: 'bundled_inference' | 'developer_override' | 'managed_checkout' | 'installed_runtime'
+    protocolVersion: string
+    capabilities: string[]
+    pipelineIds: string[]
+    deviceSupport: string[]
+    trainingSetupRequired: boolean
+    dirty: boolean
+    sourceRevision: string | null
+  } | null>
+  enableDeveloperTrainingRuntime: () => Promise<{
+    runtimeId: string
+    displayName: string
+    kind: 'bundled_inference' | 'developer_override' | 'managed_checkout' | 'installed_runtime'
+    protocolVersion: string
+    capabilities: string[]
+    pipelineIds: string[]
+    deviceSupport: string[]
+    trainingSetupRequired: boolean
+    dirty: boolean
+    sourceRevision: string | null
+  } | null>
+  listTrainingPipelines: () => Promise<
+    Array<{
+      id: string
+      display_name: string
+      kind: string
+      catalog_requirements: {
+        instrument: string
+        difficulties: string[]
+        audio_roles: string[]
+        audio_policy: string
+      }
+      prepare_schema: Record<string, unknown>
+      train_schema: Record<string, unknown>
+      checkpoint_outputs: string[]
+      inference_capability: string | null
+    }>
+  >
+  listTrainingArtifacts: () => Promise<{
+    tasks: Array<{
+      taskViewId: string
+      catalogId: string
+      catalogName: string
+      pipelineId: string
+      eligibleCount: number
+      contentHash: string
+      createdAt: string
+    }>
+    runs: Array<{
+      runId: string
+      taskViewId: string
+      pipelineId: string
+      checkpointCount: number
+      deployable: boolean
+      checkpointManifestHash: string
+      createdAt: string
+    }>
+  }>
+  inspectTrainingCatalog: (options: {
+    parentId: string
+    catalogName: string
+    pipelineId: string
+  }) => Promise<{
+    pipelineId: string
+    eligibleCount: number
+    recordCount: number
+    excluded: Record<string, number>
+    audioPolicy: string
+    estimatedStorageBytes: number
+  }>
+  prepareTrainingDataset: (options: {
+    parentId: string
+    catalogId: string
+    catalogName: string
+    pipelineId: string
+    splitSeed?: number
+  }) => Promise<{ jobId: string; taskViewId: string }>
+  startTrainingRun: (options: {
+    taskViewId: string
+    pipelineId: string
+    train: { epochs: number; batchSize: number; device: string; seed: number }
+  }) => Promise<{ jobId: string; runId: string }>
+  cancelTrainingJob: (jobId: string) => Promise<boolean>
+  onTrainingProgress: (
+    callback: (event: {
+      jobId: string
+      sequence: number
+      stage: string
+      progress?: number
+      state?:
+        | 'queued'
+        | 'validating'
+        | 'provisioning'
+        | 'running'
+        | 'cancelling'
+        | 'succeeded'
+        | 'failed'
+        | 'cancelled'
+      code?: string
+      message: string
+      result?: Record<string, unknown>
+    }) => void
+  ) => () => void
   openLyricsFileDialog: () => Promise<{ filePath: string; content: string } | null>
 
   // Song APIs

@@ -45,6 +45,73 @@ type PackageGroup = {
   candidates: PackageCandidate[]
 }
 
+type TrainingRuntime = {
+  runtimeId: string
+  displayName: string
+  kind: 'bundled_inference' | 'developer_override' | 'managed_checkout' | 'installed_runtime'
+  protocolVersion: string
+  capabilities: string[]
+  pipelineIds: string[]
+  deviceSupport: string[]
+  trainingSetupRequired: boolean
+  dirty: boolean
+  sourceRevision: string | null
+}
+
+type TrainingPipeline = {
+  id: string
+  display_name: string
+  kind: string
+  catalog_requirements: {
+    instrument: string
+    difficulties: string[]
+    audio_roles: string[]
+    audio_policy: string
+  }
+  prepare_schema: Record<string, unknown>
+  train_schema: Record<string, unknown>
+  checkpoint_outputs: string[]
+  inference_capability: string | null
+}
+
+type TrainingTask = {
+  taskViewId: string
+  catalogId: string
+  catalogName: string
+  pipelineId: string
+  eligibleCount: number
+  contentHash: string
+  createdAt: string
+}
+
+type TrainingRun = {
+  runId: string
+  taskViewId: string
+  pipelineId: string
+  checkpointCount: number
+  deployable: boolean
+  checkpointManifestHash: string
+  createdAt: string
+}
+
+type TrainingJob = {
+  jobId: string
+  sequence: number
+  stage: string
+  progress?: number
+  state?:
+    | 'queued'
+    | 'validating'
+    | 'provisioning'
+    | 'running'
+    | 'cancelling'
+    | 'succeeded'
+    | 'failed'
+    | 'cancelled'
+  code?: string
+  message: string
+}
+
 const CATALOG_PARENT_STORAGE_KEY = 'octave.datasetCatalogParent'
 const TRAINING_LEARN_SEEN_STORAGE_KEY = 'octave.trainingLearnSeen'
 
@@ -61,7 +128,7 @@ const TRAINING_STEP_TAGLINES = {
   curate: 'Select approved songs and sources for your STRUM catalog.',
   prepare: 'Create a STRUM task view from the approved catalog assets.',
   train: 'Run STRUM from the prepared catalog and follow progress in the background.',
-  deploy: 'Choose a local checkpoint to use as OCTAVE’s default auto-chart profile.'
+  deploy: 'Inspect local experiment checkpoints before deployment is allowed.'
 } as const satisfies Record<TrainingStep, string>
 
 const TRAINING_STEP_DETAILS = [
@@ -230,6 +297,26 @@ export function TrainingModal({
     records: number
     skipped: number
   } | null>(null)
+  const [trainingRuntime, setTrainingRuntime] = useState<TrainingRuntime | null>(null)
+  const [trainingPipelines, setTrainingPipelines] = useState<TrainingPipeline[]>([])
+  const [selectedPipelineId, setSelectedPipelineId] = useState('')
+  const [catalogInspection, setCatalogInspection] = useState<{
+    pipelineId: string
+    eligibleCount: number
+    recordCount: number
+    excluded: Record<string, number>
+    audioPolicy: string
+  } | null>(null)
+  const [trainingTasks, setTrainingTasks] = useState<TrainingTask[]>([])
+  const [trainingRuns, setTrainingRuns] = useState<TrainingRun[]>([])
+  const [selectedTaskViewId, setSelectedTaskViewId] = useState('')
+  const [trainingJob, setTrainingJob] = useState<TrainingJob | null>(null)
+  const [trainConfig, setTrainConfig] = useState({
+    epochs: 20,
+    batchSize: 16,
+    device: 'auto',
+    seed: 20260814
+  })
 
   const refreshLibrary = useCallback(async (): Promise<void> => {
     setLoading(true)
@@ -322,6 +409,76 @@ export function TrainingModal({
     }
   }, [])
 
+  const refreshTrainingState = useCallback(async (): Promise<void> => {
+    const [runtime, pipelines, artifacts] = await Promise.all([
+      window.api.getTrainingRuntime(),
+      window.api.listTrainingPipelines(),
+      window.api.listTrainingArtifacts()
+    ])
+    setTrainingRuntime(runtime)
+    setTrainingPipelines(pipelines)
+    setSelectedPipelineId((current) =>
+      pipelines.some((pipeline) => pipeline.id === current) ? current : (pipelines[0]?.id ?? '')
+    )
+    setTrainingTasks(artifacts.tasks)
+    setTrainingRuns(artifacts.runs)
+    setSelectedTaskViewId((current) =>
+      artifacts.tasks.some((task) => task.taskViewId === current)
+        ? current
+        : (artifacts.tasks[0]?.taskViewId ?? '')
+    )
+  }, [])
+
+  useEffect(() => {
+    if (isOpen) void refreshTrainingState()
+  }, [isOpen, refreshTrainingState])
+
+  useEffect(() => {
+    const unsubscribe = window.api.onTrainingProgress((event) => {
+      setTrainingJob({
+        jobId: event.jobId,
+        sequence: event.sequence,
+        stage: event.stage,
+        progress: event.progress,
+        state: event.state,
+        code: event.code,
+        message: event.message
+      })
+      if (event.state === 'succeeded') void refreshTrainingState()
+      if (event.state === 'failed') setError(event.message)
+    })
+    return unsubscribe
+  }, [refreshTrainingState])
+
+  useEffect(() => {
+    if (
+      activeStep !== 'prepare' ||
+      !catalogParent ||
+      !selectedCatalog ||
+      !selectedPipelineId ||
+      !trainingRuntime?.capabilities.includes('training')
+    ) {
+      setCatalogInspection(null)
+      return
+    }
+    let current = true
+    void window.api
+      .inspectTrainingCatalog({
+        parentId: catalogParent.parentId,
+        catalogName: selectedCatalog.catalogName,
+        pipelineId: selectedPipelineId
+      })
+      .then((inspection) => {
+        if (current) setCatalogInspection(inspection)
+      })
+      .catch(() => {
+        if (current) setCatalogInspection(null)
+      })
+    return () => {
+      current = false
+    }
+  }, [activeStep, catalogParent, selectedCatalog, selectedPipelineId, trainingRuntime])
+
   useEffect(() => {
     if (scanningPackages) {
       onActivityChange({
@@ -341,8 +498,17 @@ export function TrainingModal({
       })
       return
     }
+    if (trainingJob && !['succeeded', 'failed', 'cancelled'].includes(trainingJob.state ?? '')) {
+      onActivityChange({
+        step: trainingJob.stage === 'training' ? 'train' : 'prepare',
+        phase: trainingJob.message,
+        completed: Math.round((trainingJob.progress ?? 0) * 100),
+        total: 100
+      })
+      return
+    }
     onActivityChange(null)
-  }, [exporting, onActivityChange, saveProgress, scanProgress, scanningPackages])
+  }, [exporting, onActivityChange, saveProgress, scanProgress, scanningPackages, trainingJob])
 
   const allowedLibrarySongs = useMemo(
     () => songs.filter((song) => song.trainingUse === 'allowed' && song.midiValid),
@@ -567,6 +733,67 @@ export function TrainingModal({
     }
   }
 
+  const enableDeveloperRuntime = async (): Promise<void> => {
+    setError(null)
+    const runtime = await window.api.enableDeveloperTrainingRuntime()
+    if (!runtime?.capabilities.includes('training')) {
+      setError('No compatible local STRUM training runtime was found.')
+      return
+    }
+    await refreshTrainingState()
+  }
+
+  const prepareDataset = async (): Promise<void> => {
+    if (!catalogParent || !selectedCatalog || !selectedPipelineId) return
+    setError(null)
+    try {
+      const started = await window.api.prepareTrainingDataset({
+        parentId: catalogParent.parentId,
+        catalogId: selectedCatalog.catalogId,
+        catalogName: selectedCatalog.catalogName,
+        pipelineId: selectedPipelineId,
+        splitSeed: trainConfig.seed
+      })
+      setTrainingJob({
+        jobId: started.jobId,
+        sequence: 0,
+        stage: 'queued',
+        state: 'queued',
+        progress: 0,
+        message: 'Preparing the catalog locally.'
+      })
+    } catch {
+      setError('STRUM could not start catalog preparation.')
+    }
+  }
+
+  const startTraining = async (): Promise<void> => {
+    if (!selectedTaskViewId || !selectedPipelineId) return
+    setError(null)
+    try {
+      const started = await window.api.startTrainingRun({
+        taskViewId: selectedTaskViewId,
+        pipelineId: selectedPipelineId,
+        train: trainConfig
+      })
+      setTrainingJob({
+        jobId: started.jobId,
+        sequence: 0,
+        stage: 'queued',
+        state: 'queued',
+        progress: 0,
+        message: 'Queuing STRUM training locally.'
+      })
+    } catch {
+      setError('STRUM could not start this training run.')
+    }
+  }
+
+  const cancelActiveTrainingJob = async (): Promise<void> => {
+    if (!trainingJob) return
+    await window.api.cancelTrainingJob(trainingJob.jobId)
+  }
+
   const renderCandidate = (candidate: SourceCandidate, selectable: boolean): React.JSX.Element => (
     <label className={!candidate.midiValid ? 'disabled' : ''} key={candidate.candidateId}>
       <input
@@ -699,6 +926,22 @@ export function TrainingModal({
                   Training turns a catalog of approved songs into local STRUM checkpoints. OCTAVE
                   keeps the catalog, task views, and eventual profiles as local inputs and outputs.
                 </p>
+              </div>
+              <div className="training-learn-runtime">
+                <span
+                  className={`training-runtime-dot ${trainingRuntime?.capabilities.includes('training') ? 'ready' : ''}`}
+                  aria-hidden="true"
+                />
+                <div>
+                  <strong>
+                    {trainingRuntime?.displayName ?? 'Checking your local STRUM runtime…'}
+                  </strong>
+                  <small>
+                    {trainingRuntime
+                      ? `${trainingRuntime.capabilities.includes('training') ? 'Training available' : 'Inference only'} · ${trainingRuntime.deviceSupport.join(', ').toUpperCase()} · all artifacts remain local`
+                      : 'OCTAVE checks the runtime before it enables any training step.'}
+                  </small>
+                </div>
               </div>
               <ol className="training-learn-path">
                 {TRAINING_STEP_DETAILS.map((detail, index) => (
@@ -945,61 +1188,306 @@ export function TrainingModal({
             </>
           ) : activeStep === 'prepare' ? (
             <section className="training-step-panel">
-              <h3>Prepare</h3>
-              <p>
-                OCTAVE will create a STRUM task view from the selected catalog without reopening
-                original packages. Catalog assets and rights remain the only inputs.
-              </p>
-              {selectedCatalog ? (
-                <dl>
-                  <div>
-                    <dt>Catalog</dt>
-                    <dd>{selectedCatalog.catalogName}</dd>
-                  </div>
-                  <div>
-                    <dt>Records</dt>
-                    <dd>{selectedCatalog.recordCount}</dd>
-                  </div>
-                </dl>
-              ) : (
-                <p>Save or select a catalog in Curate before preparing a training view.</p>
+              <div className="training-panel-heading">
+                <div>
+                  <h3>Prepare a task view</h3>
+                  <p>
+                    STRUM revalidates approved catalog assets, assigns song-disjoint splits, and
+                    creates an immutable Guitar task view. Original packages stay out of the run.
+                  </p>
+                </div>
+                {trainingJob &&
+                  !['succeeded', 'failed', 'cancelled'].includes(trainingJob.state ?? '') && (
+                    <button
+                      className="dataset-secondary"
+                      onClick={() => void cancelActiveTrainingJob()}
+                    >
+                      Cancel job
+                    </button>
+                  )}
+              </div>
+              <div className="training-runtime-card">
+                <span
+                  className={`training-runtime-dot ${trainingRuntime?.capabilities.includes('training') ? 'ready' : ''}`}
+                  aria-hidden="true"
+                />
+                <div>
+                  <strong>{trainingRuntime?.displayName ?? 'Checking STRUM runtime…'}</strong>
+                  <small>
+                    {trainingRuntime
+                      ? `${trainingRuntime.kind.replace('_', ' ')} · protocol ${trainingRuntime.protocolVersion}${trainingRuntime.sourceRevision ? ` · ${trainingRuntime.sourceRevision}` : ''}`
+                      : 'Validating the local runtime.'}
+                  </small>
+                </div>
+                {trainingRuntime?.trainingSetupRequired && (
+                  <button
+                    className="dataset-secondary"
+                    onClick={() => void enableDeveloperRuntime()}
+                  >
+                    Enable developer override
+                  </button>
+                )}
+              </div>
+              {trainingRuntime?.kind === 'developer_override' && (
+                <p className="training-inline-note training-runtime-warning">
+                  Developer override: OCTAVE will run this local STRUM checkout. Use it only for a
+                  checkout you control; release installs do not enable it automatically.
+                </p>
               )}
-              <button className="dataset-primary" onClick={() => setActiveStep('train')}>
-                Continue to Train
-              </button>
+              {!selectedCatalog ? (
+                <p className="dataset-message warning">
+                  Select a catalog in Curate before preparing a task view.
+                </p>
+              ) : !trainingRuntime?.capabilities.includes('training') ? (
+                <p className="dataset-message warning">
+                  This runtime is inference-only. Training requires an explicitly enabled developer
+                  override or a future verified STRUM training runtime.
+                </p>
+              ) : (
+                <>
+                  <label className="training-control">
+                    Pipeline
+                    <select
+                      value={selectedPipelineId}
+                      onChange={(event) => setSelectedPipelineId(event.target.value)}
+                    >
+                      {trainingPipelines.map((pipeline) => (
+                        <option key={pipeline.id} value={pipeline.id}>
+                          {pipeline.display_name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <div className="training-inspection-grid">
+                    <div>
+                      <span>Catalog</span>
+                      <strong>{selectedCatalog.catalogName}</strong>
+                    </div>
+                    <div>
+                      <span>Eligible Guitar songs</span>
+                      <strong>{catalogInspection?.eligibleCount ?? 'Checking…'}</strong>
+                    </div>
+                    <div>
+                      <span>Audio policy</span>
+                      <strong>{catalogInspection?.audioPolicy ?? 'Prefer Guitar, then mix'}</strong>
+                    </div>
+                    <div>
+                      <span>Split</span>
+                      <strong>Song-disjoint · seed {trainConfig.seed}</strong>
+                    </div>
+                  </div>
+                  {catalogInspection &&
+                    Object.values(catalogInspection.excluded).some((count) => count > 0) && (
+                      <p className="training-inline-note">
+                        {Object.values(catalogInspection.excluded).reduce(
+                          (sum, count) => sum + count,
+                          0
+                        )}{' '}
+                        records are excluded because they are missing Guitar Expert labels, approved
+                        audio, or a verified asset.
+                      </p>
+                    )}
+                  <button
+                    className="dataset-primary"
+                    onClick={() => void prepareDataset()}
+                    disabled={
+                      !catalogInspection?.eligibleCount ||
+                      Boolean(
+                        trainingJob &&
+                        !['succeeded', 'failed', 'cancelled'].includes(trainingJob.state ?? '')
+                      )
+                    }
+                  >
+                    Prepare Guitar Dataset <span aria-hidden="true">→</span>
+                  </button>
+                </>
+              )}
+              {trainingTasks.length > 0 && (
+                <div className="training-artifact-list">
+                  <h4>Prepared task views</h4>
+                  {trainingTasks.map((task) => (
+                    <button
+                      className={selectedTaskViewId === task.taskViewId ? 'selected' : ''}
+                      key={task.taskViewId}
+                      onClick={() => setSelectedTaskViewId(task.taskViewId)}
+                    >
+                      <span>
+                        <strong>{task.catalogName}</strong>
+                        <small>{task.eligibleCount} Guitar records · immutable task view</small>
+                      </span>
+                      <span aria-hidden="true">
+                        {selectedTaskViewId === task.taskViewId ? '✓' : '○'}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              )}
             </section>
           ) : activeStep === 'train' ? (
             <section className="training-step-panel">
-              <h3>Train</h3>
-              <p>
-                Training runs will use the prepared catalog view and record only catalog IDs and
-                hashes. STRUM run configuration will be added here next.
-              </p>
-              <button className="dataset-primary" onClick={() => setActiveStep('deploy')}>
-                Review deployment
-              </button>
+              <div className="training-panel-heading">
+                <div>
+                  <h3>Train Guitar locally</h3>
+                  <p>
+                    A fresh two-stage run trains onset and fret components from the selected task
+                    view. Metrics, task identity, configuration, and checkpoint hashes are recorded
+                    locally.
+                  </p>
+                </div>
+                {trainingJob &&
+                  !['succeeded', 'failed', 'cancelled'].includes(trainingJob.state ?? '') && (
+                    <button
+                      className="dataset-secondary"
+                      onClick={() => void cancelActiveTrainingJob()}
+                    >
+                      Cancel job
+                    </button>
+                  )}
+              </div>
+              {trainingTasks.length === 0 ? (
+                <p className="dataset-message warning">
+                  Prepare a Guitar task view before starting training.
+                </p>
+              ) : (
+                <>
+                  <label className="training-control">
+                    Prepared task view
+                    <select
+                      value={selectedTaskViewId}
+                      onChange={(event) => setSelectedTaskViewId(event.target.value)}
+                    >
+                      {trainingTasks.map((task) => (
+                        <option key={task.taskViewId} value={task.taskViewId}>
+                          {task.catalogName} · {task.eligibleCount} Guitar songs
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <div className="training-config-grid">
+                    <label>
+                      Epochs
+                      <input
+                        type="number"
+                        min="1"
+                        max="500"
+                        value={trainConfig.epochs}
+                        onChange={(event) =>
+                          setTrainConfig((current) => ({
+                            ...current,
+                            epochs: Number(event.target.value) || 1
+                          }))
+                        }
+                      />
+                    </label>
+                    <label>
+                      Batch size
+                      <input
+                        type="number"
+                        min="1"
+                        max="256"
+                        value={trainConfig.batchSize}
+                        onChange={(event) =>
+                          setTrainConfig((current) => ({
+                            ...current,
+                            batchSize: Number(event.target.value) || 1
+                          }))
+                        }
+                      />
+                    </label>
+                    <label>
+                      Device
+                      <select
+                        value={trainConfig.device}
+                        onChange={(event) =>
+                          setTrainConfig((current) => ({ ...current, device: event.target.value }))
+                        }
+                      >
+                        <option value="auto">Auto</option>
+                        <option value="cuda">CUDA</option>
+                        <option value="mps">Apple Silicon</option>
+                        <option value="cpu">CPU</option>
+                      </select>
+                    </label>
+                    <label>
+                      Seed
+                      <input
+                        type="number"
+                        value={trainConfig.seed}
+                        onChange={(event) =>
+                          setTrainConfig((current) => ({
+                            ...current,
+                            seed: Number(event.target.value) || 1
+                          }))
+                        }
+                      />
+                    </label>
+                  </div>
+                  <p className="training-inline-note">
+                    Runs are local and resumability is intentionally disabled until STRUM validates
+                    parent checkpoint compatibility.
+                  </p>
+                  <button
+                    className="dataset-primary"
+                    onClick={() => void startTraining()}
+                    disabled={Boolean(
+                      trainingJob &&
+                      !['succeeded', 'failed', 'cancelled'].includes(trainingJob.state ?? '')
+                    )}
+                  >
+                    Start local Guitar run <span aria-hidden="true">⚡</span>
+                  </button>
+                </>
+              )}
+              {trainingRuns.length > 0 && (
+                <div className="training-artifact-list">
+                  <h4>Recent runs</h4>
+                  {trainingRuns.map((run) => (
+                    <div key={run.runId}>
+                      <span>
+                        <strong>{run.pipelineId}</strong>
+                        <small>
+                          {run.checkpointCount} required components ·{' '}
+                          {run.deployable ? 'deployment-ready' : 'experiment only'}
+                        </small>
+                      </span>
+                      <span
+                        className={
+                          run.deployable ? 'training-status-ready' : 'training-status-neutral'
+                        }
+                      >
+                        {run.deployable ? 'Ready' : 'Review'}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </section>
           ) : (
             <section className="training-step-panel training-deploy-panel">
-              <h3>Deploy</h3>
+              <h3>Deploy a validated profile</h3>
               <p>
-                Choose a reviewed STRUM checkpoint and save it as a local OCTAVE auto-chart profile.
-                Saving will make that profile the default in Auto Chart settings.
+                OCTAVE only offers checkpoint bundles that STRUM has inspected, hash-validated, and
+                declared compatible with the selected local Auto Chart runtime. The shipped profile
+                remains the fallback.
               </p>
-              <dl>
-                <div>
-                  <dt>Catalog</dt>
-                  <dd>{selectedCatalog?.catalogName ?? 'Select a catalog first'}</dd>
-                </div>
-                <div>
-                  <dt>Checkpoint</dt>
-                  <dd>Checkpoint selection coming next</dd>
-                </div>
-                <div>
-                  <dt>Profile</dt>
-                  <dd>Local auto-chart default</dd>
-                </div>
-              </dl>
+              {trainingRuns.length === 0 ? (
+                <p className="dataset-message warning">
+                  A completed training run is required before deployment can be evaluated.
+                </p>
+              ) : trainingRuns.some((run) => run.deployable) ? (
+                <p className="dataset-message success">
+                  A compatible checkpoint bundle is available for local profile validation.
+                </p>
+              ) : (
+                <aside className="training-deploy-blocked">
+                  <strong>Deployment safely blocked</strong>
+                  <p>
+                    The current Guitar compatibility adapter produces experiment checkpoints, not a
+                    validated OCTAVE Auto Chart model bundle. They remain available for local
+                    evaluation and are never selected automatically.
+                  </p>
+                </aside>
+              )}
               <button className="dataset-primary" disabled>
                 Save as Auto Chart default
               </button>
@@ -1032,7 +1520,12 @@ export function TrainingModal({
             </>
           ) : (
             <>
-              <span>Visual mock — this step will support background jobs when configured.</span>
+              <span>
+                {trainingJob &&
+                !['succeeded', 'failed', 'cancelled'].includes(trainingJob.state ?? '')
+                  ? `${trainingJob.message}${typeof trainingJob.progress === 'number' ? ` · ${Math.round(trainingJob.progress * 100)}%` : ''}`
+                  : 'STRUM jobs continue locally when this window is closed.'}
+              </span>
               <button className="dataset-primary" onClick={() => setActiveStep('curate')}>
                 Back to Curate
               </button>
