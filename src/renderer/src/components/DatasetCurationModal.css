@@ -101,7 +101,7 @@
 .training-step-connector {
   height: 3px;
   width: 100%;
-  margin-top: 29px;
+  margin-top: 32px;
   background: color-mix(in srgb, var(--text-secondary) 26%, transparent);
   border-radius: 999px;
 }
@@ -443,7 +443,7 @@
     padding-inline: 4px;
   }
   .training-step-connector {
-    margin-top: 29px;
+    margin-top: 32px;
   }
   .dataset-details,
   .dataset-editor-fields {
