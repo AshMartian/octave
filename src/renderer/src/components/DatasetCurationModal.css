@@ -19,7 +19,17 @@
   border-radius: 14px;
   box-shadow: var(--shadow-lg);
 }
-.dataset-curation-modal > header,
+.dataset-curation-modal > header {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: auto auto;
+  align-items: center;
+  column-gap: 16px;
+  row-gap: 4px;
+  padding: 16px 20px 12px;
+  border-bottom: 1px solid var(--border-color);
+}
 .dataset-curation-modal > footer {
   display: flex;
   justify-content: space-between;
@@ -35,6 +45,45 @@
   padding: 20px max(46px, 9%);
   background: color-mix(in srgb, var(--bg-tertiary) 72%, var(--bg-secondary));
   border-bottom: 1px solid var(--border-color);
+}
+.training-header .training-steps {
+  position: absolute;
+  top: 14px;
+  left: 50%;
+  width: min(340px, calc(100% - 360px));
+  padding: 0;
+  background: transparent;
+  border: 0;
+  transform: translateX(-50%);
+}
+.training-header .training-steps button {
+  grid-template-rows: 34px 14px;
+  gap: 4px;
+  min-height: 52px;
+}
+.training-header .training-steps button::after {
+  top: 16px;
+  left: calc(50% + 17px);
+  width: calc(100% - 34px);
+}
+.training-header .training-step-orb {
+  width: 34px;
+  height: 34px;
+}
+.training-header .training-step-orb svg {
+  width: 16px;
+  height: 16px;
+}
+.training-header .training-step-label {
+  font-size: 10px;
+}
+.training-header .dataset-close {
+  grid-column: 2;
+  grid-row: 1;
+}
+.training-tagline {
+  grid-column: 1 / -1;
+  grid-row: 2;
 }
 .dataset-curation-modal .training-steps button {
   position: relative;
@@ -445,6 +494,16 @@
 }
 .training-step-panel dt {
   color: var(--text-secondary);
+}
+@media (max-width: 760px) {
+  .training-header .training-steps {
+    position: static;
+    grid-column: 1 / -1;
+    grid-row: 3;
+    width: 100%;
+    margin-top: 8px;
+    transform: none;
+  }
 }
 @media (max-width: 620px) {
   .training-steps {
