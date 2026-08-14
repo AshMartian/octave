@@ -23,11 +23,10 @@
   position: relative;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
-  grid-template-rows: auto auto;
   align-items: center;
   column-gap: 16px;
-  row-gap: 4px;
-  padding: 16px 20px 12px;
+  min-height: 72px;
+  padding: 16px 20px;
   border-bottom: 1px solid var(--border-color);
 }
 .dataset-curation-modal > footer {
@@ -48,7 +47,7 @@
 }
 .training-header .training-steps {
   position: absolute;
-  top: 14px;
+  top: 19px;
   left: 50%;
   width: min(480px, calc(100% - 360px));
   padding: 0;
@@ -57,17 +56,17 @@
   transform: translateX(-50%);
 }
 .dataset-curation-modal .training-header .training-steps button {
-  grid-template-rows: 14px 34px;
+  grid-template-rows: 34px 14px;
   gap: 2px;
   min-height: 52px;
 }
 .dataset-curation-modal .training-header .training-steps button::after {
-  top: 32px;
+  top: 16px;
   left: calc(50% + 17px);
   width: calc(100% - 34px);
 }
 .training-header .training-step-orb {
-  grid-row: 2;
+  grid-row: 1;
   width: 34px;
   height: 34px;
 }
@@ -76,16 +75,12 @@
   height: 16px;
 }
 .training-header .training-step-label {
-  grid-row: 1;
+  grid-row: 2;
   font-size: 10px;
 }
 .training-header .dataset-close {
   grid-column: 2;
   grid-row: 1;
-}
-.training-tagline {
-  grid-column: 1 / -1;
-  grid-row: 2;
 }
 .dataset-curation-modal .training-steps button {
   position: relative;
@@ -212,6 +207,11 @@
   color: var(--text-secondary);
   font-size: 12px;
   line-height: 1.45;
+}
+.dataset-curation-modal main .training-step-summary {
+  margin: 0 0 16px;
+  color: var(--text-secondary);
+  font-size: 13px;
 }
 .dataset-curation-modal main {
   overflow-y: auto;
@@ -501,7 +501,7 @@
   .training-header .training-steps {
     position: static;
     grid-column: 1 / -1;
-    grid-row: 3;
+    grid-row: 2;
     width: 100%;
     margin-top: 8px;
     transform: none;

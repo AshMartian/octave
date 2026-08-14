@@ -45,6 +45,12 @@ type PackageGroup = {
 
 const CATALOG_PARENT_STORAGE_KEY = 'octave.datasetCatalogParent'
 
+const TRAINING_STEP_TAGLINES = {
+  curate: 'Select approved songs and sources for your STRUM catalog.',
+  prepare: 'Create a STRUM task view from the approved catalog assets.',
+  train: 'Run STRUM from the prepared catalog and follow progress in the background.'
+} as const satisfies Record<TrainingStep, string>
+
 function candidateLabel(candidate: SourceCandidate): string {
   const artist = candidate.metadata.artist
   const name = candidate.metadata.name
@@ -529,11 +535,9 @@ export function TrainingModal({
           <button className="dataset-close" onClick={onClose} aria-label="Close">
             ×
           </button>
-          <p className="training-tagline">
-            Curate approved sources, prepare a training view, then run STRUM.
-          </p>
         </header>
         <main>
+          <p className="training-step-summary">{TRAINING_STEP_TAGLINES[activeStep]}</p>
           {error && <p className="dataset-message error">{error}</p>}
           {result && (
             <p className="dataset-message success">
