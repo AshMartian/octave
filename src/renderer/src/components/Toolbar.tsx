@@ -949,9 +949,11 @@ export function Toolbar(): React.JSX.Element {
           }
         >
           <span className="toolbar-icon">🧪</span>
+          <span className="toolbar-label">Train</span>
           {trainingActivity && (
             <span
               className="toolbar-training-status"
+              aria-hidden="true"
               style={{
                 background: `conic-gradient(var(--accent-color) ${
                   trainingActivity.total
@@ -961,7 +963,6 @@ export function Toolbar(): React.JSX.Element {
               }}
             />
           )}
-          <span className="toolbar-label">Train</span>
         </button>
       </div>
 

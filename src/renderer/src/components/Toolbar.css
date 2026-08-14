@@ -939,9 +939,9 @@
   font-weight: 500;
 }
 .toolbar-training-status {
-  width: 12px;
-  height: 12px;
-  margin-left: -5px;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
   border-radius: 50%;
-  box-shadow: inset 0 0 0 3px var(--bg-primary);
+  box-shadow: inset 0 0 0 4px var(--bg-primary);
 }
