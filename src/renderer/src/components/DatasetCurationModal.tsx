@@ -496,20 +496,26 @@ export function TrainingModal({
     setCatalogId(`${selectedCatalog.catalogId}-revision`)
   }
 
-  const buildCatalog = async (): Promise<void> => {
+  const buildCatalog = async (catalogToUpdate?: ExistingCatalog): Promise<void> => {
+    const targetCatalog = catalogToUpdate ?? selectedCatalog
+    const mode = catalogToUpdate ? 'update' : saveMode
+    const effectiveCatalogName = catalogToUpdate?.catalogName ?? catalogName.trim()
+    const effectiveCatalogId = catalogToUpdate?.catalogId ?? catalogId.trim()
+    const effectiveProvenance = provenance.trim() || catalogToUpdate?.provenance || ''
+    const effectiveLicense = license.trim() || catalogToUpdate?.license || ''
     if (
       !catalogParent ||
-      !catalogName.trim() ||
-      !catalogId.trim() ||
-      !provenance.trim() ||
-      !license.trim()
+      !effectiveCatalogName ||
+      !effectiveCatalogId ||
+      !effectiveProvenance ||
+      !effectiveLicense
     ) {
       setError(
         'Catalog ID, catalog name, provenance, license, and a parent directory are required.'
       )
       return
     }
-    if ((saveMode === 'update' || saveMode === 'clone') && !selectedCatalog) {
+    if ((mode === 'update' || mode === 'clone') && !targetCatalog) {
       setError('Select an existing catalog to update or clone.')
       return
     }
@@ -529,17 +535,17 @@ export function TrainingModal({
       const response = await window.api.buildSongSourceCatalog({
         candidateIds,
         parentId: catalogParent.parentId,
-        catalogName: catalogName.trim(),
-        catalogId: catalogId.trim(),
-        provenance: provenance.trim(),
-        license: license.trim(),
-        mode: saveMode,
-        sourceCatalogName: selectedCatalog?.catalogName
+        catalogName: effectiveCatalogName,
+        catalogId: effectiveCatalogId,
+        provenance: effectiveProvenance,
+        license: effectiveLicense,
+        mode,
+        sourceCatalogName: targetCatalog?.catalogName
       })
       const refreshedCatalogs = await window.api.listDatasetCatalogs(catalogParent.parentId)
       setExistingCatalogs(refreshedCatalogs)
       const savedCatalog = refreshedCatalogs.find(
-        (catalog) => catalog.catalogName === catalogName.trim()
+        (catalog) => catalog.catalogName === effectiveCatalogName
       )
       if (!savedCatalog) {
         throw new Error('Catalog build completed without publishing the requested catalog.')
@@ -740,6 +746,16 @@ export function TrainingModal({
                     <button onClick={startNewCatalog} disabled={exporting}>
                       <span aria-hidden="true">＋</span> New catalog
                     </button>
+                    {saveMode === 'create' && (
+                      <button onClick={() => void buildCatalog()} disabled={exporting}>
+                        <span aria-hidden="true">↗</span> Create catalog
+                      </button>
+                    )}
+                    {saveMode === 'clone' && (
+                      <button onClick={() => void buildCatalog()} disabled={exporting}>
+                        <span aria-hidden="true">⎇</span> Create revision
+                      </button>
+                    )}
                     {selectedCatalog && (
                       <button onClick={cloneCatalogRevision} disabled={exporting}>
                         <span aria-hidden="true">⎇</span> Clone as revision
@@ -767,7 +783,11 @@ export function TrainingModal({
                         {isSelected && saveMode === 'update' && (
                           <button
                             className="dataset-catalog-update"
-                            onClick={() => void buildCatalog()}
+                            onClick={(event) => {
+                              event.stopPropagation()
+                              chooseExistingCatalog(catalog)
+                              void buildCatalog(catalog)
+                            }}
                             disabled={exporting}
                           >
                             {exporting ? 'Updating…' : 'Update'}
