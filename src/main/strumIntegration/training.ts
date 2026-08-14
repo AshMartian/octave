@@ -1,8 +1,8 @@
 import { app, BrowserWindow, dialog } from 'electron'
 import { execFile, spawn, type ChildProcess } from 'child_process'
-import { randomUUID } from 'crypto'
-import { existsSync } from 'fs'
-import { mkdir, readFile, unlink, writeFile } from 'fs/promises'
+import { createHash, randomUUID } from 'crypto'
+import { createReadStream, existsSync } from 'fs'
+import { mkdir, readFile, stat, unlink, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { resolvePythonCommand } from './runner'
 import type { AutoChartRunOptions, AutoChartRunResult } from './types'
@@ -113,6 +113,17 @@ export type TrainingJobEvent = {
 type RuntimeSettings = {
   developerSourceRoot?: string
   installedWorkerPath?: string
+  installedRuntimeLock?: InstalledRuntimeLock
+}
+
+type InstalledRuntimeLock = {
+  workerSha256: string
+  workerByteLength: number
+  runtimeId: string
+  protocolVersion: string
+  capabilities: string[]
+  sourceRevision: string | null
+  validatedAt: string
 }
 
 type WorkerInvocation = {
@@ -224,30 +235,81 @@ function findDetectedDeveloperRoot(): string | null {
   )
 }
 
-async function workerEnvironment(): Promise<NodeJS.ProcessEnv> {
-  const settings = await readRuntimeSettings()
+async function workerEnvironment(settings?: RuntimeSettings): Promise<NodeJS.ProcessEnv> {
+  const runtimeSettings = settings ?? (await readRuntimeSettings())
   const controlRoot = join(trainingRoot(), 'control')
   await mkdir(controlRoot, { recursive: true })
   return {
     ...process.env,
     PYTHONUTF8: '1',
     OCTAVE_STRUM_TRAINING_CONTROL_ROOT: controlRoot,
-    ...(settings.developerSourceRoot
+    ...(runtimeSettings.developerSourceRoot
       ? {
-          OCTAVE_STRUM_SOURCE_DIR: settings.developerSourceRoot,
+          OCTAVE_STRUM_SOURCE_DIR: runtimeSettings.developerSourceRoot,
           OCTAVE_STRUM_LEGACY_TRAINING_ADAPTER: '1'
         }
       : {})
   }
 }
 
+async function fingerprintWorker(path: string): Promise<{ sha256: string; byteLength: number }> {
+  let fileInfo: Awaited<ReturnType<typeof stat>>
+  try {
+    fileInfo = await stat(path)
+  } catch {
+    throw new Error('The selected STRUM runtime is no longer available.')
+  }
+  if (!fileInfo.isFile()) throw new Error('The selected STRUM runtime is no longer available.')
+  return await new Promise((resolve, reject) => {
+    const hash = createHash('sha256')
+    const stream = createReadStream(path)
+    stream.on('data', (chunk: string | Buffer) => {
+      hash.update(chunk)
+    })
+    stream.once('error', () =>
+      reject(new Error('The selected STRUM runtime is no longer available.'))
+    )
+    stream.once('end', () => resolve({ sha256: hash.digest('hex'), byteLength: fileInfo.size }))
+  })
+}
+
+function runtimeLock(
+  runtime: TrainingRuntime,
+  fingerprint: { sha256: string; byteLength: number }
+): InstalledRuntimeLock {
+  const validatedAt = new Date().toISOString()
+  return {
+    workerSha256: fingerprint.sha256,
+    workerByteLength: fingerprint.byteLength,
+    runtimeId: runtime.runtimeId,
+    protocolVersion: runtime.protocolVersion,
+    capabilities: [...runtime.capabilities],
+    sourceRevision: runtime.sourceRevision,
+    validatedAt
+  }
+}
+
+async function verifyInstalledRuntimeLock(settings: RuntimeSettings): Promise<void> {
+  const lock = settings.installedRuntimeLock
+  if (!settings.installedWorkerPath || !lock) {
+    throw new Error('Select the STRUM runtime again to validate its installation.')
+  }
+  const fingerprint = await fingerprintWorker(settings.installedWorkerPath)
+  if (
+    fingerprint.sha256 !== lock.workerSha256 ||
+    fingerprint.byteLength !== lock.workerByteLength
+  ) {
+    throw new Error(
+      'The selected STRUM runtime changed after validation. Select it again to continue.'
+    )
+  }
+}
+
 async function resolveWorkerInvocation(purpose: string): Promise<WorkerInvocation> {
   const settings = await readRuntimeSettings()
-  const env = await workerEnvironment()
+  const env = await workerEnvironment(settings)
   if (settings.installedWorkerPath) {
-    if (!existsSync(settings.installedWorkerPath)) {
-      throw new Error('The selected STRUM runtime is no longer available.')
-    }
+    await verifyInstalledRuntimeLock(settings)
     return { command: settings.installedWorkerPath, baseArgs: [], env }
   }
   const python = await resolvePythonCommand(purpose)
@@ -286,8 +348,10 @@ function normalizeRuntime(raw: unknown): TrainingRuntime {
   }
 }
 
-async function runWorkerJson(args: string[]): Promise<Record<string, unknown>> {
-  const worker = await resolveWorkerInvocation('training-probe')
+async function runWorkerJsonWithInvocation(
+  worker: WorkerInvocation,
+  args: string[]
+): Promise<Record<string, unknown>> {
   return await new Promise((resolve, reject) => {
     execFile(
       worker.command,
@@ -314,6 +378,10 @@ async function runWorkerJson(args: string[]): Promise<Record<string, unknown>> {
   })
 }
 
+async function runWorkerJson(args: string[]): Promise<Record<string, unknown>> {
+  return await runWorkerJsonWithInvocation(await resolveWorkerInvocation('training-probe'), args)
+}
+
 export async function probeTrainingRuntime(): Promise<TrainingRuntime> {
   return normalizeRuntime(await runWorkerJson(['probe', '--json']))
 }
@@ -325,7 +393,15 @@ export async function enableDetectedDeveloperTrainingRuntime(): Promise<Training
   await mkdir(trainingRoot(), { recursive: true })
   await writeFile(
     runtimeSettingsPath(),
-    JSON.stringify({ developerSourceRoot: root, installedWorkerPath: undefined }, null, 2) + '\n',
+    JSON.stringify(
+      {
+        developerSourceRoot: root,
+        installedWorkerPath: undefined,
+        installedRuntimeLock: undefined
+      },
+      null,
+      2
+    ) + '\n',
     'utf8'
   )
   return await probeTrainingRuntime()
@@ -343,19 +419,38 @@ export async function chooseInstalledTrainingRuntime(): Promise<TrainingRuntime 
   if (selection.canceled || selection.filePaths.length === 0) return null
   const previous = await readRuntimeSettings()
   const installedWorkerPath = selection.filePaths[0]
-  await mkdir(trainingRoot(), { recursive: true })
-  await writeFile(
-    runtimeSettingsPath(),
-    JSON.stringify({ installedWorkerPath, developerSourceRoot: undefined }, null, 2) + '\n',
-    'utf8'
-  )
   try {
-    const runtime = await probeTrainingRuntime()
+    const runtime = normalizeRuntime(
+      await runWorkerJsonWithInvocation(
+        {
+          command: installedWorkerPath,
+          baseArgs: [],
+          env: await workerEnvironment({})
+        },
+        ['probe', '--json']
+      )
+    )
     if (runtime.kind !== 'installed_runtime') {
       throw new Error('The selected worker is not an installed STRUM runtime.')
     }
+    const fingerprint = await fingerprintWorker(installedWorkerPath)
+    await mkdir(trainingRoot(), { recursive: true })
+    await writeFile(
+      runtimeSettingsPath(),
+      JSON.stringify(
+        {
+          installedWorkerPath,
+          installedRuntimeLock: runtimeLock(runtime, fingerprint),
+          developerSourceRoot: undefined
+        },
+        null,
+        2
+      ) + '\n',
+      'utf8'
+    )
     return runtime
   } catch {
+    await mkdir(trainingRoot(), { recursive: true })
     await writeFile(runtimeSettingsPath(), JSON.stringify(previous, null, 2) + '\n', 'utf8')
     return null
   }
