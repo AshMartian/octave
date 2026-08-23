@@ -23,6 +23,7 @@ import {
   listDatasetLibrarySongs,
   listSongSourceCatalogs,
   materializeCatalogHarmonySource,
+  setCatalogMutationTestHooksForTesting,
   summarizeDatasetSource,
   summarizeDatasetSourceEntries
 } from './sngTrainingExporter'
@@ -76,16 +77,25 @@ describe('exportSngTrainingMidi', () => {
     return Buffer.concat([header, ...tracks])
   }
 
+  async function localMutationOwnerInstance(): Promise<string> {
+    const bootId = (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim().toLowerCase()
+    return `boot:${bootId}`
+  }
+
   async function writeMutationReservation(
     path: string,
-    { ageMs = 0, ownerPid = process.pid }: { ageMs?: number; ownerPid?: number } = {}
+    options: { ageMs?: number; ownerPid?: number; ownerInstance?: string } = {}
   ): Promise<void> {
+    const ageMs = options.ageMs ?? 0
+    const ownerPid = options.ownerPid ?? process.pid
+    const ownerInstance = options.ownerInstance ?? (await localMutationOwnerInstance())
     await writeFile(
       path,
       `${JSON.stringify({
-        format: 'octave-catalog-mutation-reservation/v1',
+        format: 'octave-catalog-mutation-reservation/v2',
         owner_id: 'test-mutation-owner',
         owner_host: hostname(),
+        owner_instance: ownerInstance,
         owner_pid: ownerPid,
         created_at_ms: Date.now() - ageMs,
         lease_duration_ms: 10 * 60 * 1000
@@ -983,6 +993,133 @@ describe('exportSngTrainingMidi', () => {
         provenance: { kind: 'isolated_source_stem/v1', attestationId: 'expired-lease' }
       })
     ).resolves.toMatchObject({ sourceId, trackName: 'HARM1', configuredTracks: ['HARM1'] })
+  })
+
+  it('does not reclaim an expired lease when its hostname matches but its boot instance differs', async () => {
+    const parentDir = join(testDir, 'harmony-remote-owner-parent')
+    const songDir = join(testDir, 'harmony-remote-owner-song')
+    const harmonySource = join(testDir, 'private-harmony-remote-owner.wav')
+    await mkdir(parentDir, { recursive: true })
+    await mkdir(songDir, { recursive: true })
+    await writeFile(join(songDir, 'notes.mid'), namedTracksMidi(['PART VOCALS', 'HARM1']))
+    await writeFile(
+      join(songDir, 'song.ini'),
+      '[song]\nname = Remote owner\ndataset_opt_in = true\n'
+    )
+    await writeFile(harmonySource, 'isolated harmony remote owner')
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: songDir }],
+      parentDir,
+      catalogName: 'harmony-remote-owner-catalog',
+      catalogId: 'harmony-remote-owner-catalog',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    const sourceId = (await listCatalogHarmonyTargets(parentDir, 'harmony-remote-owner-catalog'))[0]
+      .sourceId
+    const reservationPath = join(parentDir, '.harmony-remote-owner-catalog.mutation-reservation')
+    await writeMutationReservation(reservationPath, {
+      ageMs: 11 * 60 * 1000,
+      ownerPid: 2 ** 31 - 1,
+      ownerInstance: 'boot:00000000-0000-0000-0000-000000000000'
+    })
+    try {
+      await expect(
+        materializeCatalogHarmonySource({
+          parentDir,
+          catalogName: 'harmony-remote-owner-catalog',
+          sourceId,
+          trackName: 'HARM1',
+          sourceAudioPath: harmonySource,
+          provenance: { kind: 'isolated_source_stem/v1', attestationId: 'remote-owner' }
+        })
+      ).rejects.toThrow('A catalog mutation with that name is already in progress.')
+    } finally {
+      await rm(reservationPath, { force: true })
+    }
+  })
+
+  it('serializes competing stale recovery until the new owner has acquired its reservation', async () => {
+    const parentDir = join(testDir, 'harmony-recovery-race-parent')
+    const songDir = join(testDir, 'harmony-recovery-race-song')
+    const harmonySource = join(testDir, 'private-harmony-recovery-race.wav')
+    await mkdir(parentDir, { recursive: true })
+    await mkdir(songDir, { recursive: true })
+    await writeFile(join(songDir, 'notes.mid'), namedTracksMidi(['PART VOCALS', 'HARM1']))
+    await writeFile(
+      join(songDir, 'song.ini'),
+      '[song]\nname = Recovery race\ndataset_opt_in = true\n'
+    )
+    await writeFile(harmonySource, 'isolated harmony recovery race')
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: songDir }],
+      parentDir,
+      catalogName: 'harmony-recovery-race-catalog',
+      catalogId: 'harmony-recovery-race-catalog',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    const sourceId = (
+      await listCatalogHarmonyTargets(parentDir, 'harmony-recovery-race-catalog')
+    )[0].sourceId
+    const reservationPath = join(parentDir, '.harmony-recovery-race-catalog.mutation-reservation')
+    await writeMutationReservation(reservationPath, {
+      ageMs: 11 * 60 * 1000,
+      ownerPid: 2 ** 31 - 1
+    })
+
+    let resumeRecovery: (() => void) | undefined
+    let notifyStaleRemoved: (() => void) | undefined
+    const staleRemoved = new Promise<void>((resolve) => {
+      notifyStaleRemoved = resolve
+    })
+    const recoveryCanContinue = new Promise<void>((resolve) => {
+      resumeRecovery = resolve
+    })
+    setCatalogMutationTestHooksForTesting({
+      afterStaleReservationRemoved: async () => {
+        notifyStaleRemoved?.()
+        await recoveryCanContinue
+      }
+    })
+
+    const materialize = (
+      attestationId: string
+    ): ReturnType<typeof materializeCatalogHarmonySource> =>
+      materializeCatalogHarmonySource({
+        parentDir,
+        catalogName: 'harmony-recovery-race-catalog',
+        sourceId,
+        trackName: 'HARM1',
+        sourceAudioPath: harmonySource,
+        provenance: { kind: 'isolated_source_stem/v1', attestationId }
+      })
+
+    const first = materialize('recovery-owner')
+    try {
+      await staleRemoved
+      // This contender observed the recovery-to-owner interval in the old
+      // protocol. It must be stopped by the coordination inode before it can
+      // read, rename, or remove either reservation.
+      await expect(materialize('competing-reclaimer')).rejects.toThrow(
+        'A catalog mutation with that name is already in progress.'
+      )
+      resumeRecovery?.()
+      await expect(first).resolves.toMatchObject({
+        sourceId,
+        trackName: 'HARM1',
+        configuredTracks: ['HARM1']
+      })
+      expect(
+        await readFile(join(parentDir, 'harmony-recovery-race-catalog', 'records.jsonl'), 'utf8')
+      ).toContain(sourceId)
+    } finally {
+      resumeRecovery?.()
+      setCatalogMutationTestHooksForTesting(undefined)
+      await first.catch(() => undefined)
+    }
   })
 
   it('serializes real concurrent Harmony and catalog clone mutations', async () => {

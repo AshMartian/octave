@@ -144,10 +144,12 @@ const HARMONY_SOURCE_POLICY_FILENAME = 'vocal-harmony-sources.json'
 const HARMONY_SOURCE_POLICY_FORMAT = 'octave-vocal-harmony-source-policy/v1'
 const HARMONY_IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$/
 const HARMONY_SHA256_PATTERN = /^[a-f0-9]{64}$/
-const CATALOG_MUTATION_RESERVATION_FORMAT = 'octave-catalog-mutation-reservation/v1'
+const CATALOG_MUTATION_RESERVATION_FORMAT = 'octave-catalog-mutation-reservation/v2'
 const CATALOG_MUTATION_LEASE_MS = 10 * 60 * 1000
 const CATALOG_MUTATION_HEARTBEAT_MS = 15 * 1000
 const MAX_CATALOG_MUTATION_RESERVATION_BYTES = 1024
+const CATALOG_MUTATION_COORDINATION_SUFFIX = '.coordination'
+const CATALOG_MUTATION_OWNER_INSTANCE_PREFIX = 'boot:'
 
 interface CatalogAudioInput {
   bytes: Buffer
@@ -1103,6 +1105,20 @@ function sameFileNodeIdentity(
   return left.dev === right.dev && left.ino === right.ino
 }
 
+/**
+ * Do not silently degrade O_NOFOLLOW to zero. Every pathname that can carry
+ * catalog control or selected source data is hostile until its descriptor and
+ * inode have been verified. Platforms without O_NOFOLLOW therefore cannot
+ * perform catalog mutations rather than accepting a symlink race.
+ */
+function noFollowOpenFlags(flags: number): number {
+  const noFollow = constants.O_NOFOLLOW
+  if (!Number.isSafeInteger(noFollow) || noFollow === 0) {
+    throw new Error('Safe catalog file opens are unavailable on this runtime.')
+  }
+  return flags | noFollow
+}
+
 function mediaTypeForAudioExtension(extension: (typeof AUDIO_EXTENSIONS)[number]): string {
   switch (extension) {
     case 'ogg':
@@ -1149,7 +1165,7 @@ async function readExplicitHarmonyAudio(sourcePath: string): Promise<CatalogAudi
     // process before fstat can reject it.
     sourceHandle = await open(
       sourcePath,
-      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK
+      noFollowOpenFlags(constants.O_RDONLY | constants.O_NONBLOCK)
     )
   } catch {
     throw new Error('Selected Harmony audio is unavailable or unsupported.')
@@ -1402,6 +1418,7 @@ type CatalogMutationReservationMetadata = {
   format: typeof CATALOG_MUTATION_RESERVATION_FORMAT
   owner_id: string
   owner_host: string
+  owner_instance: string
   owner_pid: number
   created_at_ms: number
   lease_duration_ms: typeof CATALOG_MUTATION_LEASE_MS
@@ -1415,14 +1432,50 @@ type CatalogMutationReservation = {
   leaseHealthy: boolean
 }
 
-function reservationMetadata(
+type CatalogMutationCoordination = {
+  path: string
+  handle: Awaited<ReturnType<typeof open>>
+  identity: FileIdentity
+}
+
+export type CatalogMutationTestHooks = {
+  afterStaleReservationRemoved?: () => Promise<void>
+}
+
+let catalogMutationTestHooks: CatalogMutationTestHooks | undefined
+let localCatalogMutationOwnerInstance: Promise<string | null> | undefined
+
+/** Test-only synchronization hook; it is never reachable through IPC. */
+export function setCatalogMutationTestHooksForTesting(
+  hooks: CatalogMutationTestHooks | undefined
+): void {
+  catalogMutationTestHooks = hooks
+}
+
+function getLocalCatalogMutationOwnerInstance(): Promise<string | null> {
+  localCatalogMutationOwnerInstance ??= readFile('/proc/sys/kernel/random/boot_id', 'utf8')
+    .then((value) => {
+      const bootId = value.trim().toLowerCase()
+      if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(bootId)) return null
+      return `${CATALOG_MUTATION_OWNER_INSTANCE_PREFIX}${bootId}`
+    })
+    .catch(() => null)
+  return localCatalogMutationOwnerInstance
+}
+
+async function reservationMetadata(
   ownerId: string,
   createdAtMs: number
-): CatalogMutationReservationMetadata {
+): Promise<CatalogMutationReservationMetadata> {
+  const ownerInstance = await getLocalCatalogMutationOwnerInstance()
+  if (!ownerInstance) {
+    throw new Error('Safe catalog mutation ownership is unavailable on this runtime.')
+  }
   return {
     format: CATALOG_MUTATION_RESERVATION_FORMAT,
     owner_id: ownerId,
     owner_host: hostname(),
+    owner_instance: ownerInstance,
     owner_pid: process.pid,
     created_at_ms: createdAtMs,
     lease_duration_ms: CATALOG_MUTATION_LEASE_MS
@@ -1438,6 +1491,8 @@ function parseReservationMetadata(value: unknown): CatalogMutationReservationMet
     typeof record.owner_host !== 'string' ||
     !record.owner_host ||
     record.owner_host.length > 255 ||
+    typeof record.owner_instance !== 'string' ||
+    !HARMONY_IDENTIFIER_PATTERN.test(record.owner_instance) ||
     !Number.isSafeInteger(record.owner_pid) ||
     Number(record.owner_pid) <= 0 ||
     !Number.isSafeInteger(record.created_at_ms) ||
@@ -1449,10 +1504,21 @@ function parseReservationMetadata(value: unknown): CatalogMutationReservationMet
   return record as CatalogMutationReservationMetadata
 }
 
-function isCatalogMutationOwnerActive(metadata: CatalogMutationReservationMetadata): boolean {
-  // Catalog roots are normally local. A remote/unknown owner must stay
-  // fail-closed because its PID cannot prove that its mutation is dead.
-  if (metadata.owner_host !== hostname()) return true
+async function isCatalogMutationOwnerActive(
+  metadata: CatalogMutationReservationMetadata
+): Promise<boolean> {
+  // PID probing is only meaningful for this exact host boot. A same-host PID
+  // can be reused after a reboot, and a matching hostname on shared storage
+  // says nothing about where a mutation runs. Unknown or remote owners stay
+  // active so recovery never claims a potentially live catalog mutation.
+  const ownerInstance = await getLocalCatalogMutationOwnerInstance()
+  if (
+    !ownerInstance ||
+    metadata.owner_host !== hostname() ||
+    metadata.owner_instance !== ownerInstance
+  ) {
+    return true
+  }
   try {
     process.kill(metadata.owner_pid, 0)
     return true
@@ -1485,7 +1551,7 @@ async function readCatalogMutationReservation(reservationPath: string): Promise<
   try {
     handle = await open(
       reservationPath,
-      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK
+      noFollowOpenFlags(constants.O_RDONLY | constants.O_NONBLOCK)
     )
   } catch {
     return null
@@ -1525,27 +1591,106 @@ async function recoverExpiredCatalogMutationReservation(reservationPath: string)
   if (
     !reservation ||
     Date.now() <= reservation.mtimeMs + reservation.metadata.lease_duration_ms ||
-    isCatalogMutationOwnerActive(reservation.metadata)
+    (await isCatalogMutationOwnerActive(reservation.metadata))
   ) {
     return false
   }
-  const stalePath = `${reservationPath}.stale-${randomUUID()}`
-  let ownsStalePath = false
+
+  // reserveCatalogMutation owns the short-lived coordination file while it
+  // calls this function. Release and every competing acquire own that same
+  // file too, so between this identity check and the new owner creation no
+  // in-process actor can replace this pathname. In particular, never rename
+  // here: a stale reader that renamed after another reclaimer released could
+  // move a brand-new owner's reservation.
   try {
-    // The only writer that can replace a reservation is a reclaimer after its
-    // lease has expired. Moving it first prevents a release from ever
-    // unlinking a new owner's reservation; release verifies inode identity.
-    await rename(reservationPath, stalePath)
-    const staleInfo = await lstat(stalePath)
-    if (!sameFileIdentity(reservation.identity, staleInfo)) {
+    const currentInfo = await lstat(reservationPath)
+    if (
+      !currentInfo.isFile() ||
+      currentInfo.isSymbolicLink() ||
+      !sameFileIdentity(reservation.identity, currentInfo)
+    ) {
       throw new Error('Catalog mutation reservation identity changed.')
     }
-    ownsStalePath = true
-    await unlink(stalePath)
+    await unlink(reservationPath)
+    await catalogMutationTestHooks?.afterStaleReservationRemoved?.()
     return true
   } catch {
-    if (ownsStalePath) await unlink(stalePath).catch(() => undefined)
     return false
+  }
+}
+
+function catalogMutationCoordinationPath(reservationPath: string): string {
+  return `${reservationPath}${CATALOG_MUTATION_COORDINATION_SUFFIX}`
+}
+
+async function acquireCatalogMutationCoordination(
+  reservationPath: string
+): Promise<CatalogMutationCoordination> {
+  // This coordinator intentionally has no automatic stale recovery. Trying
+  // to reclaim the coordinator itself would recreate the unsafe window this
+  // protocol closes. A crashed coordinator therefore remains fail-closed
+  // until an operator has independently verified and removed it.
+  const coordinationPath = catalogMutationCoordinationPath(reservationPath)
+  let handle: Awaited<ReturnType<typeof open>>
+  try {
+    handle = await open(
+      coordinationPath,
+      noFollowOpenFlags(constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL),
+      0o600
+    )
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+      throw new Error('A catalog mutation with that name is already in progress.')
+    }
+    throw new Error('The catalog mutation could not be started.')
+  }
+
+  let createdIdentity: Pick<FileIdentity, 'dev' | 'ino'> | undefined
+  try {
+    const createdInfo = await handle.stat()
+    createdIdentity = { dev: createdInfo.dev, ino: createdInfo.ino }
+    await handle.writeFile(`${process.pid}\n`, 'utf8')
+    await handle.sync()
+    const info = await handle.stat()
+    return {
+      path: coordinationPath,
+      handle,
+      identity: { dev: info.dev, ino: info.ino, size: info.size }
+    }
+  } catch {
+    await handle.close().catch(() => undefined)
+    try {
+      const pathInfo = await lstat(coordinationPath)
+      if (
+        pathInfo.isFile() &&
+        !pathInfo.isSymbolicLink() &&
+        createdIdentity &&
+        sameFileNodeIdentity(createdIdentity, pathInfo)
+      ) {
+        await unlink(coordinationPath)
+      }
+    } catch {
+      // A failed coordinator setup must never delete an unknown replacement.
+    }
+    throw new Error('The catalog mutation could not be started.')
+  }
+}
+
+async function releaseCatalogMutationCoordination(
+  coordination: CatalogMutationCoordination
+): Promise<void> {
+  await coordination.handle.close().catch(() => undefined)
+  try {
+    const pathInfo = await lstat(coordination.path)
+    if (
+      pathInfo.isFile() &&
+      !pathInfo.isSymbolicLink() &&
+      sameFileIdentity(coordination.identity, pathInfo)
+    ) {
+      await unlink(coordination.path)
+    }
+  } catch {
+    // A failed or externally replaced coordinator stays fail-closed.
   }
 }
 
@@ -1556,8 +1701,8 @@ async function assertCatalogMutationReservation(
     throw new Error('The catalog mutation reservation was lost.')
   }
   try {
-    // Renew through the owning descriptor. A recovered/renamed reservation
-    // cannot renew the replacement path and will fail the identity check.
+    // Renew through the owning descriptor. A recovered reservation cannot
+    // renew a replacement path and will fail the identity check.
     const now = new Date()
     await reservation.handle.utimes(now, now)
     const handleInfo = await reservation.handle.stat()
@@ -1585,19 +1730,32 @@ async function reserveCatalogMutation(
   catalogName: string
 ): Promise<CatalogMutationReservation> {
   const reservationPath = path.join(parentDir, `.${catalogName}.mutation-reservation`)
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  const coordination = await acquireCatalogMutationCoordination(reservationPath)
+  try {
     let handle: Awaited<ReturnType<typeof open>>
     try {
-      handle = await open(reservationPath, 'wx', 0o600)
+      handle = await open(
+        reservationPath,
+        noFollowOpenFlags(constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL),
+        0o600
+      )
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-        if (attempt === 0 && (await recoverExpiredCatalogMutationReservation(reservationPath))) {
-          continue
-        }
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        // fs errors expose the parent directory. It is private main-process state.
+        throw new Error('The catalog mutation could not be started.')
+      }
+      if (!(await recoverExpiredCatalogMutationReservation(reservationPath))) {
         throw new Error('A catalog mutation with that name is already in progress.')
       }
-      // fs errors expose the parent directory. It is private main-process state.
-      throw new Error('The catalog mutation could not be started.')
+      try {
+        handle = await open(
+          reservationPath,
+          noFollowOpenFlags(constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL),
+          0o600
+        )
+      } catch {
+        throw new Error('A catalog mutation with that name is already in progress.')
+      }
     }
 
     let createdIdentity: Pick<FileIdentity, 'dev' | 'ino'> | undefined
@@ -1606,7 +1764,7 @@ async function reserveCatalogMutation(
       createdIdentity = { dev: createdInfo.dev, ino: createdInfo.ino }
       const ownerId = randomUUID()
       await handle.writeFile(
-        `${JSON.stringify(reservationMetadata(ownerId, Date.now()))}\n`,
+        `${JSON.stringify(await reservationMetadata(ownerId, Date.now()))}\n`,
         'utf8'
       )
       await handle.sync()
@@ -1641,13 +1799,22 @@ async function reserveCatalogMutation(
       }
       throw new Error('The catalog mutation could not be started.')
     }
+  } finally {
+    await releaseCatalogMutationCoordination(coordination)
   }
-  throw new Error('The catalog mutation could not be started.')
 }
 
 async function releaseCatalogMutation(reservation: CatalogMutationReservation): Promise<void> {
   if (reservation.heartbeat) clearInterval(reservation.heartbeat)
   await reservation.handle.close().catch(() => undefined)
+  let coordination: CatalogMutationCoordination
+  try {
+    coordination = await acquireCatalogMutationCoordination(reservation.path)
+  } catch {
+    // A coordinator we do not own may protect a replacement reservation.
+    // Leaving our old inode in place is safer than deleting an unknown owner.
+    return
+  }
   try {
     const pathInfo = await lstat(reservation.path)
     if (
@@ -1658,8 +1825,10 @@ async function releaseCatalogMutation(reservation: CatalogMutationReservation): 
       await unlink(reservation.path)
     }
   } catch {
-    // A recovered reservation has already moved its old inode away. Never
-    // unlink an unknown replacement reservation during cleanup.
+    // A recovered reservation may already be absent. Never unlink an unknown
+    // replacement reservation during cleanup.
+  } finally {
+    await releaseCatalogMutationCoordination(coordination)
   }
 }
 
