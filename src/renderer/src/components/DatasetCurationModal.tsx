@@ -143,7 +143,10 @@ type CheckpointDiscovery = {
 
 type AutoChartProfile = {
   profileId: string
-  runId: string
+  runId?: string
+  strumProfileId?: string
+  artifactId?: string
+  difficultyPolicy?: string
   pipelineId: string
   runtimeId: string
   createdAt: string
