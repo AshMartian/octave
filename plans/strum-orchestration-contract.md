@@ -30,15 +30,16 @@ Initial interface:
 ```text
 strum-worker probe --json
 strum-worker pipeline list --json
-strum-worker catalog inspect --catalog <catalog-root> --pipeline <id> --json
+strum-worker catalog inspect --catalog-root <catalog-root> --pipeline <id> --json
 strum-worker dataset prepare --request <owned-json> --json-events
 strum-worker train start --request <owned-json> --json-events
-strum-worker train cancel --run <id>
-strum-worker checkpoint inspect --checkpoint <path> --json
-strum-worker inference profile validate --request <owned-json> --json
+strum-worker checkpoint inspect --model-root <path> --json
+strum-worker inference profile validate --model-root <path> --profile <id> --difficulty-policy <policy> --json
+strum-worker chart preflight --request <owned-json> --json
+strum-worker chart run --request <owned-json> --json
 ```
 
-The worker emits line-delimited JSON events with a job ID, monotonic sequence number, stage, progress, safe message/code, and terminal state (`succeeded`, `failed`, or `cancelled`). Human stdout/stderr is diagnostic only. OCTAVE's main process owns spawning, cancellation, and private paths; its renderer receives only safe IDs, names, capabilities, progress, and errors.
+`dataset prepare --json-events` and `train start --json-events` emit line-delimited JSON events with a job ID, monotonic sequence number, stage, progress, safe message/code, and terminal state (`succeeded` or `failed`). Human stdout/stderr is diagnostic only. OCTAVE's main process owns spawning, cancellation, and private paths; it cancels the worker process group rather than asking a separate STRUM daemon to retain a private-path job ID. Its renderer receives only safe IDs, names, capabilities, progress, and errors.
 
 `probe` must report a protocol version, STRUM release and source revision, dirty state, Python/platform requirements, advertised capabilities, pipeline IDs, device support, and supported model/checkpoint manifest schema versions. OCTAVE rejects an unknown major protocol, unsupported pipeline, missing command, or incompatible schema before work begins.
 
@@ -85,9 +86,7 @@ Future descriptors follow the same shape: `drums.onset-velocity/v*`, `bass.onset
 
 ### Current training coverage
 
-The catalog-aware Guitar path is the only complete training path today: it revalidates `allowed` catalog assets, prefers `audio.guitar`, falls back to `audio.mix`, creates a path-free task view, and preprocesses those resolved assets. The first OCTAVE catalog proved that path with 31 eligible Guitar songs.
-
-Drums, Bass, Keys, Vocals, Pro instruments, section/mapper data, and chart-pair difficulty transforms are not yet catalog-backed end-to-end. Their current builders/trainers still use legacy manifests or raw folder scans and may persist absolute source locations. STRUM must add one catalog task-view adapter per pipeline family; OCTAVE must not reimplement their labels, splits, caches, or transforms.
+The catalog-aware Guitar and Drums paths revalidate `allowed` catalog assets and create path-free task views. The first OCTAVE catalog proved 31 Guitar-eligible and 52 Drums-eligible records. Five-lane chart-pair difficulty transforms are catalog-backed and worker-trainable for Guitar, Bass, Keys, and Drums. Bass, Keys, Vocals, Pro instruments, section, and mapper families also have catalog task views; their missing learned trainer architectures remain explicitly `planned` rather than falling back to raw folder scans.
 
 Each new adapter must select only `allowed` records, revalidate catalog hashes at use time, derive labels within STRUM, assign and persist song-disjoint splits, and write catalog ID, task-view hash, source IDs, input hashes, and audio/MIDI alignment provenance into its cache, experiment, and checkpoint manifests. Audio-to-chart descriptors must state whether OCTAVE materializes timeline-aligned audio or STRUM derives and records an alignment offset.
 
