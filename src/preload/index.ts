@@ -328,17 +328,6 @@ const api = {
     components: Array<{ id: string; sha256: string; byteLength: number }>
   }> => ipcRenderer.invoke('training:inspectCheckpoint', runId),
 
-  saveAutoChartProfile: (
-    runId: string
-  ): Promise<{
-    profileId: string
-    runId: string
-    pipelineId: string
-    runtimeId: string
-    createdAt: string
-    isDefault: boolean
-  }> => ipcRenderer.invoke('training:saveAutoChartProfile', runId),
-
   inspectTrainingCatalog: (options: {
     parentId: string
     catalogName: string

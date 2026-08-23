@@ -1115,13 +1115,6 @@ export async function inspectTrainingCheckpoint(runId: string): Promise<Training
   )
 }
 
-export async function saveAutoChartProfile(runId: string): Promise<AutoChartProfile> {
-  void runId
-  throw new Error(
-    'Training experiments must be evaluated and packaged by STRUM, then selected from a verified model bundle folder.'
-  )
-}
-
 export async function saveDiscoveredAutoChartProfile(options: {
   artifactId: string
   profileId: string
