@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
+import type { StrumCheckpointOutputContracts } from '../shared/strumTrainingContracts'
 import type {
   MetadataArtwork,
   SongMetadataSearchRequest,
@@ -217,6 +218,7 @@ const api = {
       prepare_schema: Record<string, unknown>
       train_schema: Record<string, unknown>
       checkpoint_outputs: string[]
+      checkpoint_output_contracts?: StrumCheckpointOutputContracts
       inference_capability: string | null
     }>
   > => ipcRenderer.invoke('training:pipelines'),

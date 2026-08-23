@@ -6,6 +6,7 @@ import {
   type Dispatch,
   type SetStateAction
 } from 'react'
+import type { StrumCheckpointOutputContracts } from '../../../shared/strumTrainingContracts'
 import './DatasetCurationModal.css'
 
 type SourceCandidate = {
@@ -78,6 +79,7 @@ type TrainingPipeline = {
   prepare_schema: Record<string, unknown>
   train_schema: Record<string, unknown>
   checkpoint_outputs: string[]
+  checkpoint_output_contracts?: StrumCheckpointOutputContracts
   inference_capability: string | null
 }
 
@@ -539,6 +541,17 @@ export function TrainingModal({
     () => schemaConfig(trainControls, trainConfig),
     [trainConfig, trainControls]
   )
+  const selectedCheckpointOutputCandidate = useMemo(() => {
+    const contracts = selectedPipeline?.checkpoint_output_contracts
+    if (!contracts) return null
+    const selected = resolvedTrainConfig[contracts.selector.training_option]
+    const candidateKind =
+      typeof selected === 'string' && contracts.by_candidate_kind[selected]
+        ? selected
+        : contracts.selector.default
+    const candidate = contracts.by_candidate_kind[candidateKind]
+    return candidate ? { candidateKind, candidate } : null
+  }, [resolvedTrainConfig, selectedPipeline])
   const selectedPipelineTasks = useMemo(
     () => trainingTasks.filter((task) => task.pipelineId === selectedPipelineId),
     [selectedPipelineId, trainingTasks]
@@ -1722,6 +1735,21 @@ export function TrainingModal({
                     setValues={setTrainConfig}
                     values={resolvedTrainConfig}
                   />
+                  {selectedCheckpointOutputCandidate && (
+                    <aside className="training-deploy-blocked">
+                      <strong>
+                        Raw STRUM candidate · {selectedCheckpointOutputCandidate.candidateKind}
+                      </strong>
+                      <p>
+                        Produces{' '}
+                        {selectedCheckpointOutputCandidate.candidate.component_outputs.join(', ')}
+                        {' · '}preprocessing{' '}
+                        {selectedCheckpointOutputCandidate.candidate.preprocessing.id}. This is an
+                        experiment-only candidate: profile packaging and chart execution remain
+                        unavailable.
+                      </p>
+                    </aside>
+                  )}
                   <p className="training-inline-note">
                     OCTAVE submits only values declared by this STRUM pipeline. Any resume or
                     fine-tune option remains unavailable until STRUM advertises compatible parents.
