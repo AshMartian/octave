@@ -250,6 +250,66 @@ const api = {
     }>
   }> => ipcRenderer.invoke('training:artifacts'),
 
+  chooseTrainingCheckpointFolder: (): Promise<{
+    candidateCount: number
+    profileCount: number
+    rejectedBundleCount: number
+    truncated: boolean
+    candidates: Array<{
+      artifactId: string
+      modelId: string
+      manifestSha256: string
+      schemaVersion: number
+      compatibility: Record<string, string | number>
+      components: Array<{ id: string; sha256: string; byteLength: number }>
+      profiles: Array<{
+        profileId: string
+        capability: string
+        instruments: string[]
+        difficultyPolicies: string[]
+        requiredComponents: string[]
+        execution: { status: 'available' | 'not_available'; difficultyPolicies: string[] }
+      }>
+      rejectedProfileCount: number
+      deploymentStatus: 'ready' | 'not_deployable'
+    }>
+  } | null> => ipcRenderer.invoke('training:chooseCheckpointFolder'),
+
+  inspectDiscoveredTrainingCheckpoint: (
+    artifactId: string
+  ): Promise<{
+    artifactId: string
+    modelId: string
+    manifestSha256: string
+    schemaVersion: number
+    compatibility: Record<string, string | number>
+    components: Array<{ id: string; sha256: string; byteLength: number }>
+    profiles: Array<{
+      profileId: string
+      capability: string
+      instruments: string[]
+      difficultyPolicies: string[]
+      requiredComponents: string[]
+      execution: { status: 'available' | 'not_available'; difficultyPolicies: string[] }
+    }>
+    rejectedProfileCount: number
+    deploymentStatus: 'ready' | 'not_deployable'
+  }> => ipcRenderer.invoke('training:inspectDiscoveredCheckpoint', artifactId),
+
+  saveDiscoveredAutoChartProfile: (options: {
+    artifactId: string
+    profileId: string
+    difficultyPolicy: string
+  }): Promise<{
+    profileId: string
+    strumProfileId?: string
+    artifactId?: string
+    pipelineId: string
+    runtimeId: string
+    createdAt: string
+    isDefault: boolean
+  }> => ipcRenderer.invoke('training:saveDiscoveredAutoChartProfile', options),
+
   inspectTrainingCheckpoint: (
     runId: string
   ): Promise<{

@@ -190,6 +190,61 @@ interface ChartEditorAPI {
       isDefault: boolean
     }>
   }>
+  chooseTrainingCheckpointFolder: () => Promise<{
+    candidateCount: number
+    profileCount: number
+    rejectedBundleCount: number
+    truncated: boolean
+    candidates: Array<{
+      artifactId: string
+      modelId: string
+      manifestSha256: string
+      schemaVersion: number
+      compatibility: Record<string, string | number>
+      components: Array<{ id: string; sha256: string; byteLength: number }>
+      profiles: Array<{
+        profileId: string
+        capability: string
+        instruments: string[]
+        difficultyPolicies: string[]
+        requiredComponents: string[]
+        execution: { status: 'available' | 'not_available'; difficultyPolicies: string[] }
+      }>
+      rejectedProfileCount: number
+      deploymentStatus: 'ready' | 'not_deployable'
+    }>
+  } | null>
+  inspectDiscoveredTrainingCheckpoint: (artifactId: string) => Promise<{
+    artifactId: string
+    modelId: string
+    manifestSha256: string
+    schemaVersion: number
+    compatibility: Record<string, string | number>
+    components: Array<{ id: string; sha256: string; byteLength: number }>
+    profiles: Array<{
+      profileId: string
+      capability: string
+      instruments: string[]
+      difficultyPolicies: string[]
+      requiredComponents: string[]
+      execution: { status: 'available' | 'not_available'; difficultyPolicies: string[] }
+    }>
+    rejectedProfileCount: number
+    deploymentStatus: 'ready' | 'not_deployable'
+  }>
+  saveDiscoveredAutoChartProfile: (options: {
+    artifactId: string
+    profileId: string
+    difficultyPolicy: string
+  }) => Promise<{
+    profileId: string
+    strumProfileId?: string
+    artifactId?: string
+    pipelineId: string
+    runtimeId: string
+    createdAt: string
+    isDefault: boolean
+  }>
   inspectTrainingCheckpoint: (runId: string) => Promise<{
     runId: string
     pipelineId: string

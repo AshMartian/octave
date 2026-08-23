@@ -15,7 +15,9 @@ import {
   cancelTrainingJob,
   cancelDefaultAutoChartProfile,
   chooseInstalledTrainingRuntime,
+  chooseCheckpointFolder,
   enableDetectedDeveloperTrainingRuntime,
+  inspectDiscoveredCheckpoint,
   inspectTrainingCheckpoint,
   inspectTrainingCatalog,
   killAllTrainingJobs,
@@ -24,6 +26,7 @@ import {
   probeTrainingRuntime,
   runDefaultAutoChartProfile,
   saveAutoChartProfile,
+  saveDiscoveredAutoChartProfile,
   startTrainingPrepare,
   startTrainingRun
 } from './strumIntegration/training'
@@ -1097,6 +1100,46 @@ ipcMain.handle('training:pipelines', async () => {
 })
 
 ipcMain.handle('training:artifacts', async () => await listTrainingArtifacts())
+
+ipcMain.handle('training:chooseCheckpointFolder', async () => {
+  try {
+    return await chooseCheckpointFolder()
+  } catch {
+    throw new Error('STRUM could not discover model bundles in that folder.')
+  }
+})
+
+ipcMain.handle('training:inspectDiscoveredCheckpoint', async (_event, artifactId: unknown) => {
+  if (typeof artifactId !== 'string') throw new Error('Select a discovered checkpoint first.')
+  try {
+    return await inspectDiscoveredCheckpoint(artifactId)
+  } catch {
+    throw new Error('STRUM could not inspect the selected checkpoint bundle.')
+  }
+})
+
+ipcMain.handle('training:saveDiscoveredAutoChartProfile', async (_event, options: unknown) => {
+  if (!options || typeof options !== 'object' || Array.isArray(options)) {
+    throw new Error('Select a discovered checkpoint profile first.')
+  }
+  const value = options as Record<string, unknown>
+  if (
+    typeof value.artifactId !== 'string' ||
+    typeof value.profileId !== 'string' ||
+    typeof value.difficultyPolicy !== 'string'
+  ) {
+    throw new Error('Select a discovered checkpoint profile first.')
+  }
+  try {
+    return await saveDiscoveredAutoChartProfile({
+      artifactId: value.artifactId,
+      profileId: value.profileId,
+      difficultyPolicy: value.difficultyPolicy
+    })
+  } catch {
+    throw new Error('STRUM did not validate this checkpoint profile for Auto Chart.')
+  }
+})
 
 ipcMain.handle('training:inspectCheckpoint', async (_event, runId: string) => {
   try {

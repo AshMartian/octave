@@ -1,8 +1,8 @@
 import { app, BrowserWindow, dialog } from 'electron'
 import { execFile, spawn, type ChildProcess } from 'child_process'
 import { createHash, randomUUID } from 'crypto'
-import { createReadStream, existsSync } from 'fs'
-import { mkdir, readFile, realpath, stat, unlink, writeFile } from 'fs/promises'
+import { createReadStream, existsSync, type Dirent } from 'fs'
+import { mkdir, readFile, readdir, realpath, stat, unlink, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { resolvePythonCommand, type PythonCommand } from './runner'
 import { sanitizeTrainingSchemaValues } from './trainingSchema'
@@ -12,6 +12,16 @@ const PROTOCOL_MAJOR = 1
 const TRAINING_ROOT_NAME = 'strum-training'
 const RUNTIME_SETTINGS_NAME = 'runtime.json'
 const REGISTRY_NAME = 'registry.json'
+const MODEL_BUNDLE_MANIFEST_NAME = 'strum-model-bundle.json'
+const MAX_DISCOVERED_MODEL_MANIFESTS = 256
+const MAX_MODEL_DISCOVERY_DEPTH = 8
+const MODEL_DISCOVERY_IGNORED_DIRECTORIES = new Set([
+  '.git',
+  '.hg',
+  '.svn',
+  '__pycache__',
+  'node_modules'
+])
 
 export type TrainingPipeline = {
   id: string
@@ -85,11 +95,50 @@ export type TrainingCheckpoint = {
 
 export type AutoChartProfile = {
   profileId: string
-  runId: string
+  /** OCTAVE's previous run-backed profile records retain this field. */
+  runId?: string
+  /** STRUM's declared profile ID. This may differ from OCTAVE's local ID. */
+  strumProfileId?: string
+  /** Opaque, manifest-derived identity for a discovered model bundle. */
+  artifactId?: string
+  /** The STRUM-declared policy validated for this default. */
+  difficultyPolicy?: string
   pipelineId: string
   runtimeId: string
   createdAt: string
   isDefault: boolean
+}
+
+export type DiscoveredCheckpointProfile = {
+  profileId: string
+  capability: string
+  instruments: string[]
+  difficultyPolicies: string[]
+  requiredComponents: string[]
+  execution: {
+    status: 'available' | 'not_available'
+    difficultyPolicies: string[]
+  }
+}
+
+export type DiscoveredCheckpoint = {
+  artifactId: string
+  modelId: string
+  manifestSha256: string
+  schemaVersion: number
+  compatibility: Record<string, string | number>
+  components: Array<{ id: string; sha256: string; byteLength: number }>
+  profiles: DiscoveredCheckpointProfile[]
+  rejectedProfileCount: number
+  deploymentStatus: 'ready' | 'not_deployable'
+}
+
+export type CheckpointDiscovery = {
+  candidateCount: number
+  profileCount: number
+  rejectedBundleCount: number
+  truncated: boolean
+  candidates: DiscoveredCheckpoint[]
 }
 
 export type TrainingJobEvent = {
@@ -141,6 +190,7 @@ type WorkerInvocation = {
   command: string
   baseArgs: string[]
   env: NodeJS.ProcessEnv
+  cwd?: string
 }
 
 type TrainingRegistry = {
@@ -165,6 +215,11 @@ type RunningProfiledAutoChart = {
 
 const runningJobs = new Map<string, RunningTrainingJob>()
 const runningProfiledAutoCharts = new Map<string, RunningProfiledAutoChart>()
+/**
+ * This deliberately lives only in the main process. Renderer clients receive
+ * opaque artifact IDs and cannot ask OCTAVE to run an arbitrary local path.
+ */
+const discoveredCheckpointRoots = new Map<string, string>()
 
 function trainingRoot(): string {
   return join(app.getPath('userData'), TRAINING_ROOT_NAME)
@@ -236,12 +291,18 @@ function hasLegacyGuitarSources(root: string): boolean {
   )
 }
 
+function hasVersionedWorkerSource(root: string): boolean {
+  return existsSync(join(root, 'src', 'worker.py'))
+}
+
 function findDetectedDeveloperRoot(): string | null {
   const configured = process.env.OCTAVE_STRUM_SOURCE_DIR?.trim()
   const candidates = [configured, join(process.cwd(), '..', 'strum'), join(process.cwd(), 'strum')]
   return (
     candidates.find((candidate): candidate is string =>
-      Boolean(candidate && hasLegacyGuitarSources(candidate))
+      Boolean(
+        candidate && (hasVersionedWorkerSource(candidate) || hasLegacyGuitarSources(candidate))
+      )
     ) ?? null
   )
 }
@@ -351,6 +412,22 @@ async function bundledAdapterInvocation(
   }
 }
 
+async function developerWorkerInvocation(settings: RuntimeSettings): Promise<WorkerInvocation> {
+  const root = settings.developerSourceRoot
+  const python = settings.developerPython
+  if (!root || !python) {
+    throw new Error('Enable the developer STRUM runtime again to validate this checkout.')
+  }
+  if (!hasVersionedWorkerSource(root))
+    return await bundledAdapterInvocation('training-probe', settings)
+  return {
+    command: python.command,
+    baseArgs: [...python.baseArgs, '-m', 'src.worker'],
+    env: await workerEnvironment(settings),
+    cwd: root
+  }
+}
+
 async function verifyDeveloperRuntimeLock(settings: RuntimeSettings): Promise<WorkerInvocation> {
   const lock = settings.developerRuntimeLock
   if (
@@ -358,13 +435,15 @@ async function verifyDeveloperRuntimeLock(settings: RuntimeSettings): Promise<Wo
     !settings.developerPython ||
     !lock ||
     lock.sourceRoot !== settings.developerSourceRoot ||
-    !hasLegacyGuitarSources(settings.developerSourceRoot)
+    (!hasVersionedWorkerSource(settings.developerSourceRoot) &&
+      !hasLegacyGuitarSources(settings.developerSourceRoot))
   ) {
     throw new Error('Enable the developer STRUM runtime again to validate this checkout.')
   }
-  const invocation = await bundledAdapterInvocation('training-probe', settings)
+  const invocation = await developerWorkerInvocation(settings)
   const runtime = normalizeRuntime(
-    await runWorkerJsonWithInvocation(invocation, ['probe', '--json'])
+    await runWorkerJsonWithInvocation(invocation, ['probe', '--json']),
+    'developer_override'
   )
   if (runtime.kind !== 'developer_override' || !runtimeMatchesLock(runtime, lock)) {
     throw new Error(
@@ -388,15 +467,22 @@ async function resolveWorkerInvocation(purpose: string): Promise<WorkerInvocatio
   return await bundledAdapterInvocation(purpose, settings)
 }
 
-function normalizeRuntime(raw: unknown): TrainingRuntime {
+function normalizeRuntime(
+  raw: unknown,
+  defaultKind: TrainingRuntime['kind'] = 'bundled_inference'
+): TrainingRuntime {
   if (!raw || typeof raw !== 'object')
     throw new Error('STRUM did not return a runtime description.')
   const value = raw as Record<string, unknown>
+  const runtimeMetadata =
+    value.runtime && typeof value.runtime === 'object' && !Array.isArray(value.runtime)
+      ? (value.runtime as Record<string, unknown>)
+      : {}
   const version = String(value.protocol_version ?? '')
   if (Number(version.split('.')[0]) !== PROTOCOL_MAJOR) {
     throw new Error('The selected STRUM runtime uses an unsupported protocol version.')
   }
-  const kind = String(value.runtime_kind ?? 'bundled_inference')
+  const kind = String(value.runtime_kind ?? defaultKind)
   if (
     !['bundled_inference', 'developer_override', 'managed_checkout', 'installed_runtime'].includes(
       kind
@@ -405,16 +491,31 @@ function normalizeRuntime(raw: unknown): TrainingRuntime {
     throw new Error('The selected STRUM runtime reported an invalid runtime kind.')
   }
   return {
-    runtimeId: String(value.runtime_id ?? 'unknown-runtime'),
+    runtimeId: String(value.runtime_id ?? runtimeMetadata.id ?? 'unknown-runtime'),
     displayName: String(value.display_name ?? 'STRUM runtime'),
     kind: kind as TrainingRuntime['kind'],
     protocolVersion: version,
-    capabilities: Array.isArray(value.capabilities) ? value.capabilities.map(String) : [],
-    pipelineIds: Array.isArray(value.pipeline_ids) ? value.pipeline_ids.map(String) : [],
+    capabilities: [
+      ...new Set([
+        ...(Array.isArray(value.capabilities) ? value.capabilities.map(String) : []),
+        ...(Array.isArray(value.capabilities) && value.capabilities.includes('dataset_prepare')
+          ? ['training']
+          : [])
+      ])
+    ],
+    pipelineIds: Array.isArray(value.pipeline_ids)
+      ? value.pipeline_ids.map(String)
+      : Array.isArray(value.pipelines)
+        ? value.pipelines.map(String)
+        : [],
     deviceSupport: Array.isArray(value.device_support) ? value.device_support.map(String) : [],
     trainingSetupRequired: Boolean(value.training_setup_required),
-    dirty: Boolean(value.dirty),
-    sourceRevision: value.source_revision ? String(value.source_revision) : null
+    dirty: Boolean(value.dirty ?? runtimeMetadata.source_dirty),
+    sourceRevision: value.source_revision
+      ? String(value.source_revision)
+      : runtimeMetadata.source_revision
+        ? String(runtimeMetadata.source_revision)
+        : null
   }
 }
 
@@ -426,7 +527,7 @@ async function runWorkerJsonWithInvocation(
     execFile(
       worker.command,
       [...worker.baseArgs, ...args],
-      { env: worker.env, timeout: 20_000 },
+      { env: worker.env, cwd: worker.cwd, timeout: 20_000 },
       (error, stdout) => {
         const line = stdout.split(/\r?\n/).find((entry) => entry.trim())
         if (error || !line) {
@@ -469,10 +570,11 @@ export async function enableDetectedDeveloperTrainingRuntime(): Promise<Training
     installedRuntimeLock: undefined
   }
   const runtime = normalizeRuntime(
-    await runWorkerJsonWithInvocation(
-      await bundledAdapterInvocation('developer-training-runtime', settings),
-      ['probe', '--json']
-    )
+    await runWorkerJsonWithInvocation(await developerWorkerInvocation(settings), [
+      'probe',
+      '--json'
+    ]),
+    'developer_override'
   )
   if (runtime.kind !== 'developer_override') return null
   await mkdir(trainingRoot(), { recursive: true })
@@ -638,6 +740,301 @@ export async function listTrainingArtifacts(): Promise<{
   }
 }
 
+function isSafeIdentifier(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value)
+}
+
+function isSafeCapability(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-z][a-z0-9._-]{0,120}\/v[0-9]+$/.test(value)
+}
+
+function isSafeDifficultyPolicy(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-z][a-z0-9._:-]{0,127}$/.test(value)
+}
+
+function isArtifactId(value: unknown): value is string {
+  return typeof value === 'string' && /^strum-model-bundle\/[a-f0-9]{64}$/.test(value)
+}
+
+function normalizeComponent(
+  value: unknown
+): { id: string; sha256: string; byteLength: number } | null {
+  if (!value || typeof value !== 'object') return null
+  const component = value as Record<string, unknown>
+  const id = component.id
+  const sha256 = component.sha256
+  const byteLength = Number(component.byte_length)
+  if (
+    !isSafeIdentifier(id) ||
+    typeof sha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(sha256) ||
+    !Number.isSafeInteger(byteLength) ||
+    byteLength < 0
+  ) {
+    return null
+  }
+  return { id, sha256, byteLength }
+}
+
+function normalizeDiscoveredProfile(value: unknown): DiscoveredCheckpointProfile | null {
+  if (!value || typeof value !== 'object') return null
+  const profile = value as Record<string, unknown>
+  const execution = profile.execution
+  if (!execution || typeof execution !== 'object') return null
+  const executionValue = execution as Record<string, unknown>
+  const profileId = profile.profile_id
+  const capability = profile.capability
+  const instruments = Array.isArray(profile.instruments) ? profile.instruments : null
+  const difficultyPolicies = Array.isArray(profile.difficulty_policies)
+    ? profile.difficulty_policies
+    : null
+  const requiredComponents = Array.isArray(profile.required_components)
+    ? profile.required_components
+    : null
+  const executablePolicies = Array.isArray(executionValue.difficulty_policies)
+    ? executionValue.difficulty_policies
+    : null
+  const executionStatus = executionValue.status
+  if (
+    !isSafeIdentifier(profileId) ||
+    !isSafeCapability(capability) ||
+    !instruments ||
+    !instruments.every(isSafeIdentifier) ||
+    !difficultyPolicies ||
+    !difficultyPolicies.every(isSafeDifficultyPolicy) ||
+    !requiredComponents ||
+    !requiredComponents.every(isSafeIdentifier) ||
+    !executablePolicies ||
+    !executablePolicies.every(isSafeDifficultyPolicy) ||
+    (executionStatus !== 'available' && executionStatus !== 'not_available')
+  ) {
+    return null
+  }
+  return {
+    profileId,
+    capability,
+    instruments: [...instruments],
+    difficultyPolicies: [...difficultyPolicies],
+    requiredComponents: [...requiredComponents],
+    execution: { status: executionStatus, difficultyPolicies: [...executablePolicies] }
+  }
+}
+
+function normalizeDiscoveredCheckpoint(value: unknown): DiscoveredCheckpoint | null {
+  if (!value || typeof value !== 'object') return null
+  const candidate = value as Record<string, unknown>
+  const artifactId = candidate.artifact_id
+  const modelId = candidate.model_id
+  const manifestSha256 = candidate.manifest_sha256
+  const schemaVersion = Number(candidate.schema_version)
+  const components = Array.isArray(candidate.components) ? candidate.components : null
+  const profiles = Array.isArray(candidate.profiles) ? candidate.profiles : null
+  const rejectedProfileCount = Number(candidate.rejected_profile_count)
+  const deploymentStatus = candidate.deployment_status
+  const rawCompatibility = candidate.compatibility
+  if (
+    !isArtifactId(artifactId) ||
+    !isSafeIdentifier(modelId) ||
+    typeof manifestSha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(manifestSha256) ||
+    !Number.isSafeInteger(schemaVersion) ||
+    schemaVersion < 1 ||
+    !components ||
+    !profiles ||
+    !Number.isSafeInteger(rejectedProfileCount) ||
+    rejectedProfileCount < 0 ||
+    (deploymentStatus !== 'ready' && deploymentStatus !== 'not_deployable') ||
+    !rawCompatibility ||
+    typeof rawCompatibility !== 'object' ||
+    Array.isArray(rawCompatibility)
+  ) {
+    return null
+  }
+  const normalizedComponents = components.map(normalizeComponent)
+  const normalizedProfiles = profiles.map(normalizeDiscoveredProfile)
+  if (normalizedComponents.some((component) => component === null)) return null
+  if (normalizedProfiles.some((profile) => profile === null)) return null
+  const compatibility = Object.fromEntries(
+    Object.entries(rawCompatibility as Record<string, unknown>).flatMap(([key, entry]) =>
+      /^[a-z][a-z0-9_]{0,63}$/.test(key) &&
+      (typeof entry === 'string' || (typeof entry === 'number' && Number.isFinite(entry))) &&
+      entry.toString().length <= 128
+        ? [[key, entry]]
+        : []
+    )
+  )
+  return {
+    artifactId,
+    modelId,
+    manifestSha256,
+    schemaVersion,
+    compatibility,
+    components: normalizedComponents.filter(
+      (component): component is NonNullable<typeof component> => component !== null
+    ),
+    profiles: normalizedProfiles.filter(
+      (profile): profile is NonNullable<typeof profile> => profile !== null
+    ),
+    rejectedProfileCount,
+    deploymentStatus
+  }
+}
+
+function normalizeCheckpointDiscovery(payload: Record<string, unknown>): CheckpointDiscovery {
+  const candidates = Array.isArray(payload.candidates) ? payload.candidates : []
+  const normalizedCandidates = candidates.map(normalizeDiscoveredCheckpoint)
+  if (
+    payload.format !== 'strum-model-bundle-discovery/v1' ||
+    payload.status !== 'ready' ||
+    normalizedCandidates.some((candidate) => candidate === null)
+  ) {
+    throw new Error('STRUM did not return a valid checkpoint discovery response.')
+  }
+  const candidateCount = Number(payload.candidate_count)
+  const profileCount = Number(payload.profile_count)
+  const rejectedBundleCount = Number(payload.rejected_bundle_count)
+  if (
+    !Number.isSafeInteger(candidateCount) ||
+    candidateCount !== normalizedCandidates.length ||
+    !Number.isSafeInteger(profileCount) ||
+    !Number.isSafeInteger(rejectedBundleCount) ||
+    rejectedBundleCount < 0 ||
+    typeof payload.truncated !== 'boolean'
+  ) {
+    throw new Error('STRUM returned an inconsistent checkpoint discovery response.')
+  }
+  const usable = normalizedCandidates.filter(
+    (candidate): candidate is NonNullable<typeof candidate> => candidate !== null
+  )
+  if (profileCount !== usable.reduce((total, candidate) => total + candidate.profiles.length, 0)) {
+    throw new Error('STRUM returned an inconsistent checkpoint discovery response.')
+  }
+  return {
+    candidateCount,
+    profileCount,
+    rejectedBundleCount,
+    truncated: payload.truncated,
+    candidates: usable
+  }
+}
+
+async function findPrivateModelBundleRoots(root: string): Promise<string[]> {
+  const resolvedRoot = await realpath(root)
+  const roots: string[] = []
+  const visit = async (directory: string, depth: number): Promise<void> => {
+    if (roots.length >= MAX_DISCOVERED_MODEL_MANIFESTS) return
+    let entries: Dirent<string>[]
+    try {
+      entries = await readdir(directory, { withFileTypes: true, encoding: 'utf8' })
+    } catch {
+      return
+    }
+    if (
+      entries.some(
+        (entry) =>
+          entry.name === MODEL_BUNDLE_MANIFEST_NAME && entry.isFile() && !entry.isSymbolicLink()
+      )
+    ) {
+      roots.push(directory)
+    }
+    if (depth >= MAX_MODEL_DISCOVERY_DEPTH) return
+    for (const entry of entries) {
+      if (
+        roots.length >= MAX_DISCOVERED_MODEL_MANIFESTS ||
+        !entry.isDirectory() ||
+        entry.isSymbolicLink() ||
+        MODEL_DISCOVERY_IGNORED_DIRECTORIES.has(entry.name)
+      ) {
+        continue
+      }
+      await visit(join(directory, entry.name), depth + 1)
+    }
+  }
+  await visit(resolvedRoot, 0)
+  return roots
+}
+
+async function mapPrivateArtifactRoots(
+  roots: string[],
+  candidates: DiscoveredCheckpoint[]
+): Promise<Map<string, string>> {
+  const wanted = new Set(candidates.map((candidate) => candidate.artifactId))
+  const resolved = new Map<string, string>()
+  let next = 0
+  const workerCount = Math.min(4, roots.length)
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (next < roots.length) {
+        const root = roots[next]
+        next += 1
+        try {
+          const inspection = normalizeDiscoveredCheckpoint(
+            await runWorkerJson(['checkpoint', 'inspect', '--model-root', root, '--json'])
+          )
+          if (inspection && wanted.has(inspection.artifactId)) {
+            resolved.set(inspection.artifactId, root)
+          }
+        } catch {
+          // The discovery response remains authoritative; this private mapping
+          // pass simply prevents an unmapped item from reaching the renderer.
+        }
+      }
+    })
+  )
+  return resolved
+}
+
+export async function chooseCheckpointFolder(): Promise<CheckpointDiscovery | null> {
+  const selection = await dialog.showOpenDialog({
+    title: 'Select a folder containing STRUM model bundles',
+    properties: ['openDirectory']
+  })
+  if (selection.canceled || selection.filePaths.length === 0) return null
+  let modelRoot: string
+  try {
+    modelRoot = await realpath(selection.filePaths[0])
+  } catch {
+    throw new Error('The selected model folder is no longer available.')
+  }
+  const discovery = normalizeCheckpointDiscovery(
+    await runWorkerJson(['checkpoint', 'discover', '--model-root', modelRoot, '--json'])
+  )
+  const mappedRoots = await mapPrivateArtifactRoots(
+    await findPrivateModelBundleRoots(modelRoot),
+    discovery.candidates
+  )
+  const candidates = discovery.candidates.filter((candidate) =>
+    mappedRoots.has(candidate.artifactId)
+  )
+  for (const [artifactId, root] of mappedRoots) discoveredCheckpointRoots.set(artifactId, root)
+  return {
+    ...discovery,
+    candidateCount: candidates.length,
+    profileCount: candidates.reduce((total, candidate) => total + candidate.profiles.length, 0),
+    candidates
+  }
+}
+
+function privateCheckpointRoot(artifactId: string): string {
+  if (!isArtifactId(artifactId)) throw new Error('The selected checkpoint is invalid.')
+  const root = discoveredCheckpointRoots.get(artifactId)
+  if (!root) throw new Error('Select the checkpoint folder again before validation.')
+  return root
+}
+
+export async function inspectDiscoveredCheckpoint(
+  artifactId: string
+): Promise<DiscoveredCheckpoint> {
+  const root = privateCheckpointRoot(artifactId)
+  const inspection = normalizeDiscoveredCheckpoint(
+    await runWorkerJson(['checkpoint', 'inspect', '--model-root', root, '--json'])
+  )
+  if (!inspection || inspection.artifactId !== artifactId) {
+    throw new Error('The selected checkpoint changed after discovery.')
+  }
+  return inspection
+}
+
 function normalizeCheckpoint(
   payload: Record<string, unknown>,
   run: TrainingRun
@@ -693,71 +1090,76 @@ export async function inspectTrainingCheckpoint(runId: string): Promise<Training
 }
 
 export async function saveAutoChartProfile(runId: string): Promise<AutoChartProfile> {
-  const checkpoint = await inspectTrainingCheckpoint(runId)
-  if (!checkpoint.deployable) {
-    throw new Error('This experiment is not compatible with OCTAVE Auto Chart.')
+  void runId
+  throw new Error(
+    'Training experiments must be evaluated and packaged by STRUM, then selected from a verified model bundle folder.'
+  )
+}
+
+export async function saveDiscoveredAutoChartProfile(options: {
+  artifactId: string
+  profileId: string
+  difficultyPolicy: string
+}): Promise<AutoChartProfile> {
+  const checkpoint = await inspectDiscoveredCheckpoint(options.artifactId)
+  if (checkpoint.deploymentStatus !== 'ready') {
+    throw new Error('This bundle has no executable STRUM Auto Chart profile.')
   }
-  const registry = await readRegistry()
-  const run = registry.runs.find((entry) => entry.runId === runId && existsSync(entry.outputRoot))
-  if (!run) throw new Error('The selected training run is no longer available.')
+  const profile = checkpoint.profiles.find((entry) => entry.profileId === options.profileId)
+  if (
+    !profile ||
+    profile.execution.status !== 'available' ||
+    !profile.execution.difficultyPolicies.includes(options.difficultyPolicy)
+  ) {
+    throw new Error('The selected STRUM profile is not executable for that difficulty policy.')
+  }
   const runtime = await probeTrainingRuntime()
-  if (runtime.runtimeId !== checkpoint.runtimeId || !runtime.capabilities.includes('chart')) {
+  if (!runtime.capabilities.includes('chart')) {
     throw new Error('The selected STRUM runtime cannot run deployed Auto Chart profiles.')
   }
-  const profileId = `strum-profile-${randomUUID()}`
-  const requestPath = join(app.getPath('temp'), `octave-profile-${profileId}.json`)
-  try {
-    await writeFile(
-      requestPath,
-      JSON.stringify({ profile_id: profileId, checkpoint_root: run.outputRoot }),
-      'utf8'
-    )
-    const payload = await runWorkerJson([
-      'inference',
-      'profile',
-      'validate',
-      '--request',
-      requestPath,
-      '--json'
-    ])
-    if (payload.valid !== true) {
-      throw new Error('STRUM did not validate this checkpoint for Auto Chart.')
-    }
-    const profile = payload.profile
-    if (!profile || typeof profile !== 'object') {
-      throw new Error('STRUM did not return a valid Auto Chart profile.')
-    }
-    const value = profile as Record<string, unknown>
-    if (
-      value.profile_id !== profileId ||
-      value.pipeline_id !== checkpoint.pipelineId ||
-      value.runtime_id !== checkpoint.runtimeId
-    ) {
-      throw new Error('STRUM returned a profile that does not match this checkpoint.')
-    }
-    const saved: AutoChartProfile & { checkpointRoot: string } = {
-      profileId,
-      runId: checkpoint.runId,
-      pipelineId: checkpoint.pipelineId,
-      runtimeId: checkpoint.runtimeId,
-      createdAt: new Date().toISOString(),
-      isDefault: true,
-      checkpointRoot: run.outputRoot
-    }
-    registry.profiles = [
-      ...(registry.profiles ?? []).filter((entry) => entry.runId !== runId),
-      saved
-    ]
-    registry.defaultProfileId = profileId
-    await writeRegistry(registry)
-    return { ...saved, isDefault: true }
-  } finally {
-    try {
-      await unlink(requestPath)
-    } catch {
-      /* idempotent cleanup */
-    }
+  const root = privateCheckpointRoot(options.artifactId)
+  const validation = await runWorkerJson([
+    'inference',
+    'profile',
+    'validate',
+    '--model-root',
+    root,
+    '--profile',
+    profile.profileId,
+    '--difficulty-policy',
+    options.difficultyPolicy,
+    '--json'
+  ])
+  if (
+    validation.status !== 'ready' ||
+    validation.profile_id !== profile.profileId ||
+    validation.manifest_sha256 !== checkpoint.manifestSha256
+  ) {
+    throw new Error('STRUM did not validate the selected checkpoint profile.')
   }
+  const registry = await readRegistry()
+  const profileId = `octave-strum-profile-${randomUUID()}`
+  const saved: AutoChartProfile & { checkpointRoot: string } = {
+    profileId,
+    strumProfileId: profile.profileId,
+    artifactId: checkpoint.artifactId,
+    difficultyPolicy: options.difficultyPolicy,
+    pipelineId: profile.capability,
+    runtimeId: runtime.runtimeId,
+    createdAt: new Date().toISOString(),
+    isDefault: true,
+    checkpointRoot: root
+  }
+  registry.profiles = [
+    ...(registry.profiles ?? []).filter(
+      (entry) =>
+        entry.artifactId !== checkpoint.artifactId || entry.strumProfileId !== profile.profileId
+    ),
+    saved
+  ]
+  registry.defaultProfileId = profileId
+  await writeRegistry(registry)
+  return { ...saved, isDefault: true }
 }
 
 type ResolvedAutoChartProfile = AutoChartProfile & {
@@ -776,22 +1178,21 @@ async function resolveDefaultAutoChartProfile(): Promise<ResolvedAutoChartProfil
     await writeRegistry(registry)
     return null
   }
-  const requestPath = join(app.getPath('temp'), `octave-profile-check-${profile.profileId}.json`)
   try {
-    await writeFile(
-      requestPath,
-      JSON.stringify({ profile_id: profile.profileId, checkpoint_root: profile.checkpointRoot }),
-      'utf8'
-    )
+    const strumProfileId = profile.strumProfileId ?? profile.profileId
     const validation = await runWorkerJson([
       'inference',
       'profile',
       'validate',
-      '--request',
-      requestPath,
+      '--model-root',
+      profile.checkpointRoot,
+      '--profile',
+      strumProfileId,
+      '--difficulty-policy',
+      profile.difficultyPolicy ?? 'expert_only',
       '--json'
     ])
-    if (validation.valid !== true) {
+    if (validation.status !== 'ready' || validation.profile_id !== strumProfileId) {
       registry.defaultProfileId = undefined
       await writeRegistry(registry)
       return null
@@ -801,12 +1202,6 @@ async function resolveDefaultAutoChartProfile(): Promise<ResolvedAutoChartProfil
     registry.defaultProfileId = undefined
     await writeRegistry(registry)
     return null
-  } finally {
-    try {
-      await unlink(requestPath)
-    } catch {
-      /* idempotent cleanup */
-    }
   }
 }
 
@@ -837,7 +1232,7 @@ async function runResolvedAutoChartProfile(
   const requestPath = join(app.getPath('temp'), `octave-profile-chart-${options.runId}.json`)
   const request = {
     job_id: options.runId,
-    profile_id: profile.profileId,
+    profile_id: profile.strumProfileId ?? profile.profileId,
     model_root: profile.checkpointRoot,
     output_root: options.outputDir,
     inputs: {
@@ -850,7 +1245,7 @@ async function runResolvedAutoChartProfile(
     options: {
       enabled_tracks: options.enabledTracks,
       include_keys: options.includeKeys,
-      difficulty_policy: 'expert_only',
+      difficulty_policy: profile.difficultyPolicy ?? 'expert_only',
       disable_online_lookup: options.disableOnlineLookup,
       keep_stems: options.keepStems,
       star_power: options.starPower,
@@ -870,7 +1265,12 @@ async function runResolvedAutoChartProfile(
     const child = spawn(
       worker.command,
       [...worker.baseArgs, 'chart', '--request', requestPath, '--json-events'],
-      { stdio: ['ignore', 'pipe', 'pipe'], env: worker.env, detached: process.platform !== 'win32' }
+      {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: worker.env,
+        cwd: worker.cwd,
+        detached: process.platform !== 'win32'
+      }
     )
     runningProfiledAutoCharts.set(options.runId, { process: child, requestPath })
     let stdoutRemainder = ''
@@ -983,6 +1383,7 @@ async function startJsonEventJob(
     {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: worker.env,
+      cwd: worker.cwd,
       detached: process.platform !== 'win32'
     }
   )
