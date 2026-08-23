@@ -183,7 +183,10 @@ interface ChartEditorAPI {
     }>
     profiles: Array<{
       profileId: string
-      runId: string
+      runId?: string
+      strumProfileId?: string
+      artifactId?: string
+      difficultyPolicy?: string
       pipelineId: string
       runtimeId: string
       createdAt: string
@@ -240,6 +243,7 @@ interface ChartEditorAPI {
     profileId: string
     strumProfileId?: string
     artifactId?: string
+    difficultyPolicy?: string
     pipelineId: string
     runtimeId: string
     createdAt: string

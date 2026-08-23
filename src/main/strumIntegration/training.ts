@@ -109,6 +109,16 @@ export type AutoChartProfile = {
   isDefault: boolean
 }
 
+/**
+ * Local-only registry data. `checkpointRoot` must never cross the main-process
+ * boundary: renderer callers identify a verified bundle solely by its opaque
+ * artifact identity.
+ */
+type StoredAutoChartProfile = AutoChartProfile & {
+  checkpointRoot: string
+  manifestSha256?: string
+}
+
 export type DiscoveredCheckpointProfile = {
   profileId: string
   capability: string
@@ -196,7 +206,7 @@ type WorkerInvocation = {
 type TrainingRegistry = {
   tasks: Array<TrainingTask & { taskRoot: string; catalogRoot: string }>
   runs: Array<TrainingRun & { outputRoot: string }>
-  profiles?: Array<AutoChartProfile & { checkpointRoot: string }>
+  profiles?: StoredAutoChartProfile[]
   defaultProfileId?: string
 }
 
@@ -729,14 +739,26 @@ export async function listTrainingArtifacts(): Promise<{
       })),
     profiles: (registry.profiles ?? [])
       .filter((profile) => existsSync(profile.checkpointRoot))
-      .map((profile) => ({
-        profileId: profile.profileId,
-        runId: profile.runId,
-        pipelineId: profile.pipelineId,
-        runtimeId: profile.runtimeId,
-        createdAt: profile.createdAt,
-        isDefault: profile.profileId === registry.defaultProfileId
-      }))
+      .map((profile) =>
+        publicAutoChartProfile(profile, profile.profileId === registry.defaultProfileId)
+      )
+  }
+}
+
+function publicAutoChartProfile(
+  profile: StoredAutoChartProfile,
+  isDefault = profile.isDefault
+): AutoChartProfile {
+  return {
+    profileId: profile.profileId,
+    ...(profile.runId ? { runId: profile.runId } : {}),
+    ...(profile.strumProfileId ? { strumProfileId: profile.strumProfileId } : {}),
+    ...(profile.artifactId ? { artifactId: profile.artifactId } : {}),
+    ...(profile.difficultyPolicy ? { difficultyPolicy: profile.difficultyPolicy } : {}),
+    pipelineId: profile.pipelineId,
+    runtimeId: profile.runtimeId,
+    createdAt: profile.createdAt,
+    isDefault
   }
 }
 
@@ -996,6 +1018,10 @@ export async function chooseCheckpointFolder(): Promise<CheckpointDiscovery | nu
   } catch {
     throw new Error('The selected model folder is no longer available.')
   }
+  // A folder selection starts a new private discovery session. Do not retain
+  // artifact-to-path bindings from an earlier folder, even if an artifact ID
+  // happens to collide with a later result.
+  discoveredCheckpointRoots.clear()
   const discovery = normalizeCheckpointDiscovery(
     await runWorkerJson(['checkpoint', 'discover', '--model-root', modelRoot, '--json'])
   )
@@ -1139,10 +1165,11 @@ export async function saveDiscoveredAutoChartProfile(options: {
   }
   const registry = await readRegistry()
   const profileId = `octave-strum-profile-${randomUUID()}`
-  const saved: AutoChartProfile & { checkpointRoot: string } = {
+  const saved: StoredAutoChartProfile = {
     profileId,
     strumProfileId: profile.profileId,
     artifactId: checkpoint.artifactId,
+    manifestSha256: checkpoint.manifestSha256,
     difficultyPolicy: options.difficultyPolicy,
     pipelineId: profile.capability,
     runtimeId: runtime.runtimeId,
@@ -1159,11 +1186,18 @@ export async function saveDiscoveredAutoChartProfile(options: {
   ]
   registry.defaultProfileId = profileId
   await writeRegistry(registry)
-  return { ...saved, isDefault: true }
+  return publicAutoChartProfile(saved, true)
 }
 
-type ResolvedAutoChartProfile = AutoChartProfile & {
-  checkpointRoot: string
+type ResolvedAutoChartProfile = StoredAutoChartProfile
+
+async function discardInvalidDefaultProfile(
+  registry: TrainingRegistry,
+  profileId: string
+): Promise<void> {
+  registry.profiles = (registry.profiles ?? []).filter((entry) => entry.profileId !== profileId)
+  if (registry.defaultProfileId === profileId) registry.defaultProfileId = undefined
+  await writeRegistry(registry)
 }
 
 async function resolveDefaultAutoChartProfile(): Promise<ResolvedAutoChartProfile | null> {
@@ -1174,11 +1208,34 @@ async function resolveDefaultAutoChartProfile(): Promise<ResolvedAutoChartProfil
   if (!profile) return null
   const runtime = await probeTrainingRuntime()
   if (runtime.runtimeId !== profile.runtimeId || !runtime.capabilities.includes('chart')) {
-    registry.defaultProfileId = undefined
-    await writeRegistry(registry)
+    await discardInvalidDefaultProfile(registry, profile.profileId)
     return null
   }
   try {
+    // A profile is usable only when the current bundle re-inspection retains
+    // the exact artifact and manifest identity that OCTAVE saved.
+    if (!profile.artifactId || !profile.manifestSha256) {
+      await discardInvalidDefaultProfile(registry, profile.profileId)
+      return null
+    }
+    const inspection = normalizeDiscoveredCheckpoint(
+      await runWorkerJson([
+        'checkpoint',
+        'inspect',
+        '--model-root',
+        profile.checkpointRoot,
+        '--json'
+      ])
+    )
+    if (
+      !inspection ||
+      inspection.artifactId !== profile.artifactId ||
+      inspection.manifestSha256 !== profile.manifestSha256 ||
+      inspection.deploymentStatus !== 'ready'
+    ) {
+      await discardInvalidDefaultProfile(registry, profile.profileId)
+      return null
+    }
     const strumProfileId = profile.strumProfileId ?? profile.profileId
     const validation = await runWorkerJson([
       'inference',
@@ -1192,15 +1249,17 @@ async function resolveDefaultAutoChartProfile(): Promise<ResolvedAutoChartProfil
       profile.difficultyPolicy ?? 'expert_only',
       '--json'
     ])
-    if (validation.status !== 'ready' || validation.profile_id !== strumProfileId) {
-      registry.defaultProfileId = undefined
-      await writeRegistry(registry)
+    if (
+      validation.status !== 'ready' ||
+      validation.profile_id !== strumProfileId ||
+      validation.manifest_sha256 !== profile.manifestSha256
+    ) {
+      await discardInvalidDefaultProfile(registry, profile.profileId)
       return null
     }
     return profile
   } catch {
-    registry.defaultProfileId = undefined
-    await writeRegistry(registry)
+    await discardInvalidDefaultProfile(registry, profile.profileId)
     return null
   }
 }

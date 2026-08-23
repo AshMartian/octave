@@ -242,7 +242,10 @@ const api = {
     }>
     profiles: Array<{
       profileId: string
-      runId: string
+      runId?: string
+      strumProfileId?: string
+      artifactId?: string
+      difficultyPolicy?: string
       pipelineId: string
       runtimeId: string
       createdAt: string
@@ -304,6 +307,7 @@ const api = {
     profileId: string
     strumProfileId?: string
     artifactId?: string
+    difficultyPolicy?: string
     pipelineId: string
     runtimeId: string
     createdAt: string
