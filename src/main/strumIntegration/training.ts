@@ -4,6 +4,13 @@ import { createHash, randomUUID } from 'crypto'
 import { createReadStream, existsSync, type Dirent } from 'fs'
 import { mkdir, readFile, readdir, realpath, stat, unlink, writeFile } from 'fs/promises'
 import { join } from 'path'
+import type {
+  StrumCheckpointCandidateInputContract,
+  StrumCheckpointCandidateOutputContract,
+  StrumCheckpointCandidateTargetContract,
+  StrumCheckpointOutputCandidate,
+  StrumCheckpointOutputContracts
+} from '../../shared/strumTrainingContracts'
 import { resolvePythonCommand, type PythonCommand } from './runner'
 import { sanitizeTrainingSchemaValues } from './trainingSchema'
 import type { AutoChartRunOptions, AutoChartRunResult } from './types'
@@ -36,6 +43,7 @@ export type TrainingPipeline = {
   prepare_schema: Record<string, unknown>
   train_schema: Record<string, unknown>
   checkpoint_outputs: string[]
+  checkpoint_output_contracts?: StrumCheckpointOutputContracts
   inference_capability: string | null
 }
 
@@ -656,18 +664,407 @@ export async function chooseInstalledTrainingRuntime(): Promise<TrainingRuntime 
   }
 }
 
+const CHECKPOINT_OUTPUT_CONTRACTS_FORMAT = 'strum-candidate-checkpoint-output-contracts/v1'
+const MAX_OUTPUT_CONTRACT_CANDIDATES = 16
+const MAX_OUTPUT_CONTRACT_LIST_LENGTH = 32
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function hasOnlyKeys(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  required: readonly string[] = allowed
+): boolean {
+  return (
+    required.every((key) => Object.prototype.hasOwnProperty.call(value, key)) &&
+    Object.keys(value).every((key) => allowed.includes(key))
+  )
+}
+
+function isSafeContractName(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    /^[A-Za-z][A-Za-z0-9._-]{0,120}(?:\/[A-Za-z][A-Za-z0-9._-]{0,120})*\/v[1-9][0-9]*$/.test(value)
+  )
+}
+
+function isSafeContractToken(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value)
+}
+
+function normalizeContractStrings(
+  value: unknown,
+  predicate: (entry: unknown) => entry is string
+): string[] | null {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_OUTPUT_CONTRACT_LIST_LENGTH)
+    return null
+  if (!value.every(predicate) || new Set(value).size !== value.length) return null
+  return [...value]
+}
+
+function normalizeIntegerPair(
+  value: unknown,
+  minimum: number,
+  maximum: number
+): [number, number] | null {
+  if (
+    !Array.isArray(value) ||
+    value.length !== 2 ||
+    !Number.isSafeInteger(value[0]) ||
+    !Number.isSafeInteger(value[1]) ||
+    value[0] < minimum ||
+    value[1] > maximum ||
+    value[0] > value[1]
+  ) {
+    return null
+  }
+  return [value[0], value[1]]
+}
+
+function normalizeCandidateInputContract(
+  value: unknown
+): StrumCheckpointCandidateInputContract | null {
+  if (!isRecord(value) || !isSafeContractName(value.format)) return null
+  if (Object.prototype.hasOwnProperty.call(value, 'event_time_source')) {
+    if (
+      !hasOnlyKeys(value, [
+        'format',
+        'event_time_source',
+        'free_running_event_proposal',
+        'sequence_decoding',
+        'midi_emission'
+      ]) ||
+      !isSafeContractToken(value.event_time_source) ||
+      typeof value.free_running_event_proposal !== 'boolean' ||
+      typeof value.sequence_decoding !== 'boolean' ||
+      typeof value.midi_emission !== 'boolean'
+    ) {
+      return null
+    }
+    return {
+      format: value.format,
+      event_time_source: value.event_time_source,
+      free_running_event_proposal: value.free_running_event_proposal,
+      sequence_decoding: value.sequence_decoding,
+      midi_emission: value.midi_emission
+    }
+  }
+  if (
+    !hasOnlyKeys(value, [
+      'format',
+      'requires_midi_at_inference',
+      'offline_window_scoring',
+      'free_running_event_proposal',
+      'sequence_decoding',
+      'midi_emission'
+    ]) ||
+    typeof value.requires_midi_at_inference !== 'boolean' ||
+    typeof value.offline_window_scoring !== 'boolean' ||
+    typeof value.free_running_event_proposal !== 'boolean' ||
+    typeof value.sequence_decoding !== 'boolean' ||
+    typeof value.midi_emission !== 'boolean'
+  ) {
+    return null
+  }
+  return {
+    format: value.format,
+    requires_midi_at_inference: value.requires_midi_at_inference,
+    offline_window_scoring: value.offline_window_scoring,
+    free_running_event_proposal: value.free_running_event_proposal,
+    sequence_decoding: value.sequence_decoding,
+    midi_emission: value.midi_emission
+  }
+}
+
+function normalizeCandidateOutputContract(
+  value: unknown
+): StrumCheckpointCandidateOutputContract | null {
+  if (!isRecord(value) || !isSafeContractName(value.format)) return null
+  if (Object.prototype.hasOwnProperty.call(value, 'outputs')) {
+    const outputs = normalizeContractStrings(value.outputs, isSafeContractToken)
+    if (
+      !hasOnlyKeys(value, [
+        'format',
+        'outputs',
+        'free_running_event_proposal',
+        'sequence_decoding',
+        'midi_emission'
+      ]) ||
+      !outputs ||
+      typeof value.free_running_event_proposal !== 'boolean' ||
+      typeof value.sequence_decoding !== 'boolean' ||
+      typeof value.midi_emission !== 'boolean'
+    ) {
+      return null
+    }
+    return {
+      format: value.format,
+      outputs,
+      free_running_event_proposal: value.free_running_event_proposal,
+      sequence_decoding: value.sequence_decoding,
+      midi_emission: value.midi_emission
+    }
+  }
+  if (
+    !hasOnlyKeys(value, ['format', 'event_attributes', 'midi_emission']) ||
+    typeof value.event_attributes !== 'boolean' ||
+    typeof value.midi_emission !== 'boolean'
+  ) {
+    return null
+  }
+  return {
+    format: value.format,
+    event_attributes: value.event_attributes,
+    midi_emission: value.midi_emission
+  }
+}
+
+function normalizeCandidateTargetContract(
+  value: unknown
+): StrumCheckpointCandidateTargetContract | null {
+  if (!isRecord(value) || !isSafeContractName(value.kind)) return null
+  const allowed = [
+    'kind',
+    'string_count',
+    'fret_range',
+    'techniques',
+    'track_variant_head',
+    'pitch_range',
+    'channel_metadata',
+    'range_state_head'
+  ]
+  if (!hasOnlyKeys(value, allowed, ['kind'])) return null
+  const target: StrumCheckpointCandidateTargetContract = { kind: value.kind }
+  if (Object.prototype.hasOwnProperty.call(value, 'string_count')) {
+    const stringCount = value.string_count
+    if (
+      typeof stringCount !== 'number' ||
+      !Number.isSafeInteger(stringCount) ||
+      stringCount < 1 ||
+      stringCount > 12
+    )
+      return null
+    target.string_count = stringCount
+  }
+  if (Object.prototype.hasOwnProperty.call(value, 'fret_range')) {
+    const range = normalizeIntegerPair(value.fret_range, 0, 127)
+    if (!range) return null
+    target.fret_range = range
+  }
+  if (Object.prototype.hasOwnProperty.call(value, 'techniques')) {
+    const techniques = normalizeContractStrings(value.techniques, isSafeContractToken)
+    if (!techniques) return null
+    target.techniques = techniques
+  }
+  if (Object.prototype.hasOwnProperty.call(value, 'track_variant_head')) {
+    const variants = normalizeContractStrings(value.track_variant_head, isSafeContractToken)
+    if (!variants) return null
+    target.track_variant_head = variants
+  }
+  if (Object.prototype.hasOwnProperty.call(value, 'pitch_range')) {
+    const range = normalizeIntegerPair(value.pitch_range, 0, 127)
+    if (!range) return null
+    target.pitch_range = range
+  }
+  if (Object.prototype.hasOwnProperty.call(value, 'channel_metadata')) {
+    if (!isSafeContractName(value.channel_metadata)) return null
+    target.channel_metadata = value.channel_metadata
+  }
+  if (Object.prototype.hasOwnProperty.call(value, 'range_state_head')) {
+    const states = normalizeContractStrings(value.range_state_head, isSafeContractToken)
+    if (!states) return null
+    target.range_state_head = states
+  }
+  return target
+}
+
+function normalizeCheckpointOutputCandidate(
+  value: unknown,
+  pipelineId: string
+): StrumCheckpointOutputCandidate | null {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, [
+      'component_outputs',
+      'model_outputs',
+      'preprocessing',
+      'candidate_bundle',
+      'deployment_scope'
+    ])
+  ) {
+    return null
+  }
+  const componentOutputs = normalizeContractStrings(value.component_outputs, isSafeContractToken)
+  const modelOutputs = normalizeContractStrings(value.model_outputs, isSafeContractToken)
+  const preprocessing = value.preprocessing
+  const bundle = value.candidate_bundle
+  const scope = value.deployment_scope
+  const negativePolicy =
+    isRecord(preprocessing) &&
+    Object.prototype.hasOwnProperty.call(preprocessing, 'negative_policy')
+      ? preprocessing.negative_policy
+      : undefined
+  if (
+    !componentOutputs ||
+    !modelOutputs ||
+    !isRecord(preprocessing) ||
+    !hasOnlyKeys(
+      preprocessing,
+      ['id', 'input_contract', 'negative_policy'],
+      ['id', 'input_contract']
+    ) ||
+    !isSafeContractName(preprocessing.id) ||
+    !isSafeContractName(preprocessing.input_contract) ||
+    (negativePolicy !== undefined && !isSafeContractName(negativePolicy)) ||
+    !isRecord(bundle) ||
+    !hasOnlyKeys(
+      bundle,
+      [
+        'config_format',
+        'task_kind',
+        'pipeline_id',
+        'model_implementation',
+        'input_contract',
+        'output_contract',
+        'target_contract',
+        'component_set',
+        'profiles',
+        'companions'
+      ],
+      [
+        'config_format',
+        'task_kind',
+        'pipeline_id',
+        'model_implementation',
+        'input_contract',
+        'output_contract',
+        'component_set',
+        'profiles',
+        'companions'
+      ]
+    ) ||
+    !isSafeContractName(bundle.config_format) ||
+    !isSafeContractToken(bundle.task_kind) ||
+    bundle.pipeline_id !== pipelineId ||
+    !isSafeContractName(bundle.pipeline_id) ||
+    !isSafeContractName(bundle.model_implementation) ||
+    bundle.profiles !== 'forbidden' ||
+    bundle.companions !== 'forbidden' ||
+    !isRecord(scope) ||
+    !hasOnlyKeys(scope, ['status', 'profile', 'chart_execution']) ||
+    scope.status !== 'raw_experiment_candidate_only' ||
+    scope.profile !== 'not_available' ||
+    scope.chart_execution !== 'not_available'
+  ) {
+    return null
+  }
+  const inputContract = normalizeCandidateInputContract(bundle.input_contract)
+  const outputContract = normalizeCandidateOutputContract(bundle.output_contract)
+  const componentSet = normalizeContractStrings(bundle.component_set, isSafeContractToken)
+  const targetContract = Object.prototype.hasOwnProperty.call(bundle, 'target_contract')
+    ? normalizeCandidateTargetContract(bundle.target_contract)
+    : undefined
+  if (
+    !inputContract ||
+    !outputContract ||
+    !componentSet ||
+    componentSet.join('\u0000') !== componentOutputs.join('\u0000') ||
+    (Object.prototype.hasOwnProperty.call(bundle, 'target_contract') && !targetContract)
+  ) {
+    return null
+  }
+  return {
+    component_outputs: componentOutputs,
+    model_outputs: modelOutputs,
+    preprocessing: {
+      id: preprocessing.id,
+      input_contract: preprocessing.input_contract,
+      ...(negativePolicy ? { negative_policy: negativePolicy } : {})
+    },
+    candidate_bundle: {
+      config_format: bundle.config_format,
+      task_kind: bundle.task_kind,
+      pipeline_id: bundle.pipeline_id,
+      model_implementation: bundle.model_implementation,
+      input_contract: inputContract,
+      output_contract: outputContract,
+      ...(targetContract ? { target_contract: targetContract } : {}),
+      component_set: componentSet,
+      profiles: 'forbidden',
+      companions: 'forbidden'
+    },
+    deployment_scope: {
+      status: 'raw_experiment_candidate_only',
+      profile: 'not_available',
+      chart_execution: 'not_available'
+    }
+  }
+}
+
+function normalizeCheckpointOutputContracts(
+  value: unknown,
+  pipelineId: string
+): StrumCheckpointOutputContracts | null {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, ['format', 'selector', 'by_candidate_kind']) ||
+    value.format !== CHECKPOINT_OUTPUT_CONTRACTS_FORMAT ||
+    !isRecord(value.selector) ||
+    !hasOnlyKeys(value.selector, ['training_option', 'default']) ||
+    !isSafeContractToken(value.selector.training_option) ||
+    !isSafeContractName(value.selector.default) ||
+    !isRecord(value.by_candidate_kind)
+  ) {
+    return null
+  }
+  const entries = Object.entries(value.by_candidate_kind)
+  if (
+    entries.length === 0 ||
+    entries.length > MAX_OUTPUT_CONTRACT_CANDIDATES ||
+    !entries.every(([candidateKind]) => isSafeContractName(candidateKind)) ||
+    !Object.prototype.hasOwnProperty.call(value.by_candidate_kind, value.selector.default)
+  ) {
+    return null
+  }
+  const normalizedEntries = entries.map(
+    ([candidateKind, candidate]) =>
+      [candidateKind, normalizeCheckpointOutputCandidate(candidate, pipelineId)] as const
+  )
+  if (normalizedEntries.some(([, candidate]) => candidate === null)) return null
+  return {
+    format: CHECKPOINT_OUTPUT_CONTRACTS_FORMAT,
+    selector: {
+      training_option: value.selector.training_option,
+      default: value.selector.default
+    },
+    by_candidate_kind: Object.fromEntries(
+      normalizedEntries.filter(
+        (entry): entry is readonly [string, StrumCheckpointOutputCandidate] => entry[1] !== null
+      )
+    )
+  }
+}
+
+function normalizeTrainingPipeline(value: unknown): TrainingPipeline | null {
+  if (!isRecord(value) || typeof value.id !== 'string') return null
+  const rawContracts = value.checkpoint_output_contracts
+  if (rawContracts === undefined) return value as TrainingPipeline
+  const contracts = normalizeCheckpointOutputContracts(rawContracts, value.id)
+  if (!contracts) return null
+  return { ...(value as TrainingPipeline), checkpoint_output_contracts: contracts }
+}
+
 export async function listTrainingPipelines(): Promise<TrainingPipeline[]> {
   const runtime = await probeTrainingRuntime()
   if (!runtime.capabilities.includes('training')) return []
   const payload = await runWorkerJson(['pipeline', 'list', '--json'])
   const pipelines = Array.isArray(payload.pipelines) ? payload.pipelines : []
-  return pipelines.filter((pipeline): pipeline is TrainingPipeline =>
-    Boolean(
-      pipeline &&
-      typeof pipeline === 'object' &&
-      typeof (pipeline as Record<string, unknown>).id === 'string'
-    )
-  )
+  return pipelines.flatMap((pipeline) => {
+    const normalized = normalizeTrainingPipeline(pipeline)
+    return normalized ? [normalized] : []
+  })
 }
 
 async function resolveTrainingPipeline(pipelineId: string): Promise<TrainingPipeline> {

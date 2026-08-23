@@ -1,4 +1,5 @@
 import { ElectronAPI } from '@electron-toolkit/preload'
+import type { StrumCheckpointOutputContracts } from '../shared/strumTrainingContracts'
 import type {
   MetadataArtwork,
   SongMetadataSearchRequest,
@@ -159,6 +160,7 @@ interface ChartEditorAPI {
       prepare_schema: Record<string, unknown>
       train_schema: Record<string, unknown>
       checkpoint_outputs: string[]
+      checkpoint_output_contracts?: StrumCheckpointOutputContracts
       inference_capability: string | null
     }>
   >
