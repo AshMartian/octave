@@ -77,12 +77,18 @@ Existing `OCTAVE_STRUM_SOURCE_DIR` and `OCTAVE_STRUM_PYTHON` remain development 
   },
   "prepare_schema": { "type": "object" },
   "train_schema": { "type": "object" },
+  "private_request_fields": ["catalog_root"],
+  "catalog_inspection_option_keys": [
+    "audio_role",
+    "fallback_audio_role",
+    "required_difficulty"
+  ],
   "checkpoint_outputs": ["guitar_onset", "guitar_fret"],
   "inference_capability": "guitar.audio_to_chart/v1"
 }
 ```
 
-Future descriptors follow the same shape: `drums.onset-velocity/v*`, `bass.onset-fret/v*`, `vocals.pitch-lyrics/v*`, Pro-instrument pipelines, and `difficulty.transform/v*`. The difficulty transform is a learned STRUM pipeline; OCTAVE may request it and display provenance/confidence but must not own the deterministic Expert-to-lower-difficulty strategy.
+`private_request_fields` names only host-main-process values such as `catalog_root` or a verified `parent_bundle`; it never contains a filesystem value. `catalog_inspection_option_keys` limits which schema controls OCTAVE may pass into a readiness inspection. Together they let OCTAVE discover the orchestration boundary from STRUM rather than carrying a pipeline-ID allowlist. Future descriptors follow the same shape: `drums.onset-velocity/v*`, `bass.onset-fret/v*`, `vocals.pitch-lyrics/v*`, Pro-instrument pipelines, and `difficulty.transform/v*`. The difficulty transform is a learned STRUM pipeline; OCTAVE may request it and display provenance/confidence but must not own the deterministic Expert-to-lower-difficulty strategy.
 
 ### Current training coverage
 
@@ -157,7 +163,7 @@ OCTAVE lists only pipelines advertised by the selected runtime. It sends the cat
 
 ### Train
 
-OCTAVE renders only fields declared by a pipeline's `train_schema`: model and bounded training settings such as checkpoint mode, epochs/steps, batch size, device/precision, seed, and approved augmentation/evaluation choices. Renderer-visible schemas must never include filesystem locations. For catalog-backed Guitar/Drums training, OCTAVE privately adds the prepared catalog root to the main-process request. For chart-transform fine-tuning it presents an opaque compatible parent-artifact selector, resolves that to a verified bundle privately, and adds the private parent bundle only after preflight. It supervises the worker state machine `queued → validating → provisioning → running → cancelling → terminal`, relays JSON progress, and stores a safe job summary.
+OCTAVE renders only fields declared by a pipeline's `train_schema`: model and bounded training settings such as checkpoint mode, epochs/steps, batch size, device/precision, seed, and approved augmentation/evaluation choices. Renderer-visible schemas must never include filesystem locations. It uses the STRUM descriptor's `private_request_fields` to add a prepared catalog root or verified parent bundle only in the main-process request; it does not carry a hard-coded catalog-worker list. For chart-transform fine-tuning it presents an opaque compatible parent-artifact selector, resolves that to a verified bundle privately, and adds the private parent bundle only after preflight. It supervises the worker state machine `queued → validating → provisioning → running → cancelling → terminal`, relays JSON progress, and stores a safe job summary.
 
 **STRUM calls:** `train start` (or synchronous `train run`) with newline-delimited JSON events.
 
