@@ -112,16 +112,33 @@ type TrainingRun = {
   createdAt: string
 }
 
-type TrainingCheckpoint = {
-  runId: string
-  pipelineId: string
-  runtimeId: string
-  taskViewId: string
-  taskViewHash: string
-  checkpointManifestHash: string
-  deployable: boolean
-  deploymentReason: string | null
+type DiscoveredCheckpointProfile = {
+  profileId: string
+  capability: string
+  instruments: string[]
+  difficultyPolicies: string[]
+  requiredComponents: string[]
+  execution: { status: 'available' | 'not_available'; difficultyPolicies: string[] }
+}
+
+type DiscoveredCheckpoint = {
+  artifactId: string
+  modelId: string
+  manifestSha256: string
+  schemaVersion: number
+  compatibility: Record<string, string | number>
   components: Array<{ id: string; sha256: string; byteLength: number }>
+  profiles: DiscoveredCheckpointProfile[]
+  rejectedProfileCount: number
+  deploymentStatus: 'ready' | 'not_deployable'
+}
+
+type CheckpointDiscovery = {
+  candidateCount: number
+  profileCount: number
+  rejectedBundleCount: number
+  truncated: boolean
+  candidates: DiscoveredCheckpoint[]
 }
 
 type AutoChartProfile = {
@@ -167,7 +184,7 @@ const TRAINING_STEP_TAGLINES = {
   curate: 'Select approved songs and sources for your STRUM catalog.',
   prepare: 'Create a STRUM task view from the approved catalog assets.',
   train: 'Run STRUM from the prepared catalog and follow progress in the background.',
-  deploy: 'Inspect local experiment checkpoints before deployment is allowed.'
+  deploy: 'Discover, inspect, and validate a STRUM model bundle before making it your default.'
 } as const satisfies Record<TrainingStep, string>
 
 const TRAINING_STEP_DETAILS = [
@@ -487,8 +504,13 @@ export function TrainingModal({
   const [trainingRuns, setTrainingRuns] = useState<TrainingRun[]>([])
   const [trainingProfiles, setTrainingProfiles] = useState<AutoChartProfile[]>([])
   const [selectedTaskViewId, setSelectedTaskViewId] = useState('')
-  const [selectedRunId, setSelectedRunId] = useState('')
-  const [selectedCheckpoint, setSelectedCheckpoint] = useState<TrainingCheckpoint | null>(null)
+  const [checkpointDiscovery, setCheckpointDiscovery] = useState<CheckpointDiscovery | null>(null)
+  const [selectedArtifactId, setSelectedArtifactId] = useState('')
+  const [selectedDiscoveredCheckpoint, setSelectedDiscoveredCheckpoint] =
+    useState<DiscoveredCheckpoint | null>(null)
+  const [selectedDiscoveredProfileId, setSelectedDiscoveredProfileId] = useState('')
+  const [selectedDifficultyPolicy, setSelectedDifficultyPolicy] = useState('')
+  const [discoveringCheckpoints, setDiscoveringCheckpoints] = useState(false)
   const [savingAutoChartProfile, setSavingAutoChartProfile] = useState(false)
   const [trainingJob, setTrainingJob] = useState<TrainingJob | null>(null)
   const [prepareConfig, setPrepareConfig] = useState<Record<string, TrainingControlValue>>({})
@@ -520,6 +542,13 @@ export function TrainingModal({
   )
   const selectedPipelineName = selectedPipeline?.display_name ?? 'STRUM'
   const selectedInstrument = selectedPipeline?.catalog_requirements.instrument ?? 'training'
+  const selectedDiscoveredProfile = useMemo(
+    () =>
+      selectedDiscoveredCheckpoint?.profiles.find(
+        (profile) => profile.profileId === selectedDiscoveredProfileId
+      ) ?? null,
+    [selectedDiscoveredCheckpoint, selectedDiscoveredProfileId]
+  )
 
   const refreshLibrary = useCallback(async (): Promise<void> => {
     setLoading(true)
@@ -631,11 +660,6 @@ export function TrainingModal({
         ? current
         : (artifacts.tasks[0]?.taskViewId ?? '')
     )
-    setSelectedRunId((current) =>
-      artifacts.runs.some((run) => run.runId === current)
-        ? current
-        : (artifacts.runs[0]?.runId ?? '')
-    )
   }, [])
 
   useEffect(() => {
@@ -697,23 +721,30 @@ export function TrainingModal({
   }, [activeStep, catalogParent, selectedCatalog, selectedPipelineId, trainingRuntime])
 
   useEffect(() => {
-    if (activeStep !== 'deploy' || !selectedRunId) {
-      setSelectedCheckpoint(null)
+    if (activeStep !== 'deploy' || !selectedArtifactId) {
+      setSelectedDiscoveredCheckpoint(null)
       return
     }
     let current = true
+    setSelectedDiscoveredCheckpoint(null)
     void window.api
-      .inspectTrainingCheckpoint(selectedRunId)
+      .inspectDiscoveredTrainingCheckpoint(selectedArtifactId)
       .then((checkpoint) => {
-        if (current) setSelectedCheckpoint(checkpoint)
+        if (!current) return
+        setSelectedDiscoveredCheckpoint(checkpoint)
+        const availableProfile = checkpoint.profiles.find(
+          (profile) => profile.execution.status === 'available'
+        )
+        setSelectedDiscoveredProfileId(availableProfile?.profileId ?? '')
+        setSelectedDifficultyPolicy(availableProfile?.execution.difficultyPolicies[0] ?? '')
       })
       .catch(() => {
-        if (current) setSelectedCheckpoint(null)
+        if (current) setSelectedDiscoveredCheckpoint(null)
       })
     return () => {
       current = false
     }
-  }, [activeStep, selectedRunId])
+  }, [activeStep, selectedArtifactId])
 
   useEffect(() => {
     if (scanningPackages) {
@@ -1002,12 +1033,42 @@ export function TrainingModal({
     await refreshTrainingState()
   }
 
+  const discoverCheckpointFolder = async (): Promise<void> => {
+    setDiscoveringCheckpoints(true)
+    setError(null)
+    try {
+      const discovery = await window.api.chooseTrainingCheckpointFolder()
+      if (!discovery) return
+      setCheckpointDiscovery(discovery)
+      setSelectedArtifactId('')
+      setSelectedDiscoveredCheckpoint(null)
+      setSelectedDiscoveredProfileId('')
+      setSelectedDifficultyPolicy('')
+    } catch {
+      setError('STRUM could not discover verified model bundles in that folder.')
+    } finally {
+      setDiscoveringCheckpoints(false)
+    }
+  }
+
   const saveSelectedAutoChartProfile = async (): Promise<void> => {
-    if (!selectedCheckpoint?.deployable) return
+    if (
+      !selectedDiscoveredCheckpoint ||
+      selectedDiscoveredCheckpoint.deploymentStatus !== 'ready' ||
+      !selectedDiscoveredProfile ||
+      selectedDiscoveredProfile.execution.status !== 'available' ||
+      !selectedDiscoveredProfile.execution.difficultyPolicies.includes(selectedDifficultyPolicy)
+    ) {
+      return
+    }
     setSavingAutoChartProfile(true)
     setError(null)
     try {
-      await window.api.saveAutoChartProfile(selectedCheckpoint.runId)
+      await window.api.saveDiscoveredAutoChartProfile({
+        artifactId: selectedDiscoveredCheckpoint.artifactId,
+        profileId: selectedDiscoveredProfile.profileId,
+        difficultyPolicy: selectedDifficultyPolicy
+      })
       await refreshTrainingState()
     } catch {
       setError('STRUM did not validate this checkpoint for Auto Chart.')
@@ -1073,9 +1134,6 @@ export function TrainingModal({
     }
     if (step === 'train' && selectedPipelineTasks.length === 0) {
       return 'Prepare a task view for the selected pipeline before training.'
-    }
-    if (step === 'deploy' && trainingRuns.length === 0) {
-      return 'Complete a training run before deployment can be evaluated.'
     }
     return null
   }
@@ -1705,87 +1763,163 @@ export function TrainingModal({
             <section className="training-step-panel training-deploy-panel">
               <h3>Deploy a validated profile</h3>
               <p>
-                OCTAVE only offers checkpoint bundles that STRUM has inspected, hash-validated, and
-                declared compatible with the selected local Auto Chart runtime. The shipped profile
-                remains the fallback.
+                Choose a local model-bundle folder. OCTAVE asks STRUM to discover and hash-check its
+                manifests, then keeps the selected folder and bundle mapping in the main process.
+                Experiment folders never become Auto Chart defaults directly.
               </p>
-              {trainingRuns.length === 0 ? (
-                <p className="dataset-message warning">
-                  A completed training run is required before deployment can be evaluated.
-                </p>
-              ) : (
+              <button
+                className="dataset-secondary"
+                disabled={discoveringCheckpoints}
+                onClick={() => void discoverCheckpointFolder()}
+              >
+                {discoveringCheckpoints ? 'Discovering bundles…' : 'Choose model-bundle folder'}
+              </button>
+              {checkpointDiscovery && (
                 <>
-                  <div className="training-artifact-list training-deploy-runs">
-                    <h4>Select a completed run</h4>
-                    {trainingRuns.map((run) => (
-                      <button
-                        className={selectedRunId === run.runId ? 'selected' : ''}
-                        key={run.runId}
-                        onClick={() => setSelectedRunId(run.runId)}
-                      >
-                        <span>
-                          <strong>{run.pipelineId}</strong>
-                          <small>
-                            {run.checkpointCount} components ·{' '}
-                            {run.deployable ? 'declared deployable' : 'experiment only'}
-                          </small>
-                        </span>
-                        <span
-                          className={
-                            run.deployable ? 'training-status-ready' : 'training-status-neutral'
-                          }
-                        >
-                          {selectedRunId === run.runId ? 'Inspecting' : 'Inspect'}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                  {selectedCheckpoint ? (
-                    <div className="training-checkpoint-summary">
-                      <div>
-                        <span>Pipeline</span>
-                        <strong>{selectedCheckpoint.pipelineId}</strong>
-                      </div>
-                      <div>
-                        <span>Verified components</span>
-                        <strong>{selectedCheckpoint.components.length}</strong>
-                      </div>
-                      <div>
-                        <span>Deployment</span>
-                        <strong>
-                          {selectedCheckpoint.deployable ? 'Eligible for validation' : 'Blocked'}
-                        </strong>
-                      </div>
-                    </div>
-                  ) : (
-                    <p className="training-inline-note">
-                      Inspecting the selected checkpoint bundle…
+                  <p className="training-inline-note">
+                    STRUM found {checkpointDiscovery.candidateCount} verified bundle
+                    {checkpointDiscovery.candidateCount === 1 ? '' : 's'} and{' '}
+                    {checkpointDiscovery.profileCount} declared profile
+                    {checkpointDiscovery.profileCount === 1 ? '' : 's'}.
+                    {checkpointDiscovery.rejectedBundleCount > 0
+                      ? ` ${checkpointDiscovery.rejectedBundleCount} invalid bundle${checkpointDiscovery.rejectedBundleCount === 1 ? '' : 's'} hidden.`
+                      : ''}
+                    {checkpointDiscovery.truncated
+                      ? ' Discovery was bounded; narrow the folder to see more.'
+                      : ''}
+                  </p>
+                  {checkpointDiscovery.candidates.length === 0 ? (
+                    <p className="dataset-message warning">
+                      No hash-verified STRUM model bundles were found in that folder.
                     </p>
-                  )}
-                  {!selectedCheckpoint?.deployable && (
-                    <aside className="training-deploy-blocked">
-                      <strong>Deployment safely blocked</strong>
-                      <p>
-                        {selectedCheckpoint?.deploymentReason ??
-                          'This checkpoint is an experiment artifact, not a validated OCTAVE Auto Chart model bundle.'}
-                      </p>
-                    </aside>
-                  )}
-                  {trainingProfiles.length > 0 && (
-                    <div className="training-profile-summary">
-                      {trainingProfiles.map((profile) => (
-                        <span key={profile.profileId}>
-                          {profile.pipelineId}{' '}
-                          {profile.isDefault ? '· current Auto Chart default' : ''}
-                        </span>
-                      ))}
+                  ) : (
+                    <div className="training-artifact-list training-deploy-runs">
+                      <h4>Verified model bundles</h4>
+                      {checkpointDiscovery.candidates.map((candidate) =>
+                        candidate.deploymentStatus === 'ready' ? (
+                          <button
+                            className={
+                              selectedArtifactId === candidate.artifactId ? 'selected' : ''
+                            }
+                            key={candidate.artifactId}
+                            onClick={() => setSelectedArtifactId(candidate.artifactId)}
+                          >
+                            <span>
+                              <strong>{candidate.modelId}</strong>
+                              <small>
+                                {candidate.components.length} verified components ·{' '}
+                                {
+                                  candidate.profiles.filter(
+                                    (profile) => profile.execution.status === 'available'
+                                  ).length
+                                }{' '}
+                                executable profiles
+                              </small>
+                            </span>
+                            <span className="training-status-ready">Inspect</span>
+                          </button>
+                        ) : (
+                          <div key={candidate.artifactId}>
+                            <span>
+                              <strong>{candidate.modelId}</strong>
+                              <small>
+                                {candidate.components.length} verified components · profile
+                                execution unavailable
+                              </small>
+                            </span>
+                            <span className="training-status-neutral">Not deployable</span>
+                          </div>
+                        )
+                      )}
                     </div>
                   )}
                 </>
               )}
+              {selectedArtifactId && !selectedDiscoveredCheckpoint && (
+                <p className="training-inline-note">Inspecting the selected checkpoint bundle…</p>
+              )}
+              {selectedDiscoveredCheckpoint && (
+                <>
+                  <div className="training-checkpoint-summary">
+                    <div>
+                      <span>Model</span>
+                      <strong>{selectedDiscoveredCheckpoint.modelId}</strong>
+                    </div>
+                    <div>
+                      <span>Verified components</span>
+                      <strong>{selectedDiscoveredCheckpoint.components.length}</strong>
+                    </div>
+                    <div>
+                      <span>Manifest</span>
+                      <strong>{selectedDiscoveredCheckpoint.manifestSha256.slice(0, 12)}</strong>
+                    </div>
+                  </div>
+                  <label className="training-control">
+                    STRUM profile
+                    <select
+                      value={selectedDiscoveredProfileId}
+                      onChange={(event) => {
+                        const profile = selectedDiscoveredCheckpoint.profiles.find(
+                          (entry) => entry.profileId === event.target.value
+                        )
+                        setSelectedDiscoveredProfileId(event.target.value)
+                        setSelectedDifficultyPolicy(profile?.execution.difficultyPolicies[0] ?? '')
+                      }}
+                    >
+                      {selectedDiscoveredCheckpoint.profiles
+                        .filter((profile) => profile.execution.status === 'available')
+                        .map((profile) => (
+                          <option key={profile.profileId} value={profile.profileId}>
+                            {profile.capability} · {profile.instruments.join(', ')}
+                          </option>
+                        ))}
+                    </select>
+                  </label>
+                  <label className="training-control">
+                    Difficulty policy
+                    <select
+                      value={selectedDifficultyPolicy}
+                      onChange={(event) => setSelectedDifficultyPolicy(event.target.value)}
+                    >
+                      {selectedDiscoveredProfile?.execution.difficultyPolicies.map((policy) => (
+                        <option key={policy} value={policy}>
+                          {policy}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </>
+              )}
+              {trainingRuns.length > 0 && (
+                <aside className="training-deploy-blocked">
+                  <strong>Training runs are not deployment candidates</strong>
+                  <p>
+                    Evaluate and package an experiment in STRUM first. Return here only with its
+                    hash-verified model-bundle folder.
+                  </p>
+                </aside>
+              )}
+              {trainingProfiles.length > 0 && (
+                <div className="training-profile-summary">
+                  {trainingProfiles.map((profile) => (
+                    <span key={profile.profileId}>
+                      {profile.pipelineId} {profile.isDefault ? '· current Auto Chart default' : ''}
+                    </span>
+                  ))}
+                </div>
+              )}
               <button
                 className="dataset-primary"
-                disabled={!selectedCheckpoint?.deployable || savingAutoChartProfile}
+                disabled={
+                  !selectedDiscoveredCheckpoint ||
+                  selectedDiscoveredCheckpoint.deploymentStatus !== 'ready' ||
+                  !selectedDiscoveredProfile ||
+                  selectedDiscoveredProfile.execution.status !== 'available' ||
+                  !selectedDiscoveredProfile.execution.difficultyPolicies.includes(
+                    selectedDifficultyPolicy
+                  ) ||
+                  savingAutoChartProfile
+                }
                 onClick={() => void saveSelectedAutoChartProfile()}
               >
                 {savingAutoChartProfile
