@@ -25,7 +25,6 @@ import {
   listTrainingPipelines,
   probeTrainingRuntime,
   runDefaultAutoChartProfile,
-  saveAutoChartProfile,
   saveDiscoveredAutoChartProfile,
   startTrainingPrepare,
   startTrainingRun
@@ -1146,14 +1145,6 @@ ipcMain.handle('training:inspectCheckpoint', async (_event, runId: string) => {
     return await inspectTrainingCheckpoint(runId)
   } catch {
     throw new Error('STRUM could not inspect the selected checkpoint bundle.')
-  }
-})
-
-ipcMain.handle('training:saveAutoChartProfile', async (_event, runId: string) => {
-  try {
-    return await saveAutoChartProfile(runId)
-  } catch {
-    throw new Error('STRUM did not validate this checkpoint for Auto Chart.')
   }
 })
 

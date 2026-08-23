@@ -260,14 +260,6 @@ interface ChartEditorAPI {
     deploymentReason: string | null
     components: Array<{ id: string; sha256: string; byteLength: number }>
   }>
-  saveAutoChartProfile: (runId: string) => Promise<{
-    profileId: string
-    runId: string
-    pipelineId: string
-    runtimeId: string
-    createdAt: string
-    isDefault: boolean
-  }>
   inspectTrainingCatalog: (options: {
     parentId: string
     catalogName: string
