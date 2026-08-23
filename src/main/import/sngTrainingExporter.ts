@@ -1097,10 +1097,19 @@ function mediaTypeForAudioExtension(extension: (typeof AUDIO_EXTENSIONS)[number]
 }
 
 async function readExplicitHarmonyAudio(sourcePath: string): Promise<CatalogAudioInput> {
-  const sourceInfo = await lstat(sourcePath)
+  let sourceInfo: Awaited<ReturnType<typeof lstat>>
+  try {
+    sourceInfo = await lstat(sourcePath)
+  } catch {
+    // The chooser's location is private main-process state. In particular,
+    // an ENOENT/EACCES error includes it in Node's message, so never let that
+    // diagnostic escape through the Dataset Curation IPC handler.
+    throw new Error('Selected Harmony audio is unavailable or unsupported.')
+  }
   if (
     !sourceInfo.isFile() ||
     sourceInfo.isSymbolicLink() ||
+    (sourceInfo.mode & 0o444) === 0 ||
     sourceInfo.size > MAX_AUDIO_ASSET_BYTES
   ) {
     throw new Error('Selected Harmony audio is unavailable or unsupported.')
@@ -1109,7 +1118,14 @@ async function readExplicitHarmonyAudio(sourcePath: string): Promise<CatalogAudi
   if (!isCatalogAudioExtension(extension)) {
     throw new Error('Select an OGG, MP3, Opus, WAV, or FLAC Harmony source.')
   }
-  const bytes = await readFile(sourcePath)
+  let bytes: Buffer
+  try {
+    bytes = await readFile(sourcePath)
+  } catch {
+    // Protect against deletion, relocation, permission changes, and other
+    // read failures after lstat. Those errors also include source locations.
+    throw new Error('Selected Harmony audio is unavailable or unsupported.')
+  }
   if (bytes.length !== sourceInfo.size || bytes.length > MAX_AUDIO_ASSET_BYTES) {
     throw new Error('Selected Harmony audio is unavailable or unsupported.')
   }
@@ -1325,6 +1341,60 @@ async function replaceCatalogAtomically(
   await rm(backupPath, { recursive: true, force: true }).catch(() => undefined)
 }
 
+type CatalogMutationReservation = {
+  path: string
+  handle: Awaited<ReturnType<typeof open>>
+}
+
+/**
+ * Mutating operations replace a complete catalog directory after staging. A
+ * single catalog-level reservation therefore protects both the generic
+ * create/update/clone flow and Harmony materialization from lost replacements.
+ */
+async function reserveCatalogMutation(
+  parentDir: string,
+  catalogName: string
+): Promise<CatalogMutationReservation> {
+  const reservationPath = path.join(parentDir, `.${catalogName}.mutation-reservation`)
+  try {
+    return { path: reservationPath, handle: await open(reservationPath, 'wx') }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+      throw new Error('A catalog mutation with that name is already in progress.')
+    }
+    // fs errors expose the parent directory. It is private main-process state.
+    throw new Error('The catalog mutation could not be started.')
+  }
+}
+
+async function releaseCatalogMutation(reservation: CatalogMutationReservation): Promise<void> {
+  await reservation.handle.close().catch(() => undefined)
+  await unlink(reservation.path).catch(() => undefined)
+}
+
+async function reserveCatalogMutations(
+  parentDir: string,
+  catalogNames: readonly string[]
+): Promise<CatalogMutationReservation[]> {
+  const names = [...new Set(catalogNames)].sort((left, right) => left.localeCompare(right))
+  const reservations: CatalogMutationReservation[] = []
+  try {
+    for (const catalogName of names) {
+      reservations.push(await reserveCatalogMutation(parentDir, catalogName))
+    }
+    return reservations
+  } catch (error) {
+    for (const reservation of reservations.reverse()) await releaseCatalogMutation(reservation)
+    throw error
+  }
+}
+
+async function releaseCatalogMutations(
+  reservations: readonly CatalogMutationReservation[]
+): Promise<void> {
+  for (const reservation of [...reservations].reverse()) await releaseCatalogMutation(reservation)
+}
+
 export async function listCatalogHarmonyTargets(
   parentDir: string,
   requestedCatalogName: string
@@ -1377,8 +1447,7 @@ export async function materializeCatalogHarmonySource(
   if (!isHarmonyTrackName(options.trackName)) throw new Error('Harmony track is invalid.')
   const parentDir = path.resolve(options.parentDir)
   const catalogPath = path.join(parentDir, catalogName)
-  const reservationPath = path.join(parentDir, `.${catalogName}.harmony-reservation`)
-  const reservation = await open(reservationPath, 'wx')
+  const reservation = await reserveCatalogMutation(parentDir, catalogName)
   const stagingPath = path.join(parentDir, `.${catalogName}.harmony-staging-${randomUUID()}`)
   try {
     await validateStagedCatalog(catalogPath)
@@ -1518,8 +1587,7 @@ export async function materializeCatalogHarmonySource(
     await rm(stagingPath, { recursive: true, force: true })
     throw error
   } finally {
-    await reservation.close()
-    await unlink(reservationPath).catch(() => undefined)
+    await releaseCatalogMutation(reservation)
   }
 }
 
@@ -1597,16 +1665,10 @@ export async function buildSongSourceCatalog(options: {
     ? validateCatalogName(options.sourceCatalogName)
     : catalogName
   const sourceCatalogPath = path.join(parentDir, sourceCatalogName)
-  const reservationPath = path.join(parentDir, `.${catalogName}.catalog-reservation`)
-  let reservation: Awaited<ReturnType<typeof open>>
-  try {
-    reservation = await open(reservationPath, 'wx')
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-      throw new Error('A catalog build with that name is already in progress.')
-    }
-    throw error
-  }
+  const reservations = await reserveCatalogMutations(
+    parentDir,
+    mode === 'clone' ? [catalogName, sourceCatalogName] : [catalogName]
+  )
   try {
     if (mode === 'update' || mode === 'clone') {
       try {
@@ -1625,8 +1687,7 @@ export async function buildSongSourceCatalog(options: {
       }
     }
   } catch (error) {
-    await reservation.close()
-    await unlink(reservationPath)
+    await releaseCatalogMutations(reservations)
     throw error
   }
 
@@ -1786,12 +1847,10 @@ export async function buildSongSourceCatalog(options: {
     }
   } catch (error) {
     await rm(stagingPath, { recursive: true, force: true })
-    await reservation.close()
-    await unlink(reservationPath)
     throw error
+  } finally {
+    await releaseCatalogMutations(reservations)
   }
-  await reservation.close()
-  await unlink(reservationPath)
   return {
     catalogPath,
     recordCount: records.length,
