@@ -86,7 +86,7 @@ Future descriptors follow the same shape: `drums.onset-velocity/v*`, `bass.onset
 
 ### Current training coverage
 
-The catalog-aware Guitar and Drums paths revalidate `allowed` catalog assets and create path-free task views. The first OCTAVE catalog proved 31 Guitar-eligible and 52 Drums-eligible records. Guitar onset/fret and Drums onset-classifier worker training are available for experiment artifacts; their outputs are explicitly non-deployable until a compatible evaluated profile is packaged. Five-lane chart-pair difficulty transforms are catalog-backed and worker-trainable for Guitar, Bass, Keys, and Drums. Bass, Keys, Vocals, Pro instruments, section, and mapper families also have catalog task views. Each declares its label-source/event schema and selected approved MIDI tracks, so a future trainer cannot silently infer track conventions; their missing learned architectures remain explicitly `planned` rather than falling back to raw folder scans.
+The catalog-aware Guitar and Drums paths revalidate `allowed` catalog assets and create path-free task views. The first OCTAVE catalog proved 31 Guitar-eligible and 52 Drums-eligible records. Guitar onset/fret and Drums onset-classifier worker training are available for experiment artifacts. A Guitar pair can become an Expert-only neural profile only after revalidated validation-split evaluation passes explicit gates; an unqualified experiment remains non-deployable. A Drums V2 experiment can be packaged only as a hash-verified prepared-window evaluator, not as an auto-chart profile; direct V14 remains the executable Drums chart profile. Five-lane chart-pair difficulty transforms are catalog-backed and worker-trainable for Guitar, Bass, Keys, and Drums. Bass, Keys, Vocals, Pro instruments, section, and mapper families also have catalog task views. Each declares its label-source/event schema and selected approved MIDI tracks, so a future trainer cannot silently infer track conventions; their missing learned architectures remain explicitly `planned` rather than falling back to raw folder scans.
 
 Each new adapter must select only `allowed` records, revalidate catalog hashes at use time, derive labels within STRUM, assign and persist song-disjoint splits, and write catalog ID, task-view hash, source IDs, input hashes, and audio/MIDI alignment provenance into its cache, experiment, and checkpoint manifests. Audio-to-chart descriptors must state whether OCTAVE materializes timeline-aligned audio or STRUM derives and records an alignment offset.
 
@@ -121,7 +121,7 @@ strum-worker inference preflight --model-root <validated-root> --request <owned-
 strum-worker chart --request <owned-json> --json-events
 ```
 
-Preflight validates bundle schema, file hashes/sizes, model state/config/shape compatibility, device availability, requested instruments, required stems, companion models, and the selected difficulty policy. It returns an immutable resolved plan. Loading an arbitrary user-selected `.pt` with unsafe deserialization is never an OCTAVE feature; only a trusted, verified bundle is eligible.
+Preflight validates bundle schema, file hashes/sizes, model state/config/shape compatibility, device availability, requested instruments, required stems, companion models, and the selected difficulty policy. It returns an immutable `strum-chart-preflight/v1` resolved plan. Loading an arbitrary user-selected `.pt` with unsafe deserialization is never an OCTAVE feature; only a trusted, verified bundle is eligible.
 
 The chart request names a model bundle/profile, requested instruments, typed backend choices, device/network policy, and an explicit `difficulty_policy`:
 
@@ -129,7 +129,7 @@ The chart request names a model bundle/profile, requested instruments, typed bac
 - `deterministic-v1`: an explicitly requested transitional legacy behavior; or
 - `learned:<component-id>`: a validated learned STRUM transform.
 
-The result records per-instrument status, resolved model IDs/hashes, stems and fallbacks, exact runtime configuration, output identities, safe warnings/errors, and the chosen difficulty policy. A partial result is never silently presented as a complete deployment result; OCTAVE can display it only when the user explicitly accepts the declared fallback policy.
+The result is a path-free `strum-chart-run/v1` manifest with per-instrument stage status, resolved model IDs/hashes, output identities, safe warnings/errors, and the chosen difficulty policy. Existing direct profiles use a typed `expert_chart` stage and explicitly mark omitted lower-difficulty work `not_requested`; learned transforms mark their supplied Expert chart `provided` and their transform stage `succeeded`. Profiles without a worker handler are `unavailable`, never silently delegated to legacy assembly. A partial result is never presented as a complete deployment result; OCTAVE can display it only when the user explicitly accepts the declared fallback policy.
 
 This removes current gaps where auto-chart loaders use CWD-relative hard-coded checkpoint/config locations, individual models have divergent compatibility rules, optional components silently fall back, and full-pipeline output can report success despite per-instrument failures. It also gives OCTAVE the required checkpoint-folder support without reproducing STRUM internals.
 
@@ -169,7 +169,7 @@ Cancellation must signal the worker, wait for exit, then terminate its process g
 
 OCTAVE discovers manifests through STRUM, groups required companions, displays pipeline/runtime/dataset/metric provenance, and asks for confirmation before changing a local default. It retains the shipped profile as fallback.
 
-**STRUM calls:** `checkpoint inspect`, `inference profile validate`.
+**STRUM calls:** `checkpoint inspect`, `inference profile validate`; developer-only profile evaluation/packaging is explicit and never an implicit deployment step.
 
 An auto-chart request resolves a profile ID to a compatible bundle in the main process, records profile/runtime IDs in the result manifest, and fails closed to the shipped profile if validation fails.
 
@@ -184,8 +184,8 @@ Before deployment, STRUM must state for each checkpoint: the inference stage it 
 1. **Complete:** STRUM versioned worker protocol, `probe`, pipeline descriptors, catalog inspection, and fixture worker.
 2. **Complete for local development:** OCTAVE runtime resolver with `bundled_inference` and `developer_override`, explicit probe validation, opaque settings, and legacy-wrapper compatibility flag.
 3. **Complete:** OCTAVE background job/process-group lifecycle and idempotent cleanup.
-4. **In progress:** STRUM model-bundle manifest, inference preflight, typed chart request/result, explicit difficulty policy, and no-silent-fallback reporting. Guitar/Drums/learned-difficulty profiles have strict direct-runtime validation; the complete multi-stage graph remains to be described by bundles.
-5. **Complete, experiment-only:** catalog `prepare`/`train`, manifests, and compatibility checks for Guitar, Drums, and five-lane chart transforms.
+4. **In progress:** STRUM model-bundle manifest, inference preflight, typed chart request/result, explicit difficulty policy, and no-silent-fallback reporting. `strum-chart-preflight/v1` and `strum-chart-run/v1` now cover the executable narrow profiles with explicit stage statuses; the complete multi-stage graph remains to be described by bundles.
+5. **Complete for worker artifacts:** catalog `prepare`/`train`, manifests, and compatibility checks for Guitar, Drums, and five-lane chart transforms. Guitar adds revalidated evaluation-gated Expert-profile packaging; Drums V2 adds evaluation-only package support, while deployable onset-plus-classifier execution remains a distinct future contract.
 6. **Complete for training; pending deployment:** OCTAVE dynamic Prepare/Train screens consume worker descriptors, readiness summaries, private request fields, and verified fine-tune-parent selection. Deploy remains gated on STRUM profile packaging/evaluation.
 7. **Pending external release authority:** opt-in managed pinned-release acquisition, verification, locking, update/rollback, and offline behavior. Implement only once STRUM publishes an immutable revision plus verification hash/signature; OCTAVE must not clone or update arbitrary source at runtime.
 8. **Planned learned models:** Bass, Keys, Vocals, Pro instruments, mapper/section training architectures and deployable profiles on the unchanged catalog boundary.
