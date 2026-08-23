@@ -86,7 +86,7 @@ Future descriptors follow the same shape: `drums.onset-velocity/v*`, `bass.onset
 
 ### Current training coverage
 
-The catalog-aware Guitar and Drums paths revalidate `allowed` catalog assets and create path-free task views. The first OCTAVE catalog proved 31 Guitar-eligible and 52 Drums-eligible records. Five-lane chart-pair difficulty transforms are catalog-backed and worker-trainable for Guitar, Bass, Keys, and Drums. Bass, Keys, Vocals, Pro instruments, section, and mapper families also have catalog task views; their missing learned trainer architectures remain explicitly `planned` rather than falling back to raw folder scans.
+The catalog-aware Guitar and Drums paths revalidate `allowed` catalog assets and create path-free task views. The first OCTAVE catalog proved 31 Guitar-eligible and 52 Drums-eligible records. Guitar onset/fret and Drums onset-classifier worker training are available for experiment artifacts; their outputs are explicitly non-deployable until a compatible evaluated profile is packaged. Five-lane chart-pair difficulty transforms are catalog-backed and worker-trainable for Guitar, Bass, Keys, and Drums. Bass, Keys, Vocals, Pro instruments, section, and mapper families also have catalog task views; their missing learned trainer architectures remain explicitly `planned` rather than falling back to raw folder scans.
 
 Each new adapter must select only `allowed` records, revalidate catalog hashes at use time, derive labels within STRUM, assign and persist song-disjoint splits, and write catalog ID, task-view hash, source IDs, input hashes, and audio/MIDI alignment provenance into its cache, experiment, and checkpoint manifests. Audio-to-chart descriptors must state whether OCTAVE materializes timeline-aligned audio or STRUM derives and records an alignment offset.
 
@@ -98,11 +98,11 @@ OCTAVE writes `octave-song-source-catalog/v1`. Curation exclusions happen before
 
 ### Task view
 
-STRUM writes a pipeline-specific, path-free view containing catalog ID and manifest hash; pipeline ID/version and runtime ID; selected source IDs and asset hashes; safe eligibility counts; split algorithm/version/seed; preprocessing configuration/hash; and a task-view content hash. The current `strum-guitar-catalog-manifest/v1` is the first implementation and revalidates managed assets at use time.
+STRUM writes a pipeline-specific, path-free view containing catalog ID and manifest hash; pipeline ID/version and runtime ID; selected source IDs and asset hashes; safe eligibility counts; split algorithm/version/seed; preprocessing configuration/hash; and a task-view content hash. The current catalog manifests revalidate managed assets at use time. Before preparation, `catalog inspect --pipeline --options` returns a path-free eligibility summary: eligible count, stable exclusion counts, effective audio policy, and a bounded/capped storage estimate. OCTAVE supplies only pipeline-relevant preparation options (for example, transform instrument and target difficulty).
 
 ### Experiment manifest
 
-Before training, STRUM writes `experiment.json` with run ID; task-view hash; pipeline/runtime IDs; normalized configuration/hash; checkpoint mode (`fresh`, `resume`, `fine_tune`); validated parent; requested/resolved device, precision, workers, and seed; lifecycle/metric summary; and output checkpoint bundle hashes. This removes hidden assumptions in YAML paths and directory names.
+Before training, STRUM writes `experiment.json` with run ID; task-view hash; pipeline/runtime IDs; normalized configuration/hash; checkpoint mode; validated parent provenance where applicable; requested/resolved device, precision, workers, and seed; lifecycle/metric summary; and output checkpoint bundle hashes. This removes hidden assumptions in YAML paths and directory names. The current chart-transform worker supports `fresh` and verified-bundle `fine_tune`; it rejects resume until STRUM has a portable optimizer/scheduler-state contract. Experiment manifests retain parent identity/hashes, never source paths.
 
 ### Checkpoint manifest
 
@@ -149,19 +149,19 @@ OCTAVE parses sources in the main process, applies rights and STRUM-charted-song
 
 ### Prepare
 
-OCTAVE lists only pipelines advertised by the selected runtime. It sends the catalog root only from the main process and displays eligible count, missing requirement counts, audio-role policy, split seed, and estimated storage/time. STRUM creates and returns the immutable task view plus safe exclusions.
+OCTAVE lists only pipelines advertised by the selected runtime. It sends the catalog root only from the main process and displays eligible count, stable missing-requirement counts, audio-role policy, split seed, and estimated storage/time. STRUM creates and returns the immutable task view plus safe exclusions.
 
 **STRUM calls:** `catalog inspect`, `dataset prepare`.
 
-**First implementation:** `guitar.onset-fret/v1`, Expert Guitar, prefer `audio.guitar`, fall back to `audio.mix`, then catalog-aware preprocessing. Prepare becomes a real job rather than a transition button.
+**Implemented initial pipelines:** `guitar.onset-fret/v1` (Expert Guitar, prefer `audio.guitar`, fall back to `audio.mix`), `drums.onset-classifier/v1`, and `chart_transform.five_lane/v1`. Prepare is a real catalog-backed job rather than a transition button.
 
 ### Train
 
-OCTAVE renders only fields declared by a pipeline's `train_schema`: fresh/resume/fine-tune mode, compatible parent, epochs/steps, batch size, device/precision, seed, output location, and approved augmentation/evaluation choices. It supervises the worker state machine `queued → validating → provisioning → running → cancelling → terminal`, relays JSON progress, and stores a safe job summary.
+OCTAVE renders only fields declared by a pipeline's `train_schema`: model and bounded training settings such as checkpoint mode, epochs/steps, batch size, device/precision, seed, and approved augmentation/evaluation choices. Renderer-visible schemas must never include filesystem locations. For catalog-backed Guitar/Drums training, OCTAVE privately adds the prepared catalog root to the main-process request. For chart-transform fine-tuning it presents an opaque compatible parent-artifact selector, resolves that to a verified bundle privately, and adds the private parent bundle only after preflight. It supervises the worker state machine `queued → validating → provisioning → running → cancelling → terminal`, relays JSON progress, and stores a safe job summary.
 
-**STRUM calls:** `train start --json-events`, `train cancel`.
+**STRUM calls:** `train start` (or synchronous `train run`) with newline-delimited JSON events.
 
-The first templates are a clearly labelled non-deployable Guitar smoke run and a normal local run. STRUM must reject incompatible resume/fine-tune parents.
+The first templates are clearly labelled non-deployable Guitar and Drums smoke runs, plus chart-transform fresh/fine-tune runs. STRUM must reject incompatible parents. A trained checkpoint is not an auto-chart profile unless it has a validated `model-bundle.json`, explicit inference capability, and evaluation evidence.
 
 Cancellation must signal the worker, wait for exit, then terminate its process group/job object after a grace period so child Demucs/yt-dlp processes cannot survive. Request/staging cleanup must be idempotent and occur only after terminal exit.
 
@@ -181,13 +181,13 @@ Before deployment, STRUM must state for each checkpoint: the inference stage it 
 
 ## Delivery order
 
-1. STRUM: versioned worker protocol, `probe`, pipeline descriptors, release manifest, and fixture worker; no model behavior change.
-2. OCTAVE: runtime resolver with `bundled_inference` and `developer_override`, explicit probe validation, opaque settings, and legacy-wrapper compatibility flag.
-3. OCTAVE: robust background job/process-group lifecycle and idempotent cleanup.
-4. STRUM: model-bundle manifest, inference preflight, typed chart request/result, explicit difficulty policy, and no-silent-fallback reporting.
-5. STRUM: Guitar `dataset prepare`, `train`, experiment/checkpoint manifests, and compatibility checks.
-6. OCTAVE: real Guitar Prepare/Train/Deploy screens using the contract and bundle/profile validation.
-7. STRUM/OCTAVE: opt-in managed pinned-release acquisition, verification, locking, update/rollback, and offline behavior.
-8. STRUM: Drums, Bass, Keys, Vocals, Pro instruments, mapper/section data, and learned difficulty-transform descriptors on the unchanged catalog boundary.
+1. **Complete:** STRUM versioned worker protocol, `probe`, pipeline descriptors, catalog inspection, and fixture worker.
+2. **Complete for local development:** OCTAVE runtime resolver with `bundled_inference` and `developer_override`, explicit probe validation, opaque settings, and legacy-wrapper compatibility flag.
+3. **Complete:** OCTAVE background job/process-group lifecycle and idempotent cleanup.
+4. **In progress:** STRUM model-bundle manifest, inference preflight, typed chart request/result, explicit difficulty policy, and no-silent-fallback reporting. Guitar/Drums/learned-difficulty profiles have strict direct-runtime validation; the complete multi-stage graph remains to be described by bundles.
+5. **Complete, experiment-only:** catalog `prepare`/`train`, manifests, and compatibility checks for Guitar, Drums, and five-lane chart transforms.
+6. **Complete for training; pending deployment:** OCTAVE dynamic Prepare/Train screens consume worker descriptors, readiness summaries, private request fields, and verified fine-tune-parent selection. Deploy remains gated on STRUM profile packaging/evaluation.
+7. **Pending external release authority:** opt-in managed pinned-release acquisition, verification, locking, update/rollback, and offline behavior. Implement only once STRUM publishes an immutable revision plus verification hash/signature; OCTAVE must not clone or update arbitrary source at runtime.
+8. **Planned learned models:** Bass, Keys, Vocals, Pro instruments, mapper/section training architectures and deployable profiles on the unchanged catalog boundary.
 
 Every delivery needs shared protocol fixtures and a real-catalog smoke test. Integration tests must prove that no original source path crosses into a task view, experiment/checkpoint manifest, renderer payload, progress event, log, or user-visible error.
