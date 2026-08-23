@@ -82,6 +82,40 @@ interface ChartEditorAPI {
       externalRecordCount: number
     }>
   >
+  listDatasetCatalogHarmonyTargets: (
+    parentId: string,
+    catalogName: string
+  ) => Promise<
+    Array<{
+      sourceId: string
+      label: string
+      tracks: Array<'HARM1' | 'HARM2' | 'HARM3'>
+      configuredTracks: Array<'HARM1' | 'HARM2' | 'HARM3'>
+    }>
+  >
+  chooseDatasetHarmonyAudio: () => Promise<{ selectionId: string; displayName: string } | null>
+  materializeDatasetHarmonySource: (options: {
+    parentId: string
+    catalogName: string
+    sourceId: string
+    trackName: 'HARM1' | 'HARM2' | 'HARM3'
+    sourceSelectionId: string
+    provenance:
+      | { kind: 'isolated_source_stem/v1'; attestationId: string }
+      | {
+          kind: 'isolated_separation_output/v1'
+          separator: {
+            id: string
+            version: string
+            modelSha256: string
+            configurationSha256: string
+          }
+        }
+  }) => Promise<{
+    sourceId: string
+    trackName: 'HARM1' | 'HARM2' | 'HARM3'
+    configuredTracks: Array<'HARM1' | 'HARM2' | 'HARM3'>
+  }>
   scanDatasetLibrary: () => Promise<
     Array<{
       candidateId: string

@@ -165,6 +165,9 @@
             "bass": { "$ref": "#/$defs/asset" },
             "keys": { "$ref": "#/$defs/asset" },
             "vocals": { "$ref": "#/$defs/asset" },
+            "harm1": { "$ref": "#/$defs/asset" },
+            "harm2": { "$ref": "#/$defs/asset" },
+            "harm3": { "$ref": "#/$defs/asset" },
             "other": { "$ref": "#/$defs/asset" }
           }
         }

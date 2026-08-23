@@ -14,6 +14,7 @@ The normative schema is [song-source-catalog.schema.json](./song-source-catalog.
 my-catalog/
 ├── catalog.json             # `octave-song-source-catalog/v1` manifest
 ├── records.jsonl            # one validated source record per song
+├── vocal-harmony-sources.json # optional HARM1/2/3 source-policy sidecar
 └── assets/
     └── sha256/<hash>/...    # OCTAVE-managed materialized MIDI/audio assets
 ```
@@ -123,6 +124,9 @@ perform these semantic checks before writing a record or returning a UI result:
 - Treat `audio` as a keyed role map. A record has at most one asset for each
   role, so STRUM can deterministically choose `audio.guitar`, `audio.vocals`,
   or `audio.mix`.
+- `audio.harm1`, `audio.harm2`, and `audio.harm3` are optional, explicitly
+  materialized isolated-source roles. They are never inferred from a file
+  name, `audio.vocals`, or `audio.mix`.
 - Require coverage consistency: `present` has non-empty difficulties and track
   names; `absent` and `unsupported` have neither. Display violations to the
   curator as a safe validation code, never as a raw source path.
@@ -156,6 +160,34 @@ importer or tokenization layer.
    marker at the destination.
 5. Hand STRUM the catalog directory. Do not hand it the original package paths
    or put those paths in renderer state, exported manifests, logs, or errors.
+
+### Vocal Harmony source policy
+
+Harmony is deliberately a separate curation operation on an existing allowed
+catalog record. The editor first decodes the managed `notes.mid` and offers
+only exact `HARM1`, `HARM2`, or `HARM3` tracks. The user selects an audio file
+through a trusted main-process dialog; the renderer receives only an opaque
+selection ID and a safe display name. OCTAVE materializes it as the matching
+`harm1`, `harm2`, or `harm3` asset and atomically writes
+`vocal-harmony-sources.json`.
+
+The sidecar is `octave-vocal-harmony-source-policy/v1`, path-free, and binds
+each `(source_id, HARM track)` to its matching asset identity. It requires one
+of two truthful provenance forms:
+
+- `isolated_source_stem/v1`: a same-master-timeline original-stem attestation
+  ID supplied by the curator.
+- `isolated_separation_output/v1`: the catalog's exact `audio.mix` asset ID
+  and hash plus separator ID, version, model SHA-256, and configuration
+  SHA-256.
+
+The sidecar includes the SHA-256 of canonical `catalog.json` plus the exact
+`records.jsonl` text. Any subsequent catalog change therefore invalidates a
+stale sidecar until OCTAVE rebuilds it. Existing rows are retained only after
+their assets, roles, provenance, source IDs, and current control hash validate
+again. OCTAVE rejects a selected Harmony file whose content hash equals the
+record's `mix` or shared `vocals` asset; it never performs separation, labels
+an unproven source as isolated, or falls back to shared vocals/mix.
 
 STRUM rejects a catalog without both root files, with a staging marker, or with
 any asset/hash validation failure. It never tries to repair an incomplete

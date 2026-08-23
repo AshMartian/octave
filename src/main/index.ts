@@ -59,8 +59,10 @@ import { importSng } from './import/sngImporter'
 import { importCon } from './import/conImporter'
 import {
   buildSongSourceCatalog,
+  listCatalogHarmonyTargets,
   listDatasetLibrarySongs,
   listSongSourceCatalogs,
+  materializeCatalogHarmonySource,
   summarizeDatasetSource,
   summarizeDatasetSourceEntries,
   type DatasetCatalogSource,
@@ -129,9 +131,24 @@ app.on('before-quit', () => {
 // Track the currently opened project folder for path validation
 let allowedProjectPath: string | null = null
 const datasetSources = new Map<string, DatasetCatalogSource>()
+const datasetHarmonyAudioSources = new Map<string, { sourcePath: string }>()
 const datasetCatalogParents = new Map<string, string>()
 const approvedDatasetPackageIds = new Set<string>()
 const DATASET_CATALOG_PARENT_KEY = 'dataset-catalog-parent.json'
+
+function redactDatasetDisplayName(value: string): string {
+  const withoutControls = Array.from(value.normalize('NFKC'), (character) => {
+    const codePoint = character.codePointAt(0) ?? 0
+    return codePoint <= 0x1f || codePoint === 0x7f ? ' ' : character
+  }).join('')
+  const normalized = withoutControls
+    .replace(/(?:https?|smb|file):\/\/\S+/gi, '[redacted]')
+    .replace(/[\\/]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 128)
+  return normalized || 'Selected audio'
+}
 
 type DatasetCatalogParentBookmark = {
   parentId: string
@@ -968,6 +985,73 @@ ipcMain.handle('dataset:listCatalogs', async (_event, parentId: string) => {
     return []
   }
 })
+
+ipcMain.handle(
+  'dataset:listHarmonyTargets',
+  async (_event, parentId: string, catalogName: string) => {
+    const parentDir = datasetCatalogParents.get(parentId)
+    if (!parentDir) return []
+    try {
+      return await listCatalogHarmonyTargets(parentDir, catalogName)
+    } catch {
+      console.error('Catalog Harmony targets could not be listed.')
+      return []
+    }
+  }
+)
+
+ipcMain.handle('dataset:chooseHarmonyAudio', async () => {
+  const result = await dialog.showOpenDialog({
+    title: 'Select Isolated Harmony Stem or Pinned Separation Output',
+    properties: ['openFile'],
+    filters: [{ name: 'Audio', extensions: ['ogg', 'mp3', 'opus', 'wav', 'flac'] }]
+  })
+  if (result.canceled || result.filePaths.length === 0) return null
+  const sourcePath = resolve(result.filePaths[0])
+  const selectionId = randomUUID()
+  datasetHarmonyAudioSources.set(selectionId, { sourcePath })
+  return { selectionId, displayName: redactDatasetDisplayName(basename(sourcePath)) }
+})
+
+ipcMain.handle(
+  'dataset:materializeHarmonySource',
+  async (
+    _event,
+    options: {
+      parentId: string
+      catalogName: string
+      sourceId: string
+      trackName: 'HARM1' | 'HARM2' | 'HARM3'
+      sourceSelectionId: string
+      provenance:
+        | { kind: 'isolated_source_stem/v1'; attestationId: string }
+        | {
+            kind: 'isolated_separation_output/v1'
+            separator: {
+              id: string
+              version: string
+              modelSha256: string
+              configurationSha256: string
+            }
+          }
+    }
+  ) => {
+    const parentDir = datasetCatalogParents.get(options.parentId)
+    const source = datasetHarmonyAudioSources.get(options.sourceSelectionId)
+    if (!parentDir || !source)
+      throw new Error('Choose a Harmony audio source through Dataset Curation.')
+    const result = await materializeCatalogHarmonySource({
+      parentDir,
+      catalogName: options.catalogName,
+      sourceId: options.sourceId,
+      trackName: options.trackName,
+      sourceAudioPath: source.sourcePath,
+      provenance: options.provenance
+    })
+    datasetHarmonyAudioSources.delete(options.sourceSelectionId)
+    return result
+  }
+)
 
 ipcMain.handle('dataset:scanLibrary', async () => {
   if (!allowedProjectPath) return []

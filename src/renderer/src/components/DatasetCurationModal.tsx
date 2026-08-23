@@ -188,6 +188,17 @@ type TrainingPromotionResult = StrumPromotionJobResult & {
   deploymentStatus?: 'ready' | 'not_deployable'
 }
 
+type HarmonyTrackName = 'HARM1' | 'HARM2' | 'HARM3'
+
+type HarmonyTarget = {
+  sourceId: string
+  label: string
+  tracks: HarmonyTrackName[]
+  configuredTracks: HarmonyTrackName[]
+}
+
+type HarmonyAudioSelection = { selectionId: string; displayName: string }
+
 const CATALOG_PARENT_STORAGE_KEY = 'octave.datasetCatalogParent'
 const TRAINING_LEARN_SEEN_STORAGE_KEY = 'octave.trainingLearnSeen'
 
@@ -608,6 +619,22 @@ export function TrainingModal({
     [trainingRuns]
   )
 
+  const [harmonyTargets, setHarmonyTargets] = useState<HarmonyTarget[]>([])
+  const [harmonyTargetId, setHarmonyTargetId] = useState('')
+  const [harmonyTrackName, setHarmonyTrackName] = useState<HarmonyTrackName>('HARM1')
+  const [harmonyAudio, setHarmonyAudio] = useState<HarmonyAudioSelection | null>(null)
+  const [harmonyKind, setHarmonyKind] = useState<
+    'isolated_source_stem/v1' | 'isolated_separation_output/v1'
+  >('isolated_source_stem/v1')
+  const [harmonyAttestationId, setHarmonyAttestationId] = useState('')
+  const [separatorId, setSeparatorId] = useState('')
+  const [separatorVersion, setSeparatorVersion] = useState('')
+  const [separatorModelSha256, setSeparatorModelSha256] = useState('')
+  const [separatorConfigurationSha256, setSeparatorConfigurationSha256] = useState('')
+  const [harmonyLoading, setHarmonyLoading] = useState(false)
+  const [harmonySaving, setHarmonySaving] = useState(false)
+  const [harmonyMessage, setHarmonyMessage] = useState<string | null>(null)
+
   const refreshLibrary = useCallback(async (): Promise<void> => {
     setLoading(true)
     setError(null)
@@ -882,6 +909,37 @@ export function TrainingModal({
     }
     onActivityChange(null)
   }, [exporting, onActivityChange, saveProgress, scanProgress, scanningPackages, trainingJob])
+
+  useEffect(() => {
+    if (!catalogParent || !selectedCatalog) {
+      setHarmonyTargets([])
+      setHarmonyTargetId('')
+      return
+    }
+    let active = true
+    setHarmonyLoading(true)
+    setHarmonyMessage(null)
+    void window.api
+      .listDatasetCatalogHarmonyTargets(catalogParent.parentId, selectedCatalog.catalogName)
+      .then((targets) => {
+        if (!active) return
+        setHarmonyTargets(targets)
+        setHarmonyTargetId((current) =>
+          targets.some((target) => target.sourceId === current)
+            ? current
+            : (targets[0]?.sourceId ?? '')
+        )
+      })
+      .catch(() => {
+        if (active) setHarmonyMessage('Could not validate this catalog’s Harmony targets.')
+      })
+      .finally(() => {
+        if (active) setHarmonyLoading(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [catalogParent, selectedCatalog])
 
   const allowedLibrarySongs = useMemo(
     () => songs.filter((song) => song.trainingUse === 'allowed' && song.midiValid),
@@ -1279,6 +1337,61 @@ export function TrainingModal({
     return null
   }
 
+  const selectedHarmonyTarget = harmonyTargets.find((target) => target.sourceId === harmonyTargetId)
+
+  const chooseHarmonyAudio = async (): Promise<void> => {
+    const selected = await window.api.chooseDatasetHarmonyAudio()
+    if (selected) setHarmonyAudio(selected)
+  }
+
+  const materializeHarmonySource = async (): Promise<void> => {
+    if (!catalogParent || !selectedCatalog || !selectedHarmonyTarget || !harmonyAudio) {
+      setHarmonyMessage('Select a catalog HARM track and an explicit isolated audio source.')
+      return
+    }
+    if (!selectedHarmonyTarget.tracks.includes(harmonyTrackName)) {
+      setHarmonyMessage('The selected catalog source does not contain that exact HARM track.')
+      return
+    }
+    const provenance =
+      harmonyKind === 'isolated_source_stem/v1'
+        ? { kind: harmonyKind, attestationId: harmonyAttestationId.trim() }
+        : {
+            kind: harmonyKind,
+            separator: {
+              id: separatorId.trim(),
+              version: separatorVersion.trim(),
+              modelSha256: separatorModelSha256.trim(),
+              configurationSha256: separatorConfigurationSha256.trim()
+            }
+          }
+    setHarmonySaving(true)
+    setHarmonyMessage(null)
+    try {
+      const response = await window.api.materializeDatasetHarmonySource({
+        parentId: catalogParent.parentId,
+        catalogName: selectedCatalog.catalogName,
+        sourceId: selectedHarmonyTarget.sourceId,
+        trackName: harmonyTrackName,
+        sourceSelectionId: harmonyAudio.selectionId,
+        provenance
+      })
+      setHarmonyTargets((current) =>
+        current.map((target) =>
+          target.sourceId === response.sourceId
+            ? { ...target, configuredTracks: response.configuredTracks }
+            : target
+        )
+      )
+      setHarmonyAudio(null)
+      setHarmonyMessage(`${response.trackName} was materialized with explicit provenance.`)
+    } catch {
+      setHarmonyMessage('Harmony materialization failed. Verify the selected asset and provenance.')
+    } finally {
+      setHarmonySaving(false)
+    }
+  }
+
   const renderCandidate = (candidate: SourceCandidate, selectable: boolean): React.JSX.Element => (
     <label className={!candidate.midiValid ? 'disabled' : ''} key={candidate.candidateId}>
       <input
@@ -1523,6 +1636,169 @@ export function TrainingModal({
                   </p>
                 ) : null}
                 <div className="dataset-editor-fields">
+                  {selectedCatalog && (
+                    <section className="dataset-section dataset-harmony-sources">
+                      <div className="dataset-section-heading">
+                        <div>
+                          <h3>Vocal Harmony sources</h3>
+                          <p>
+                            Add only an explicit isolated <code>HARM1</code>, <code>HARM2</code>, or{' '}
+                            <code>HARM3</code> source. OCTAVE never substitutes shared vocals or the
+                            mix.
+                          </p>
+                        </div>
+                      </div>
+                      {harmonyLoading ? (
+                        <p className="dataset-empty">Validating catalog HARM tracks…</p>
+                      ) : harmonyTargets.length === 0 ? (
+                        <p className="dataset-empty">
+                          No allowed catalog records with exact HARM1, HARM2, or HARM3 MIDI tracks
+                          are available.
+                        </p>
+                      ) : (
+                        <>
+                          <label>
+                            Catalog source
+                            <select
+                              value={harmonyTargetId}
+                              disabled={harmonySaving || exporting}
+                              onChange={(event) => {
+                                const sourceId = event.target.value
+                                const target = harmonyTargets.find(
+                                  (entry) => entry.sourceId === sourceId
+                                )
+                                setHarmonyTargetId(sourceId)
+                                if (target && !target.tracks.includes(harmonyTrackName)) {
+                                  setHarmonyTrackName(target.tracks[0])
+                                }
+                              }}
+                            >
+                              {harmonyTargets.map((target) => (
+                                <option key={target.sourceId} value={target.sourceId}>
+                                  {target.label}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <label>
+                            Exact MIDI target
+                            <select
+                              value={harmonyTrackName}
+                              disabled={harmonySaving || exporting}
+                              onChange={(event) =>
+                                setHarmonyTrackName(event.target.value as HarmonyTrackName)
+                              }
+                            >
+                              {(selectedHarmonyTarget?.tracks ?? []).map((track) => (
+                                <option key={track} value={track}>
+                                  {track}
+                                  {selectedHarmonyTarget?.configuredTracks.includes(track)
+                                    ? ' (configured)'
+                                    : ''}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <label>
+                            Isolation provenance
+                            <select
+                              value={harmonyKind}
+                              disabled={harmonySaving || exporting}
+                              onChange={(event) =>
+                                setHarmonyKind(
+                                  event.target.value as
+                                    | 'isolated_source_stem/v1'
+                                    | 'isolated_separation_output/v1'
+                                )
+                              }
+                            >
+                              <option value="isolated_source_stem/v1">
+                                Original isolated source stem
+                              </option>
+                              <option value="isolated_separation_output/v1">
+                                Pinned separation output
+                              </option>
+                            </select>
+                          </label>
+                          {harmonyKind === 'isolated_source_stem/v1' ? (
+                            <label>
+                              Stem attestation ID
+                              <input
+                                value={harmonyAttestationId}
+                                disabled={harmonySaving || exporting}
+                                onChange={(event) => setHarmonyAttestationId(event.target.value)}
+                                placeholder="licensed-stem-001"
+                              />
+                            </label>
+                          ) : (
+                            <div className="dataset-harmony-provenance">
+                              <label>
+                                Separator ID
+                                <input
+                                  value={separatorId}
+                                  disabled={harmonySaving || exporting}
+                                  onChange={(event) => setSeparatorId(event.target.value)}
+                                  placeholder="demucs"
+                                />
+                              </label>
+                              <label>
+                                Separator version
+                                <input
+                                  value={separatorVersion}
+                                  disabled={harmonySaving || exporting}
+                                  onChange={(event) => setSeparatorVersion(event.target.value)}
+                                  placeholder="v4"
+                                />
+                              </label>
+                              <label>
+                                Model SHA-256
+                                <input
+                                  value={separatorModelSha256}
+                                  disabled={harmonySaving || exporting}
+                                  onChange={(event) => setSeparatorModelSha256(event.target.value)}
+                                  placeholder="64-character SHA-256"
+                                />
+                              </label>
+                              <label>
+                                Configuration SHA-256
+                                <input
+                                  value={separatorConfigurationSha256}
+                                  disabled={harmonySaving || exporting}
+                                  onChange={(event) =>
+                                    setSeparatorConfigurationSha256(event.target.value)
+                                  }
+                                  placeholder="64-character SHA-256"
+                                />
+                              </label>
+                            </div>
+                          )}
+                          <div className="dataset-output">
+                            <input
+                              value={harmonyAudio?.displayName ?? ''}
+                              readOnly
+                              placeholder="No audio selected"
+                            />
+                            <button
+                              onClick={() => void chooseHarmonyAudio()}
+                              disabled={harmonySaving || exporting}
+                            >
+                              Choose audio
+                            </button>
+                          </div>
+                          <button
+                            onClick={() => void materializeHarmonySource()}
+                            disabled={harmonySaving || exporting || !harmonyAudio}
+                          >
+                            {harmonySaving
+                              ? 'Materializing…'
+                              : 'Materialize explicit Harmony source'}
+                          </button>
+                        </>
+                      )}
+                      {harmonyMessage && <p className="dataset-message">{harmonyMessage}</p>}
+                    </section>
+                  )}
+
                   <label>
                     Catalog ID
                     <input
@@ -1887,8 +2163,8 @@ export function TrainingModal({
                     onClick={() => void startTraining()}
                     disabled={Boolean(
                       enablingTrainingRuntime ||
-                      trainingJob &&
-                      !['succeeded', 'failed', 'cancelled'].includes(trainingJob.state ?? '')
+                      (trainingJob &&
+                        !['succeeded', 'failed', 'cancelled'].includes(trainingJob.state ?? ''))
                     )}
                   >
                     Start local {selectedPipelineName} run <span aria-hidden="true">⚡</span>
@@ -1976,7 +2252,9 @@ export function TrainingModal({
                           <button
                             className="dataset-secondary"
                             disabled={
-                              enablingTrainingRuntime || Boolean(running) || job.status !== 'available'
+                              enablingTrainingRuntime ||
+                              Boolean(running) ||
+                              job.status !== 'available'
                             }
                             onClick={() => void startPromotion(job)}
                           >

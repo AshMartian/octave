@@ -119,7 +119,30 @@ interface CatalogCandidate {
   requiresOptIn: boolean
 }
 
-type CatalogAudioRole = 'mix' | 'drums' | 'guitar' | 'bass' | 'keys' | 'vocals' | 'other'
+type CatalogAudioRole =
+  | 'mix'
+  | 'drums'
+  | 'guitar'
+  | 'bass'
+  | 'keys'
+  | 'vocals'
+  | 'harm1'
+  | 'harm2'
+  | 'harm3'
+  | 'other'
+
+type HarmonyTrackName = 'HARM1' | 'HARM2' | 'HARM3'
+type HarmonyAudioRole = 'harm1' | 'harm2' | 'harm3'
+
+const HARMONY_TRACK_AUDIO_ROLE: Record<HarmonyTrackName, HarmonyAudioRole> = {
+  HARM1: 'harm1',
+  HARM2: 'harm2',
+  HARM3: 'harm3'
+}
+const HARMONY_SOURCE_POLICY_FILENAME = 'vocal-harmony-sources.json'
+const HARMONY_SOURCE_POLICY_FORMAT = 'octave-vocal-harmony-source-policy/v1'
+const HARMONY_IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$/
+const HARMONY_SHA256_PATTERN = /^[a-f0-9]{64}$/
 
 interface CatalogAudioInput {
   bytes: Buffer
@@ -133,6 +156,41 @@ interface CatalogAsset {
   relative_path: string
   byte_length: number
   media_type: string
+}
+
+export interface CatalogHarmonyTarget {
+  sourceId: string
+  label: string
+  tracks: HarmonyTrackName[]
+  configuredTracks: HarmonyTrackName[]
+}
+
+export interface MaterializeCatalogHarmonySourceOptions {
+  parentDir: string
+  catalogName: string
+  sourceId: string
+  trackName: HarmonyTrackName
+  sourceAudioPath: string
+  provenance:
+    | {
+        kind: 'isolated_source_stem/v1'
+        attestationId: string
+      }
+    | {
+        kind: 'isolated_separation_output/v1'
+        separator: {
+          id: string
+          version: string
+          modelSha256: string
+          configurationSha256: string
+        }
+      }
+}
+
+export interface MaterializeCatalogHarmonySourceResult {
+  sourceId: string
+  trackName: HarmonyTrackName
+  configuredTracks: HarmonyTrackName[]
 }
 
 export interface SongSourceCatalogResult {
@@ -522,12 +580,17 @@ const TRACK_INSTRUMENTS: Array<[string, string]> = [
   ['PART REAL_BASS', 'pro_bass']
 ]
 
+const HARMONY_TRACK_NAMES: readonly HarmonyTrackName[] = ['HARM1', 'HARM2', 'HARM3']
+
 function discoverInstrumentCoverage(midiBytes: Buffer): DatasetSourceSummary['instruments'] {
   const coverage: DatasetSourceSummary['instruments'] = {}
   const midi = new Midi(midiBytes)
   for (const track of midi.tracks) {
     const trackName = track.name.trim()
-    const mapped = TRACK_INSTRUMENTS.find(([prefix]) => trackName.toUpperCase().startsWith(prefix))
+    const harmonyTrack = HARMONY_TRACK_NAMES.find((name) => name === trackName.toUpperCase())
+    const mapped = harmonyTrack
+      ? ([harmonyTrack, 'vocals'] as const)
+      : TRACK_INSTRUMENTS.find(([prefix]) => trackName.toUpperCase().startsWith(prefix))
     if (!mapped || track.notes.length === 0) continue
     const safeTrackName = redactLocationText(trackName, mapped[0])
     const [, instrument] = mapped
@@ -971,6 +1034,495 @@ async function readCatalogRecords(catalogRoot: string): Promise<Record<string, u
   return lines.map((line) => JSON.parse(line) as Record<string, unknown>)
 }
 
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === 'boolean' || typeof value === 'number') {
+    return JSON.stringify(value)
+  }
+  if (typeof value === 'string') {
+    // Python's ``ensure_ascii=True`` is part of STRUM's catalog-control
+    // fingerprint. Keep the producer byte-for-byte compatible with it.
+    return JSON.stringify(value).replace(/[\u0080-\u{10ffff}]/gu, (character) =>
+      character
+        .split('')
+        .map((codeUnit) => `\\u${codeUnit.charCodeAt(0).toString(16).padStart(4, '0')}`)
+        .join('')
+    )
+  }
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(',')}]`
+  if (typeof value === 'object') {
+    const record = value as Record<string, unknown>
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${canonicalJson(key)}:${canonicalJson(record[key])}`)
+      .join(',')}}`
+  }
+  throw new Error('Catalog control data is invalid.')
+}
+
+function catalogControlSha256(catalog: Record<string, unknown>, recordsText: string): string {
+  return sha256Buffer(Buffer.from(canonicalJson({ catalog, records_jsonl: recordsText }), 'utf8'))
+}
+
+function isHarmonyTrackName(value: unknown): value is HarmonyTrackName {
+  return typeof value === 'string' && HARMONY_TRACK_NAMES.includes(value as HarmonyTrackName)
+}
+
+function validateHarmonyIdentifier(value: unknown, label: string): string {
+  if (typeof value !== 'string' || !HARMONY_IDENTIFIER_PATTERN.test(value)) {
+    throw new Error(`Harmony ${label} is invalid.`)
+  }
+  return value
+}
+
+function validateHarmonySha256(value: unknown, label: string): string {
+  if (typeof value !== 'string' || !HARMONY_SHA256_PATTERN.test(value)) {
+    throw new Error(`Harmony ${label} must be a SHA-256.`)
+  }
+  return value
+}
+
+function mediaTypeForAudioExtension(extension: (typeof AUDIO_EXTENSIONS)[number]): string {
+  switch (extension) {
+    case 'ogg':
+      return 'audio/ogg'
+    case 'opus':
+      return 'audio/opus'
+    case 'mp3':
+      return 'audio/mpeg'
+    case 'wav':
+      return 'audio/wav'
+    case 'flac':
+      return 'audio/flac'
+  }
+}
+
+async function readExplicitHarmonyAudio(sourcePath: string): Promise<CatalogAudioInput> {
+  const sourceInfo = await lstat(sourcePath)
+  if (
+    !sourceInfo.isFile() ||
+    sourceInfo.isSymbolicLink() ||
+    sourceInfo.size > MAX_AUDIO_ASSET_BYTES
+  ) {
+    throw new Error('Selected Harmony audio is unavailable or unsupported.')
+  }
+  const extension = path.extname(sourcePath).slice(1).toLowerCase()
+  if (!isCatalogAudioExtension(extension)) {
+    throw new Error('Select an OGG, MP3, Opus, WAV, or FLAC Harmony source.')
+  }
+  const bytes = await readFile(sourcePath)
+  if (bytes.length !== sourceInfo.size || bytes.length > MAX_AUDIO_ASSET_BYTES) {
+    throw new Error('Selected Harmony audio is unavailable or unsupported.')
+  }
+  return { bytes, extension, mediaType: mediaTypeForAudioExtension(extension) }
+}
+
+async function readExactHarmonyTracks(
+  catalogRoot: string,
+  record: Record<string, unknown>
+): Promise<HarmonyTrackName[]> {
+  const chart = record.chart as { notes_midi?: CatalogAsset }
+  const notes = chart.notes_midi
+  if (!notes) throw new Error('Catalog source is missing notes MIDI.')
+  await validateMaterializedAsset(catalogRoot, notes)
+  const midi = new Midi(
+    await readFile(path.resolve(catalogRoot, ...notes.relative_path.split('/')))
+  )
+  const tracks = new Set(
+    midi.tracks.map((track) => track.name.trim().toUpperCase()).filter(isHarmonyTrackName)
+  )
+  return HARMONY_TRACK_NAMES.filter((track) => tracks.has(track))
+}
+
+function harmonySourceLabel(record: Record<string, unknown>): string {
+  const metadata = (record.metadata ?? {}) as Record<string, unknown>
+  const artist = typeof metadata.artist === 'string' ? metadata.artist : ''
+  const name = typeof metadata.name === 'string' ? metadata.name : ''
+  return redactLocationText(
+    artist && name ? `${artist} — ${name}` : name || artist || 'Catalog source',
+    'Catalog source'
+  )
+}
+
+type HarmonyPolicyRecord = {
+  source_id: string
+  track_name: HarmonyTrackName
+  audio: { role: HarmonyAudioRole; asset_id: string; sha256: string }
+  provenance:
+    | {
+        kind: 'isolated_source_stem/v1'
+        timeline: 'same-master-timeline/v1'
+        attestation_id: string
+      }
+    | {
+        kind: 'isolated_separation_output/v1'
+        timeline: 'same-master-timeline/v1'
+        input: { asset_id: string; sha256: string }
+        separator: {
+          id: string
+          version: string
+          model_sha256: string
+          configuration_sha256: string
+        }
+      }
+}
+
+function catalogAssetIdentity(asset: CatalogAsset): { asset_id: string; sha256: string } {
+  return { asset_id: asset.asset_id, sha256: asset.sha256 }
+}
+
+function validateExistingHarmonyPolicy(
+  raw: unknown,
+  catalog: Record<string, unknown>,
+  records: readonly Record<string, unknown>[],
+  controlSha256: string
+): { policyId: string; records: HarmonyPolicyRecord[] } {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('Existing Harmony source policy is invalid.')
+  }
+  const policy = raw as Record<string, unknown>
+  if (
+    Object.keys(policy).length !== 6 ||
+    policy.schema_version !== 1 ||
+    policy.format !== HARMONY_SOURCE_POLICY_FORMAT ||
+    policy.catalog_id !== catalog.catalog_id ||
+    policy.catalog_control_sha256 !== controlSha256 ||
+    !Array.isArray(policy.records)
+  ) {
+    throw new Error('Existing Harmony source policy does not match this catalog.')
+  }
+  const policyId = validateHarmonyIdentifier(policy.policy_id, 'policy ID')
+  const bySourceId = new Map(records.map((record) => [String(record.source_id), record]))
+  const seen = new Set<string>()
+  const validRows: HarmonyPolicyRecord[] = []
+  for (const value of policy.records) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('Existing Harmony source policy is invalid.')
+    }
+    const row = value as Record<string, unknown>
+    if (Object.keys(row).length !== 4 || !isHarmonyTrackName(row.track_name)) {
+      throw new Error('Existing Harmony source policy is invalid.')
+    }
+    const sourceId = validateHarmonyIdentifier(row.source_id, 'source ID')
+    const key = `${sourceId}:${row.track_name}`
+    if (seen.has(key)) throw new Error('Existing Harmony source policy is invalid.')
+    seen.add(key)
+    const record = bySourceId.get(sourceId)
+    if (!record) throw new Error('Existing Harmony source policy is invalid.')
+    const expectedRole = HARMONY_TRACK_AUDIO_ROLE[row.track_name]
+    const audio = row.audio as Record<string, unknown> | undefined
+    const recordAudio = (record.audio ?? {}) as Partial<Record<CatalogAudioRole, CatalogAsset>>
+    const asset = recordAudio[expectedRole]
+    if (
+      !asset ||
+      !audio ||
+      Object.keys(audio).length !== 3 ||
+      audio.role !== expectedRole ||
+      audio.asset_id !== asset.asset_id ||
+      audio.sha256 !== asset.sha256
+    ) {
+      throw new Error('Existing Harmony source policy is invalid.')
+    }
+    const provenance = row.provenance as Record<string, unknown> | undefined
+    if (!provenance || provenance.timeline !== 'same-master-timeline/v1') {
+      throw new Error('Existing Harmony source policy is invalid.')
+    }
+    if (provenance.kind === 'isolated_source_stem/v1') {
+      if (Object.keys(provenance).length !== 3)
+        throw new Error('Existing Harmony source policy is invalid.')
+      validRows.push({
+        source_id: sourceId,
+        track_name: row.track_name,
+        audio: { role: expectedRole, ...catalogAssetIdentity(asset) },
+        provenance: {
+          kind: 'isolated_source_stem/v1',
+          timeline: 'same-master-timeline/v1',
+          attestation_id: validateHarmonyIdentifier(provenance.attestation_id, 'attestation ID')
+        }
+      })
+      continue
+    }
+    if (
+      provenance.kind !== 'isolated_separation_output/v1' ||
+      Object.keys(provenance).length !== 4
+    ) {
+      throw new Error('Existing Harmony source policy is invalid.')
+    }
+    const mix = recordAudio.mix
+    const input = provenance.input as Record<string, unknown> | undefined
+    const separator = provenance.separator as Record<string, unknown> | undefined
+    if (
+      !mix ||
+      !input ||
+      Object.keys(input).length !== 2 ||
+      input.asset_id !== mix.asset_id ||
+      input.sha256 !== mix.sha256 ||
+      !separator ||
+      Object.keys(separator).length !== 4
+    ) {
+      throw new Error('Existing Harmony source policy is invalid.')
+    }
+    validRows.push({
+      source_id: sourceId,
+      track_name: row.track_name,
+      audio: { role: expectedRole, ...catalogAssetIdentity(asset) },
+      provenance: {
+        kind: 'isolated_separation_output/v1',
+        timeline: 'same-master-timeline/v1',
+        input: catalogAssetIdentity(mix),
+        separator: {
+          id: validateHarmonyIdentifier(separator.id, 'separator ID'),
+          version: validateHarmonyIdentifier(separator.version, 'separator version'),
+          model_sha256: validateHarmonySha256(separator.model_sha256, 'separator model hash'),
+          configuration_sha256: validateHarmonySha256(
+            separator.configuration_sha256,
+            'separator configuration hash'
+          )
+        }
+      }
+    })
+  }
+  return { policyId, records: validRows }
+}
+
+async function readExistingHarmonyPolicy(
+  catalogRoot: string,
+  catalog: Record<string, unknown>,
+  records: readonly Record<string, unknown>[],
+  controlSha256: string
+): Promise<{ policyId: string; records: HarmonyPolicyRecord[] } | null> {
+  const policyPath = path.join(catalogRoot, HARMONY_SOURCE_POLICY_FILENAME)
+  try {
+    const policyInfo = await lstat(policyPath)
+    if (!policyInfo.isFile() || policyInfo.isSymbolicLink()) {
+      throw new Error('Existing Harmony source policy is invalid.')
+    }
+    return validateExistingHarmonyPolicy(
+      JSON.parse(await readFile(policyPath, 'utf8')),
+      catalog,
+      records,
+      controlSha256
+    )
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw error
+  }
+}
+
+async function replaceCatalogAtomically(
+  parentDir: string,
+  catalogName: string,
+  stagingPath: string
+): Promise<void> {
+  const catalogPath = path.join(parentDir, catalogName)
+  const backupPath = path.join(parentDir, `.${catalogName}.backup-${randomUUID()}`)
+  await rename(catalogPath, backupPath)
+  try {
+    await rename(stagingPath, catalogPath)
+  } catch (error) {
+    await rename(backupPath, catalogPath)
+    throw error
+  }
+  await rm(backupPath, { recursive: true, force: true }).catch(() => undefined)
+}
+
+export async function listCatalogHarmonyTargets(
+  parentDir: string,
+  requestedCatalogName: string
+): Promise<CatalogHarmonyTarget[]> {
+  const catalogName = validateCatalogName(requestedCatalogName)
+  const catalogRoot = path.join(path.resolve(parentDir), catalogName)
+  await validateStagedCatalog(catalogRoot)
+  const catalog = JSON.parse(
+    await readFile(path.join(catalogRoot, 'catalog.json'), 'utf8')
+  ) as Record<string, unknown>
+  const records = await readCatalogRecords(catalogRoot)
+  const policy = await readExistingHarmonyPolicy(
+    catalogRoot,
+    catalog,
+    records,
+    catalogControlSha256(catalog, await readFile(path.join(catalogRoot, 'records.jsonl'), 'utf8'))
+  )
+  const configured = new Map<string, Set<HarmonyTrackName>>()
+  for (const row of policy?.records ?? []) {
+    const tracks = configured.get(row.source_id) ?? new Set<HarmonyTrackName>()
+    tracks.add(row.track_name)
+    configured.set(row.source_id, tracks)
+  }
+  const targets = await Promise.all(
+    records.map(async (record) => ({
+      record,
+      tracks: await readExactHarmonyTracks(catalogRoot, record)
+    }))
+  )
+  return targets
+    .filter(
+      ({ record, tracks }) =>
+        (record.rights as { training_use?: string }).training_use === 'allowed' && tracks.length
+    )
+    .map(({ record, tracks }) => ({
+      sourceId: String(record.source_id),
+      label: harmonySourceLabel(record),
+      tracks,
+      configuredTracks: HARMONY_TRACK_NAMES.filter((track) =>
+        configured.get(String(record.source_id))?.has(track)
+      )
+    }))
+}
+
+export async function materializeCatalogHarmonySource(
+  options: MaterializeCatalogHarmonySourceOptions
+): Promise<MaterializeCatalogHarmonySourceResult> {
+  const catalogName = validateCatalogName(options.catalogName)
+  const sourceId = validateHarmonyIdentifier(options.sourceId, 'source ID')
+  if (!isHarmonyTrackName(options.trackName)) throw new Error('Harmony track is invalid.')
+  const parentDir = path.resolve(options.parentDir)
+  const catalogPath = path.join(parentDir, catalogName)
+  const reservationPath = path.join(parentDir, `.${catalogName}.harmony-reservation`)
+  const reservation = await open(reservationPath, 'wx')
+  const stagingPath = path.join(parentDir, `.${catalogName}.harmony-staging-${randomUUID()}`)
+  try {
+    await validateStagedCatalog(catalogPath)
+    const sourceAudio = await readExplicitHarmonyAudio(options.sourceAudioPath)
+    const catalog = JSON.parse(
+      await readFile(path.join(catalogPath, 'catalog.json'), 'utf8')
+    ) as Record<string, unknown>
+    const existingRecords = await readCatalogRecords(catalogPath)
+    const recordsText = await readFile(path.join(catalogPath, 'records.jsonl'), 'utf8')
+    const existingPolicy = await readExistingHarmonyPolicy(
+      catalogPath,
+      catalog,
+      existingRecords,
+      catalogControlSha256(catalog, recordsText)
+    )
+    const target = existingRecords.find((record) => record.source_id === sourceId)
+    if (!target || (target.rights as { training_use?: string }).training_use !== 'allowed') {
+      throw new Error('Choose an allowed catalog source for Harmony materialization.')
+    }
+    const availableTracks = await readExactHarmonyTracks(catalogPath, target)
+    if (!availableTracks.includes(options.trackName)) {
+      throw new Error('The selected catalog source does not contain that exact HARM track.')
+    }
+    const targetAudio = (target.audio ?? {}) as Partial<Record<CatalogAudioRole, CatalogAsset>>
+    const role = HARMONY_TRACK_AUDIO_ROLE[options.trackName]
+    const forbiddenHashes = new Set(
+      [targetAudio.mix?.sha256, targetAudio.vocals?.sha256].filter(Boolean)
+    )
+    const sourceSha256 = sha256Buffer(sourceAudio.bytes)
+    if (forbiddenHashes.has(sourceSha256)) {
+      throw new Error('Harmony audio must not duplicate the catalog mix or shared vocals asset.')
+    }
+    let provenance: HarmonyPolicyRecord['provenance']
+    if (options.provenance.kind === 'isolated_source_stem/v1') {
+      provenance = {
+        kind: 'isolated_source_stem/v1',
+        timeline: 'same-master-timeline/v1',
+        attestation_id: validateHarmonyIdentifier(
+          options.provenance.attestationId,
+          'attestation ID'
+        )
+      }
+    } else if (options.provenance.kind === 'isolated_separation_output/v1') {
+      const mix = targetAudio.mix
+      if (!mix) throw new Error('Pinned separation output requires a catalog mix asset.')
+      provenance = {
+        kind: 'isolated_separation_output/v1',
+        timeline: 'same-master-timeline/v1',
+        input: catalogAssetIdentity(mix),
+        separator: {
+          id: validateHarmonyIdentifier(options.provenance.separator.id, 'separator ID'),
+          version: validateHarmonyIdentifier(
+            options.provenance.separator.version,
+            'separator version'
+          ),
+          model_sha256: validateHarmonySha256(
+            options.provenance.separator.modelSha256,
+            'separator model hash'
+          ),
+          configuration_sha256: validateHarmonySha256(
+            options.provenance.separator.configurationSha256,
+            'separator configuration hash'
+          )
+        }
+      }
+    } else {
+      throw new Error('Harmony provenance is invalid.')
+    }
+    await cp(catalogPath, stagingPath, {
+      recursive: true,
+      errorOnExist: true,
+      verbatimSymlinks: true
+    })
+    const stagingRoot = await realpath(stagingPath)
+    const stagedRecords = await readCatalogRecords(stagingRoot)
+    const stagedTarget = stagedRecords.find((record) => record.source_id === sourceId)
+    if (!stagedTarget) throw new Error('Catalog source is unavailable.')
+    const asset = await materializeCatalogAsset(
+      stagingRoot,
+      sourceAudio.bytes,
+      `${role}.${sourceAudio.extension}`,
+      sourceAudio.mediaType
+    )
+    const stagedAudio = (stagedTarget.audio ??= {}) as Partial<
+      Record<CatalogAudioRole, CatalogAsset>
+    >
+    stagedAudio[role] = asset
+    for (const record of stagedRecords) validateCatalogRecord(record)
+    const stagedRecordsText = `${stagedRecords.map((record) => JSON.stringify(record)).join('\n')}\n`
+    await writeFile(path.join(stagingRoot, 'records.jsonl'), stagedRecordsText, 'utf8')
+    const stagedCatalog = JSON.parse(
+      await readFile(path.join(stagingRoot, 'catalog.json'), 'utf8')
+    ) as Record<string, unknown>
+    const updatedRows = (existingPolicy?.records ?? []).filter(
+      (row) => row.source_id !== sourceId || row.track_name !== options.trackName
+    )
+    updatedRows.push({
+      source_id: sourceId,
+      track_name: options.trackName,
+      audio: { role, ...catalogAssetIdentity(asset) },
+      provenance
+    })
+    updatedRows.sort((left, right) =>
+      `${left.source_id}:${left.track_name}`.localeCompare(`${right.source_id}:${right.track_name}`)
+    )
+    const policy = {
+      schema_version: 1,
+      format: HARMONY_SOURCE_POLICY_FORMAT,
+      policy_id: existingPolicy?.policyId ?? `octave-harmony-${randomUUID()}`,
+      catalog_id: stagedCatalog.catalog_id,
+      catalog_control_sha256: catalogControlSha256(stagedCatalog, stagedRecordsText),
+      records: updatedRows
+    }
+    // Read back through the strict policy validator before replacing the live
+    // catalog. That proves every retained row still binds to catalog assets.
+    await writeFile(
+      path.join(stagingRoot, HARMONY_SOURCE_POLICY_FILENAME),
+      `${JSON.stringify(policy, null, 2)}\n`,
+      'utf8'
+    )
+    await validateStagedCatalog(stagingRoot)
+    await readExistingHarmonyPolicy(
+      stagingRoot,
+      stagedCatalog,
+      stagedRecords,
+      catalogControlSha256(stagedCatalog, stagedRecordsText)
+    )
+    await replaceCatalogAtomically(parentDir, catalogName, stagingRoot)
+    return {
+      sourceId,
+      trackName: options.trackName,
+      configuredTracks: HARMONY_TRACK_NAMES.filter((track) =>
+        updatedRows.some((row) => row.source_id === sourceId && row.track_name === track)
+      )
+    }
+  } catch (error) {
+    await rm(stagingPath, { recursive: true, force: true })
+    throw error
+  } finally {
+    await reservation.close()
+    await unlink(reservationPath).catch(() => undefined)
+  }
+}
+
 export async function listSongSourceCatalogs(
   parentDir: string
 ): Promise<SongSourceCatalogSummary[]> {
@@ -1094,6 +1646,15 @@ export async function buildSongSourceCatalog(options: {
     }
     const stagingRoot = await realpath(stagingPath)
     await mkdir(path.join(stagingRoot, 'assets', 'sha256'), { recursive: true })
+    // A copied policy is valid only for its exact catalog-control identity.
+    // Catalog edits below can change records, rights, or catalog_id, so never
+    // carry a stale Harmony admission policy into an update/clone. A curator
+    // can explicitly recreate rows through the dedicated Harmony flow.
+    if (mode === 'update' || mode === 'clone') {
+      await unlink(path.join(stagingRoot, HARMONY_SOURCE_POLICY_FILENAME)).catch((error) => {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      })
+    }
     if (mode === 'update' || mode === 'clone') {
       const existingRecords = await readCatalogRecords(stagingRoot)
       if (mode === 'update' || mode === 'clone') {
