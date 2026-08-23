@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'crypto'
-import { createReadStream } from 'fs'
+import { constants, createReadStream } from 'fs'
 import {
   cp,
   lstat,
@@ -14,6 +14,7 @@ import {
   unlink,
   writeFile
 } from 'fs/promises'
+import { hostname } from 'os'
 import * as path from 'path'
 import { Readable } from 'stream'
 import { Midi } from '@tonejs/midi'
@@ -143,6 +144,10 @@ const HARMONY_SOURCE_POLICY_FILENAME = 'vocal-harmony-sources.json'
 const HARMONY_SOURCE_POLICY_FORMAT = 'octave-vocal-harmony-source-policy/v1'
 const HARMONY_IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$/
 const HARMONY_SHA256_PATTERN = /^[a-f0-9]{64}$/
+const CATALOG_MUTATION_RESERVATION_FORMAT = 'octave-catalog-mutation-reservation/v1'
+const CATALOG_MUTATION_LEASE_MS = 10 * 60 * 1000
+const CATALOG_MUTATION_HEARTBEAT_MS = 15 * 1000
+const MAX_CATALOG_MUTATION_RESERVATION_BYTES = 1024
 
 interface CatalogAudioInput {
   bytes: Buffer
@@ -1081,6 +1086,23 @@ function validateHarmonySha256(value: unknown, label: string): string {
   return value
 }
 
+type FileIdentity = {
+  dev: number
+  ino: number
+  size: number
+}
+
+function sameFileIdentity(left: FileIdentity, right: FileIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.size === right.size
+}
+
+function sameFileNodeIdentity(
+  left: Pick<FileIdentity, 'dev' | 'ino'>,
+  right: Pick<FileIdentity, 'dev' | 'ino'>
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino
+}
+
 function mediaTypeForAudioExtension(extension: (typeof AUDIO_EXTENSIONS)[number]): string {
   switch (extension) {
     case 'ogg':
@@ -1097,9 +1119,14 @@ function mediaTypeForAudioExtension(extension: (typeof AUDIO_EXTENSIONS)[number]
 }
 
 async function readExplicitHarmonyAudio(sourcePath: string): Promise<CatalogAudioInput> {
-  let sourceInfo: Awaited<ReturnType<typeof lstat>>
+  const extension = path.extname(sourcePath).slice(1).toLowerCase()
+  if (!isCatalogAudioExtension(extension)) {
+    throw new Error('Select an OGG, MP3, Opus, WAV, or FLAC Harmony source.')
+  }
+
+  let selectedInfo: Awaited<ReturnType<typeof lstat>>
   try {
-    sourceInfo = await lstat(sourcePath)
+    selectedInfo = await lstat(sourcePath)
   } catch {
     // The chooser's location is private main-process state. In particular,
     // an ENOENT/EACCES error includes it in Node's message, so never let that
@@ -1107,29 +1134,59 @@ async function readExplicitHarmonyAudio(sourcePath: string): Promise<CatalogAudi
     throw new Error('Selected Harmony audio is unavailable or unsupported.')
   }
   if (
-    !sourceInfo.isFile() ||
-    sourceInfo.isSymbolicLink() ||
-    (sourceInfo.mode & 0o444) === 0 ||
-    sourceInfo.size > MAX_AUDIO_ASSET_BYTES
+    !selectedInfo.isFile() ||
+    selectedInfo.isSymbolicLink() ||
+    (selectedInfo.mode & 0o444) === 0 ||
+    selectedInfo.size > MAX_AUDIO_ASSET_BYTES
   ) {
     throw new Error('Selected Harmony audio is unavailable or unsupported.')
   }
-  const extension = path.extname(sourcePath).slice(1).toLowerCase()
-  if (!isCatalogAudioExtension(extension)) {
-    throw new Error('Select an OGG, MP3, Opus, WAV, or FLAC Harmony source.')
-  }
-  let bytes: Buffer
+
+  let sourceHandle: Awaited<ReturnType<typeof open>>
   try {
-    bytes = await readFile(sourcePath)
+    // Read only from this descriptor. O_NOFOLLOW rejects a final-path symlink
+    // and O_NONBLOCK prevents a swapped FIFO/device from stalling the main
+    // process before fstat can reject it.
+    sourceHandle = await open(
+      sourcePath,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK
+    )
   } catch {
-    // Protect against deletion, relocation, permission changes, and other
-    // read failures after lstat. Those errors also include source locations.
     throw new Error('Selected Harmony audio is unavailable or unsupported.')
   }
-  if (bytes.length !== sourceInfo.size || bytes.length > MAX_AUDIO_ASSET_BYTES) {
+
+  try {
+    const openedInfo = await sourceHandle.stat()
+    if (
+      !openedInfo.isFile() ||
+      (openedInfo.mode & 0o444) === 0 ||
+      openedInfo.size > MAX_AUDIO_ASSET_BYTES ||
+      !sameFileIdentity(selectedInfo, openedInfo)
+    ) {
+      throw new Error('Selected Harmony audio is unavailable or unsupported.')
+    }
+    const bytes = await sourceHandle.readFile()
+    const readInfo = await sourceHandle.stat()
+    const currentInfo = await lstat(sourcePath)
+    if (
+      bytes.length !== openedInfo.size ||
+      bytes.length > MAX_AUDIO_ASSET_BYTES ||
+      !sameFileIdentity(openedInfo, readInfo) ||
+      !currentInfo.isFile() ||
+      currentInfo.isSymbolicLink() ||
+      !sameFileIdentity(openedInfo, currentInfo) ||
+      currentInfo.mtimeMs !== readInfo.mtimeMs
+    ) {
+      throw new Error('Selected Harmony audio is unavailable or unsupported.')
+    }
+    return { bytes, extension, mediaType: mediaTypeForAudioExtension(extension) }
+  } catch {
+    // Protect against deletion, relocation, permission changes, and every
+    // failure after selection. Diagnostics can contain a private path.
     throw new Error('Selected Harmony audio is unavailable or unsupported.')
+  } finally {
+    await sourceHandle.close().catch(() => undefined)
   }
-  return { bytes, extension, mediaType: mediaTypeForAudioExtension(extension) }
 }
 
 async function readExactHarmonyTracks(
@@ -1341,9 +1398,181 @@ async function replaceCatalogAtomically(
   await rm(backupPath, { recursive: true, force: true }).catch(() => undefined)
 }
 
+type CatalogMutationReservationMetadata = {
+  format: typeof CATALOG_MUTATION_RESERVATION_FORMAT
+  owner_id: string
+  owner_host: string
+  owner_pid: number
+  created_at_ms: number
+  lease_duration_ms: typeof CATALOG_MUTATION_LEASE_MS
+}
+
 type CatalogMutationReservation = {
   path: string
   handle: Awaited<ReturnType<typeof open>>
+  identity: FileIdentity
+  heartbeat?: ReturnType<typeof setInterval>
+  leaseHealthy: boolean
+}
+
+function reservationMetadata(
+  ownerId: string,
+  createdAtMs: number
+): CatalogMutationReservationMetadata {
+  return {
+    format: CATALOG_MUTATION_RESERVATION_FORMAT,
+    owner_id: ownerId,
+    owner_host: hostname(),
+    owner_pid: process.pid,
+    created_at_ms: createdAtMs,
+    lease_duration_ms: CATALOG_MUTATION_LEASE_MS
+  }
+}
+
+function parseReservationMetadata(value: unknown): CatalogMutationReservationMetadata | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const record = value as Record<string, unknown>
+  if (
+    record.format !== CATALOG_MUTATION_RESERVATION_FORMAT ||
+    !HARMONY_IDENTIFIER_PATTERN.test(String(record.owner_id ?? '')) ||
+    typeof record.owner_host !== 'string' ||
+    !record.owner_host ||
+    record.owner_host.length > 255 ||
+    !Number.isSafeInteger(record.owner_pid) ||
+    Number(record.owner_pid) <= 0 ||
+    !Number.isSafeInteger(record.created_at_ms) ||
+    !Number.isSafeInteger(record.lease_duration_ms) ||
+    record.lease_duration_ms !== CATALOG_MUTATION_LEASE_MS
+  ) {
+    return null
+  }
+  return record as CatalogMutationReservationMetadata
+}
+
+function isCatalogMutationOwnerActive(metadata: CatalogMutationReservationMetadata): boolean {
+  // Catalog roots are normally local. A remote/unknown owner must stay
+  // fail-closed because its PID cannot prove that its mutation is dead.
+  if (metadata.owner_host !== hostname()) return true
+  try {
+    process.kill(metadata.owner_pid, 0)
+    return true
+  } catch (error) {
+    // EPERM means the process exists but is not signalable. Other unexpected
+    // errors remain fail-closed; only a confirmed missing PID is reclaimable.
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH'
+  }
+}
+
+async function readCatalogMutationReservation(reservationPath: string): Promise<{
+  metadata: CatalogMutationReservationMetadata
+  identity: FileIdentity
+  mtimeMs: number
+} | null> {
+  let selectedInfo: Awaited<ReturnType<typeof lstat>>
+  try {
+    selectedInfo = await lstat(reservationPath)
+  } catch {
+    return null
+  }
+  if (
+    !selectedInfo.isFile() ||
+    selectedInfo.isSymbolicLink() ||
+    selectedInfo.size > MAX_CATALOG_MUTATION_RESERVATION_BYTES
+  ) {
+    return null
+  }
+  let handle: Awaited<ReturnType<typeof open>>
+  try {
+    handle = await open(
+      reservationPath,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK
+    )
+  } catch {
+    return null
+  }
+  try {
+    const openedInfo = await handle.stat()
+    if (!openedInfo.isFile() || !sameFileIdentity(selectedInfo, openedInfo)) return null
+    const bytes = await handle.readFile()
+    const readInfo = await handle.stat()
+    const currentInfo = await lstat(reservationPath)
+    if (
+      bytes.length > MAX_CATALOG_MUTATION_RESERVATION_BYTES ||
+      !sameFileIdentity(openedInfo, readInfo) ||
+      !currentInfo.isFile() ||
+      currentInfo.isSymbolicLink() ||
+      !sameFileIdentity(openedInfo, currentInfo) ||
+      currentInfo.mtimeMs !== readInfo.mtimeMs
+    ) {
+      return null
+    }
+    const metadata = parseReservationMetadata(JSON.parse(bytes.toString('utf8')))
+    if (!metadata) return null
+    return {
+      metadata,
+      identity: { dev: openedInfo.dev, ino: openedInfo.ino, size: openedInfo.size },
+      mtimeMs: readInfo.mtimeMs
+    }
+  } catch {
+    return null
+  } finally {
+    await handle.close().catch(() => undefined)
+  }
+}
+
+async function recoverExpiredCatalogMutationReservation(reservationPath: string): Promise<boolean> {
+  const reservation = await readCatalogMutationReservation(reservationPath)
+  if (
+    !reservation ||
+    Date.now() <= reservation.mtimeMs + reservation.metadata.lease_duration_ms ||
+    isCatalogMutationOwnerActive(reservation.metadata)
+  ) {
+    return false
+  }
+  const stalePath = `${reservationPath}.stale-${randomUUID()}`
+  let ownsStalePath = false
+  try {
+    // The only writer that can replace a reservation is a reclaimer after its
+    // lease has expired. Moving it first prevents a release from ever
+    // unlinking a new owner's reservation; release verifies inode identity.
+    await rename(reservationPath, stalePath)
+    const staleInfo = await lstat(stalePath)
+    if (!sameFileIdentity(reservation.identity, staleInfo)) {
+      throw new Error('Catalog mutation reservation identity changed.')
+    }
+    ownsStalePath = true
+    await unlink(stalePath)
+    return true
+  } catch {
+    if (ownsStalePath) await unlink(stalePath).catch(() => undefined)
+    return false
+  }
+}
+
+async function assertCatalogMutationReservation(
+  reservation: CatalogMutationReservation
+): Promise<void> {
+  if (!reservation.leaseHealthy) {
+    throw new Error('The catalog mutation reservation was lost.')
+  }
+  try {
+    // Renew through the owning descriptor. A recovered/renamed reservation
+    // cannot renew the replacement path and will fail the identity check.
+    const now = new Date()
+    await reservation.handle.utimes(now, now)
+    const handleInfo = await reservation.handle.stat()
+    const pathInfo = await lstat(reservation.path)
+    if (
+      !sameFileIdentity(reservation.identity, handleInfo) ||
+      !pathInfo.isFile() ||
+      pathInfo.isSymbolicLink() ||
+      !sameFileIdentity(reservation.identity, pathInfo)
+    ) {
+      throw new Error('Catalog mutation reservation identity changed.')
+    }
+  } catch {
+    throw new Error('The catalog mutation reservation was lost.')
+  }
 }
 
 /**
@@ -1356,20 +1585,82 @@ async function reserveCatalogMutation(
   catalogName: string
 ): Promise<CatalogMutationReservation> {
   const reservationPath = path.join(parentDir, `.${catalogName}.mutation-reservation`)
-  try {
-    return { path: reservationPath, handle: await open(reservationPath, 'wx') }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-      throw new Error('A catalog mutation with that name is already in progress.')
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let handle: Awaited<ReturnType<typeof open>>
+    try {
+      handle = await open(reservationPath, 'wx', 0o600)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+        if (attempt === 0 && (await recoverExpiredCatalogMutationReservation(reservationPath))) {
+          continue
+        }
+        throw new Error('A catalog mutation with that name is already in progress.')
+      }
+      // fs errors expose the parent directory. It is private main-process state.
+      throw new Error('The catalog mutation could not be started.')
     }
-    // fs errors expose the parent directory. It is private main-process state.
-    throw new Error('The catalog mutation could not be started.')
+
+    let createdIdentity: Pick<FileIdentity, 'dev' | 'ino'> | undefined
+    try {
+      const createdInfo = await handle.stat()
+      createdIdentity = { dev: createdInfo.dev, ino: createdInfo.ino }
+      const ownerId = randomUUID()
+      await handle.writeFile(
+        `${JSON.stringify(reservationMetadata(ownerId, Date.now()))}\n`,
+        'utf8'
+      )
+      await handle.sync()
+      const info = await handle.stat()
+      const reservation: CatalogMutationReservation = {
+        path: reservationPath,
+        handle,
+        identity: { dev: info.dev, ino: info.ino, size: info.size },
+        leaseHealthy: true
+      }
+      reservation.heartbeat = setInterval(() => {
+        void reservation.handle.utimes(new Date(), new Date()).catch(() => {
+          reservation.leaseHealthy = false
+        })
+      }, CATALOG_MUTATION_HEARTBEAT_MS)
+      reservation.heartbeat.unref()
+      return reservation
+    } catch {
+      await handle.close().catch(() => undefined)
+      try {
+        const pathInfo = await lstat(reservationPath)
+        if (
+          pathInfo.isFile() &&
+          !pathInfo.isSymbolicLink() &&
+          createdIdentity &&
+          sameFileNodeIdentity(createdIdentity, pathInfo)
+        ) {
+          await unlink(reservationPath)
+        }
+      } catch {
+        // Never unlink an unknown replacement reservation during failed setup.
+      }
+      throw new Error('The catalog mutation could not be started.')
+    }
   }
+  throw new Error('The catalog mutation could not be started.')
 }
 
 async function releaseCatalogMutation(reservation: CatalogMutationReservation): Promise<void> {
+  if (reservation.heartbeat) clearInterval(reservation.heartbeat)
   await reservation.handle.close().catch(() => undefined)
-  await unlink(reservation.path).catch(() => undefined)
+  try {
+    const pathInfo = await lstat(reservation.path)
+    if (
+      pathInfo.isFile() &&
+      !pathInfo.isSymbolicLink() &&
+      sameFileIdentity(reservation.identity, pathInfo)
+    ) {
+      await unlink(reservation.path)
+    }
+  } catch {
+    // A recovered reservation has already moved its old inode away. Never
+    // unlink an unknown replacement reservation during cleanup.
+  }
 }
 
 async function reserveCatalogMutations(
@@ -1393,6 +1684,12 @@ async function releaseCatalogMutations(
   reservations: readonly CatalogMutationReservation[]
 ): Promise<void> {
   for (const reservation of [...reservations].reverse()) await releaseCatalogMutation(reservation)
+}
+
+async function assertCatalogMutationReservations(
+  reservations: readonly CatalogMutationReservation[]
+): Promise<void> {
+  for (const reservation of reservations) await assertCatalogMutationReservation(reservation)
 }
 
 export async function listCatalogHarmonyTargets(
@@ -1575,6 +1872,7 @@ export async function materializeCatalogHarmonySource(
       stagedRecords,
       catalogControlSha256(stagedCatalog, stagedRecordsText)
     )
+    await assertCatalogMutationReservation(reservation)
     await replaceCatalogAtomically(parentDir, catalogName, stagingRoot)
     return {
       sourceId,
@@ -1826,6 +2124,7 @@ export async function buildSongSourceCatalog(options: {
       total: options.sources.length
     })
     await validateStagedCatalog(stagingRoot)
+    await assertCatalogMutationReservations(reservations)
     if (mode === 'update') {
       const backupPath = path.join(parentDir, `.${catalogName}.backup-${randomUUID()}`)
       await rename(catalogPath, backupPath)

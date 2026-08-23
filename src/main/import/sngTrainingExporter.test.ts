@@ -1,5 +1,16 @@
 import { existsSync } from 'fs'
-import { chmod, mkdir, readFile, readdir, rename, rm, writeFile } from 'fs/promises'
+import {
+  chmod,
+  mkdir,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  symlink,
+  utimes,
+  writeFile
+} from 'fs/promises'
+import { hostname } from 'os'
 import { join } from 'path'
 import AdmZip from 'adm-zip'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -63,6 +74,26 @@ describe('exportSngTrainingMidi', () => {
     header.writeUInt16BE(tracks.length, 10)
     header.writeUInt16BE(480, 12)
     return Buffer.concat([header, ...tracks])
+  }
+
+  async function writeMutationReservation(
+    path: string,
+    { ageMs = 0, ownerPid = process.pid }: { ageMs?: number; ownerPid?: number } = {}
+  ): Promise<void> {
+    await writeFile(
+      path,
+      `${JSON.stringify({
+        format: 'octave-catalog-mutation-reservation/v1',
+        owner_id: 'test-mutation-owner',
+        owner_host: hostname(),
+        owner_pid: ownerPid,
+        created_at_ms: Date.now() - ageMs,
+        lease_duration_ms: 10 * 60 * 1000
+      })}\n`,
+      'utf8'
+    )
+    const timestamp = new Date(Date.now() - ageMs)
+    await utimes(path, timestamp, timestamp)
   }
 
   function emptySngPackage(): Buffer {
@@ -857,6 +888,155 @@ describe('exportSngTrainingMidi', () => {
     } finally {
       await chmod(unreadable, 0o600)
     }
+  })
+
+  it('rejects a selected Harmony symlink without revealing its private target', async () => {
+    const parentDir = join(testDir, 'harmony-symlink-parent')
+    const songDir = join(testDir, 'harmony-symlink-song')
+    const privateTarget = join(testDir, 'private-harmony-target.wav')
+    const selectedLink = join(testDir, 'selected-harmony-link.wav')
+    await mkdir(parentDir, { recursive: true })
+    await mkdir(songDir, { recursive: true })
+    await writeFile(join(songDir, 'notes.mid'), namedTracksMidi(['PART VOCALS', 'HARM1']))
+    await writeFile(
+      join(songDir, 'song.ini'),
+      '[song]\nname = Symlink source\ndataset_opt_in = true\n'
+    )
+    await writeFile(privateTarget, 'isolated but private harmony')
+    await symlink(privateTarget, selectedLink)
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: songDir }],
+      parentDir,
+      catalogName: 'harmony-symlink-catalog',
+      catalogId: 'harmony-symlink-catalog',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    const sourceId = (await listCatalogHarmonyTargets(parentDir, 'harmony-symlink-catalog'))[0]
+      .sourceId
+    let error: Error | undefined
+    try {
+      await materializeCatalogHarmonySource({
+        parentDir,
+        catalogName: 'harmony-symlink-catalog',
+        sourceId,
+        trackName: 'HARM1',
+        sourceAudioPath: selectedLink,
+        provenance: { kind: 'isolated_source_stem/v1', attestationId: 'symlink-test' }
+      })
+    } catch (reason) {
+      error = reason as Error
+    }
+    expect(error?.message).toBe('Selected Harmony audio is unavailable or unsupported.')
+    expect(error?.message).not.toContain(privateTarget)
+    expect(error?.message).not.toContain(selectedLink)
+  })
+
+  it('recovers an expired valid mutation lease while preserving a live lease', async () => {
+    const parentDir = join(testDir, 'harmony-lease-parent')
+    const songDir = join(testDir, 'harmony-lease-song')
+    const harmonySource = join(testDir, 'private-harmony-lease.wav')
+    await mkdir(parentDir, { recursive: true })
+    await mkdir(songDir, { recursive: true })
+    await writeFile(join(songDir, 'notes.mid'), namedTracksMidi(['PART VOCALS', 'HARM1']))
+    await writeFile(join(songDir, 'song.ini'), '[song]\nname = Lease\ndataset_opt_in = true\n')
+    await writeFile(harmonySource, 'isolated harmony lease')
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: songDir }],
+      parentDir,
+      catalogName: 'harmony-lease-catalog',
+      catalogId: 'harmony-lease-catalog',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    const sourceId = (await listCatalogHarmonyTargets(parentDir, 'harmony-lease-catalog'))[0]
+      .sourceId
+    const reservationPath = join(parentDir, '.harmony-lease-catalog.mutation-reservation')
+    await writeMutationReservation(reservationPath)
+    await expect(
+      materializeCatalogHarmonySource({
+        parentDir,
+        catalogName: 'harmony-lease-catalog',
+        sourceId,
+        trackName: 'HARM1',
+        sourceAudioPath: harmonySource,
+        provenance: { kind: 'isolated_source_stem/v1', attestationId: 'live-lease' }
+      })
+    ).rejects.toThrow('A catalog mutation with that name is already in progress.')
+    await rm(reservationPath, { force: true })
+
+    await writeMutationReservation(reservationPath, {
+      ageMs: 11 * 60 * 1000,
+      // Linux PID values are bounded well below this and kill(..., 0) reports
+      // ESRCH, proving this is a crash-stale lease rather than a live owner.
+      ownerPid: 2 ** 31 - 1
+    })
+    await expect(
+      materializeCatalogHarmonySource({
+        parentDir,
+        catalogName: 'harmony-lease-catalog',
+        sourceId,
+        trackName: 'HARM1',
+        sourceAudioPath: harmonySource,
+        provenance: { kind: 'isolated_source_stem/v1', attestationId: 'expired-lease' }
+      })
+    ).resolves.toMatchObject({ sourceId, trackName: 'HARM1', configuredTracks: ['HARM1'] })
+  })
+
+  it('serializes real concurrent Harmony and catalog clone mutations', async () => {
+    const parentDir = join(testDir, 'harmony-concurrency-parent')
+    const songDir = join(testDir, 'harmony-concurrency-song')
+    const harmonySource = join(testDir, 'private-harmony-concurrency.wav')
+    await mkdir(parentDir, { recursive: true })
+    await mkdir(songDir, { recursive: true })
+    await writeFile(join(songDir, 'notes.mid'), namedTracksMidi(['PART VOCALS', 'HARM1']))
+    await writeFile(
+      join(songDir, 'song.ini'),
+      '[song]\nname = Concurrency\ndataset_opt_in = true\n'
+    )
+    await writeFile(harmonySource, 'isolated harmony concurrency')
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: songDir }],
+      parentDir,
+      catalogName: 'harmony-concurrency-catalog',
+      catalogId: 'harmony-concurrency-catalog',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    const sourceId = (await listCatalogHarmonyTargets(parentDir, 'harmony-concurrency-catalog'))[0]
+      .sourceId
+    const results = await Promise.allSettled([
+      materializeCatalogHarmonySource({
+        parentDir,
+        catalogName: 'harmony-concurrency-catalog',
+        sourceId,
+        trackName: 'HARM1',
+        sourceAudioPath: harmonySource,
+        provenance: { kind: 'isolated_source_stem/v1', attestationId: 'concurrency-stem' }
+      }),
+      buildSongSourceCatalog({
+        sources: [{ kind: 'octave-library', sourcePath: songDir }],
+        parentDir,
+        catalogName: 'harmony-concurrency-clone',
+        catalogId: 'harmony-concurrency-clone',
+        provenance: 'Reviewed',
+        license: 'test-only',
+        octaveVersion: 'test',
+        mode: 'clone',
+        sourceCatalogName: 'harmony-concurrency-catalog'
+      })
+    ])
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
+    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1)
+    const rejected = results.find((result) => result.status === 'rejected')
+    expect((rejected as PromiseRejectedResult).reason).toEqual(
+      expect.objectContaining({
+        message: 'A catalog mutation with that name is already in progress.'
+      })
+    )
   })
 
   it('shares one catalog mutation reservation across Harmony and generic catalog updates/clones', async () => {
