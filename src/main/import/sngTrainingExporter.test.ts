@@ -15,6 +15,7 @@ import {
 import { hostname } from 'os'
 import { join } from 'path'
 import AdmZip from 'adm-zip'
+import { type SngHeader } from 'parse-sng'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { packRb3con } from '../conPacker'
 import { packSng } from '../sngPacker'
@@ -27,6 +28,8 @@ import {
   listSongSourceCatalogs,
   materializeCatalogHarmonySource,
   setCatalogMutationTestHooksForTesting,
+  setSngExtractionTestHooksForTesting,
+  type SngExtractionParser,
   summarizeDatasetSource,
   summarizeDatasetSourceEntries
 } from './sngTrainingExporter'
@@ -125,6 +128,85 @@ describe('exportSngTrainingMidi', () => {
     fileIndex.writeBigUInt64LE(8n, 0)
     const payloadLength = Buffer.alloc(8)
     return Buffer.concat([header, metadata, fileIndex, payloadLength])
+  }
+
+  class NonterminalSngParser implements SngExtractionParser {
+    private headerListener: ((header: SngHeader) => void) | undefined
+    private fileListener:
+      | ((
+          fileName: string,
+          fileStream: ReadableStream<Uint8Array>,
+          nextFile: (() => void) | null
+        ) => void)
+      | undefined
+
+    constructor(
+      private readonly midi: Buffer,
+      private readonly emitDeclaredFinalAudio = false
+    ) {}
+
+    on(event: 'header', listener: (header: SngHeader) => void): void
+    on(
+      event: 'file',
+      listener: (
+        fileName: string,
+        fileStream: ReadableStream<Uint8Array>,
+        nextFile: (() => void) | null
+      ) => void
+    ): void
+    on(event: 'error', listener: (error: unknown) => void): void
+    on(
+      event: 'header' | 'file' | 'error',
+      listener:
+        | ((header: SngHeader) => void)
+        | ((
+            fileName: string,
+            fileStream: ReadableStream<Uint8Array>,
+            nextFile: (() => void) | null
+          ) => void)
+        | ((error: unknown) => void)
+    ): void {
+      if (event === 'header') this.headerListener = listener as typeof this.headerListener
+      else if (event === 'file') this.fileListener = listener as typeof this.fileListener
+      else void listener
+    }
+
+    start(): void {
+      this.headerListener?.({
+        fileIdentifier: 'SNGPKG',
+        version: 1,
+        xorMask: new Uint8Array(16),
+        metadata: { artist: 'Stalled Artist', name: 'Stalled Song' },
+        fileMeta: [
+          { filename: 'notes.mid', contentsLen: BigInt(this.midi.length), contentsIndex: 0n },
+          { filename: 'song.ogg', contentsLen: 4n, contentsIndex: BigInt(this.midi.length) }
+        ]
+      })
+      const emitFinalAudio = (): void => {
+        this.fileListener?.(
+          'song.ogg',
+          new ReadableStream({
+            start: (controller) => {
+              controller.enqueue(Buffer.from('OggS'))
+              controller.close()
+            }
+          }),
+          // Deliberately nonterminal: this mimics the observed parser failure
+          // after the final payload has been drained.
+          () => undefined
+        )
+      }
+      this.fileListener?.(
+        'notes.mid',
+        new ReadableStream({
+          start: (controller) => {
+            controller.enqueue(this.midi)
+            controller.close()
+          }
+        }),
+        this.emitDeclaredFinalAudio ? emitFinalAudio : () => undefined
+      )
+    }
   }
 
   beforeAll(async () => {
@@ -237,6 +319,64 @@ describe('exportSngTrainingMidi', () => {
     expect(result.exported).toEqual([])
     expect(result.skipped).toEqual([{ sourceIndex: 0, reason: 'Package has no notes.mid' }])
     expect(await readFile(result.manifestPath, 'utf8')).not.toContain('empty-private-package.sng')
+  })
+
+  it('fails closed when a declared later SNG stream never arrives', async () => {
+    const stalledSng = join(testDir, 'stalled-private-package.sng')
+    await writeFile(stalledSng, 'fixture parser owns this stream')
+    const outputDir = join(testDir, 'stalled-package-dataset')
+    setSngExtractionTestHooksForTesting({
+      timeoutMs: 100,
+      createParser: () => new NonterminalSngParser(validMidi)
+    })
+
+    try {
+      const result = await exportSngTrainingMidi({
+        sngPaths: [stalledSng],
+        outputDir,
+        datasetId: 'test-private-export',
+        provenance: 'synthetic test fixture',
+        license: 'test-only'
+      })
+
+      expect(result.exported).toEqual([])
+      expect(result.skipped).toEqual([
+        { sourceIndex: 0, reason: 'Package could not be read or exported' }
+      ])
+      const manifest = await readFile(result.manifestPath, 'utf8')
+      expect(manifest).not.toContain(stalledSng)
+      expect(manifest).not.toContain('stalled-private-package.sng')
+    } finally {
+      setSngExtractionTestHooksForTesting(undefined)
+    }
+  })
+
+  it('completes a fully drained declared SNG file set without a terminal continuation', async () => {
+    const nonterminalSng = join(testDir, 'nonterminal-private-package.sng')
+    await writeFile(nonterminalSng, 'fixture parser owns this stream')
+    const outputDir = join(testDir, 'nonterminal-package-dataset')
+    setSngExtractionTestHooksForTesting({
+      timeoutMs: 100,
+      createParser: () => new NonterminalSngParser(validMidi, true)
+    })
+
+    try {
+      const result = await exportSngTrainingMidi({
+        sngPaths: [nonterminalSng],
+        outputDir,
+        datasetId: 'test-private-export',
+        provenance: 'synthetic test fixture',
+        license: 'test-only'
+      })
+
+      expect(result.exported).toHaveLength(1)
+      expect(result.skipped).toEqual([])
+      const manifest = await readFile(result.manifestPath, 'utf8')
+      expect(manifest).not.toContain(nonterminalSng)
+      expect(manifest).not.toContain('nonterminal-private-package.sng')
+    } finally {
+      setSngExtractionTestHooksForTesting(undefined)
+    }
   })
 
   it('skips packages with malformed notes.mid data, even when the header looks valid', async () => {

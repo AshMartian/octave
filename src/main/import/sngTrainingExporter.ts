@@ -36,6 +36,10 @@ const MAX_METADATA_VALUE_LENGTH = 512
 const MAX_ZIP_ENTRIES = 2_000
 const MAX_ZIP_ENTRY_BYTES = 64 * 1024 * 1024
 const MAX_AUDIO_ASSET_BYTES = 512 * 1024 * 1024
+// A malformed package must not hold a catalog mutation indefinitely. This is
+// deliberately generous for legitimate packages with several large audio
+// streams, while still giving every selected package a bounded outcome.
+const SNG_EXTRACTION_TIMEOUT_MS = 2 * 60 * 1000
 const AUDIO_EXTENSIONS = ['ogg', 'mp3', 'opus', 'wav', 'flac'] as const
 const CATALOG_SCHEMA_ID =
   'https://octavestudio.tools/schemas/song-source-catalog/v1/catalog.schema.json'
@@ -358,6 +362,45 @@ async function drain(fileStream: ReadableStream<Uint8Array>): Promise<void> {
   }
 }
 
+type SngFileContinuation = (() => void) | null
+
+export interface SngExtractionParser {
+  on(event: 'header', listener: (header: SngHeader) => void): void
+  on(
+    event: 'file',
+    listener: (
+      fileName: string,
+      fileStream: ReadableStream<Uint8Array>,
+      nextFile: SngFileContinuation
+    ) => void
+  ): void
+  on(event: 'error', listener: (error: unknown) => void): void
+  start(): void
+}
+
+export interface SngExtractionTestHooks {
+  /** Kept test-only so production ingestion always uses the bounded default. */
+  timeoutMs?: number
+  /** Allows a stalled parser harness without exposing parser failures through IPC. */
+  createParser?: (source: ReadableStream<Uint8Array>) => SngExtractionParser
+}
+
+let sngExtractionTestHooks: SngExtractionTestHooks | undefined
+
+/** Test-only parser seam; it is never reachable through IPC or catalog records. */
+export function setSngExtractionTestHooksForTesting(
+  hooks: SngExtractionTestHooks | undefined
+): void {
+  sngExtractionTestHooks = hooks
+}
+
+function sngExtractionTimeoutMs(): number {
+  const timeoutMs = sngExtractionTestHooks?.timeoutMs
+  return timeoutMs !== undefined && Number.isSafeInteger(timeoutMs) && timeoutMs > 0
+    ? timeoutMs
+    : SNG_EXTRACTION_TIMEOUT_MS
+}
+
 function isCatalogAudioExtension(value: string): value is (typeof AUDIO_EXTENSIONS)[number] {
   return (AUDIO_EXTENSIONS as readonly string[]).includes(value)
 }
@@ -484,27 +527,54 @@ async function extractSngNotesMidi(
     let metadata: Record<string, string> | null = null
     let generatedByStrum = false
     let notesMidi: Buffer | null = null
+    let expectedFileCount: number | null = null
+    let completedFileCount = 0
+    let activeFileStream: ReadableStream<Uint8Array> | null = null
     const audio: Partial<Record<CatalogAudioRole, CatalogAudioInput>> = {}
-    const settle = (callback: () => void): void => {
+    const input =
+      typeof sngSource === 'string' ? createReadStream(sngSource) : Readable.from([sngSource])
+    // A close caused by our cleanup should not become an unhandled Node stream
+    // error. The parser still receives read failures through its Web stream.
+    input.on('error', () => undefined)
+    const timeout = setTimeout(() => {
+      fail(new Error('SNG package extraction timed out.'))
+    }, sngExtractionTimeoutMs())
+    const stopStreams = (): void => {
+      if (activeFileStream) {
+        void activeFileStream.cancel('SNG package extraction stopped.').catch(() => undefined)
+      }
+      if (!input.destroyed) input.destroy()
+    }
+    const settle = (callback: () => void, stop = false): void => {
       if (settled) return
       settled = true
+      clearTimeout(timeout)
+      if (stop) stopStreams()
       callback()
     }
     const fail = (error: unknown): void =>
-      settle(() => reject(error instanceof Error ? error : new Error(String(error))))
-    const input =
-      typeof sngSource === 'string' ? createReadStream(sngSource) : Readable.from([sngSource])
-    const sngStream = new SngStream(Readable.toWeb(input) as ReadableStream<Uint8Array>, {
-      generateSongIni: false
-    })
+      settle(() => reject(error instanceof Error ? error : new Error(String(error))), true)
+    const source = Readable.toWeb(input) as ReadableStream<Uint8Array>
+    const sngStream =
+      sngExtractionTestHooks?.createParser?.(source) ??
+      new SngStream(source, { generateSongIni: false })
 
     sngStream.on('header', (header: SngHeader) => {
       metadata = sanitizeMetadata(header.metadata)
       generatedByStrum = isStrumGenerated(header.metadata)
-      if (header.fileMeta.length === 0) settle(() => resolve(null))
+      expectedFileCount = header.fileMeta.length
+      if (expectedFileCount === 0) settle(() => resolve(null), true)
     })
     sngStream.on('file', (fileName, fileStream, nextFile) => {
       void (async () => {
+        if (settled) {
+          await fileStream.cancel('SNG package extraction already settled.').catch(() => undefined)
+          return
+        }
+        if (expectedFileCount === null || completedFileCount >= expectedFileCount) {
+          throw new Error('SNG package file sequence is invalid.')
+        }
+        activeFileStream = fileStream
         if (fileName.toLowerCase() === NOTES_MIDI) {
           if (notesMidi) throw new Error(`Package contains multiple ${NOTES_MIDI} files`)
           const chunks: Buffer[] = []
@@ -530,21 +600,33 @@ async function extractSngNotesMidi(
         } else {
           await drain(fileStream as ReadableStream<Uint8Array>)
         }
-        if (nextFile) nextFile()
-        else
-          settle(() =>
-            resolve(
-              notesMidi && metadata
-                ? {
-                    midi: notesMidi,
-                    entryLocator: NOTES_MIDI,
-                    metadata,
-                    audio,
-                    isStrumGenerated: generatedByStrum
-                  }
-                : null
-            )
+        activeFileStream = null
+        completedFileCount += 1
+        // parse-sng exposes completion only through the final file's null
+        // continuation. Some real streams drain that final payload but never
+        // provide the expected terminal continuation. The authenticated header
+        // already declares the exact file count, so only accept after every
+        // declared stream has drained; never accept a partial package.
+        if (completedFileCount === expectedFileCount) {
+          settle(
+            () =>
+              resolve(
+                notesMidi && metadata
+                  ? {
+                      midi: notesMidi,
+                      entryLocator: NOTES_MIDI,
+                      metadata,
+                      audio,
+                      isStrumGenerated: generatedByStrum
+                    }
+                  : null
+              ),
+            true
           )
+          return
+        }
+        if (!nextFile) throw new Error('SNG package ended before all declared files were read.')
+        nextFile()
       })().catch(fail)
     })
     sngStream.on('error', fail)
