@@ -125,8 +125,8 @@ The bundle manifest contains schema version; bundle ID; compatible STRUM runtime
 Before a chart run, STRUM performs:
 
 ```text
-strum-worker inference preflight --model-root <validated-root> --request <owned-json> --json
-strum-worker chart --request <owned-json> --json-events
+strum-worker chart preflight --request <owned-json> --json
+strum-worker chart run --request <owned-json> --json-events
 ```
 
 Preflight validates bundle schema, file hashes/sizes, model state/config/shape compatibility, device availability, requested instruments, required stems, companion models, and the selected difficulty policy. It returns an immutable `strum-chart-preflight/v1` resolved plan. Loading an arbitrary user-selected `.pt` with unsafe deserialization is never an OCTAVE feature; only a trusted, verified bundle is eligible.
