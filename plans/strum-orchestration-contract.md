@@ -6,7 +6,7 @@ OCTAVE is the local curation, catalog, job-control, and deployment surface. STRU
 
 The boundary supports STRUM as a family of models rather than one model. A user can select Guitar audio-to-chart, Drums, learned chart-to-chart difficulty transforms, or future Vocal/Pro-instrument pipelines from one approved OCTAVE catalog.
 
-The first proof is complete: OCTAVE created a 58-record allowed catalog; STRUM selected 31 Guitar, 52 Drums, 29 Bass, 18 Keys, and 3 Vocal-eligible records for dedicated workers. Catalog-aware smoke preprocessing and bounded CUDA training completed for Guitar, Drums, Bass, Keys, and Vocal activity/pitch. Exact Pro target decoding and Vocal phrase/lyric task preparation also complete against that catalog. These artifacts validate the handoff and worker contracts only; they are not deployable quality models.
+The first proof is complete: OCTAVE created a 58-record allowed catalog; STRUM selected 31 Guitar, 52 Drums, 29 Bass, 18 Keys, and 3 Vocal-eligible records for dedicated workers. Catalog-aware smoke preprocessing and bounded CUDA training completed for Guitar, Drums, Bass, Keys, Vocal activity/pitch, and observed Vocal lyric alignment. Exact Pro target decoding and Vocal phrase task preparation also complete against that catalog. These artifacts validate the handoff and worker contracts only; they are not deployable quality models.
 
 ## Ownership boundary
 
