@@ -1,6 +1,9 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
-import type { StrumCheckpointOutputContracts } from '../shared/strumTrainingContracts'
+import type {
+  StrumCheckpointOutputContracts,
+  StrumPromotionJobDescriptor
+} from '../shared/strumTrainingContracts'
 import type {
   MetadataArtwork,
   SongMetadataSearchRequest,
@@ -209,17 +212,20 @@ const api = {
       id: string
       display_name: string
       kind: string
-      catalog_requirements: {
-        instrument: string
-        difficulties: string[]
-        audio_roles: string[]
-        audio_policy: string
-      }
+      version: number
+      status: string
+      preparation_status: string
+      training_status: string
+      catalog_requirements: Record<string, unknown>
       prepare_schema: Record<string, unknown>
-      train_schema: Record<string, unknown>
+      train_schema: Record<string, unknown> | null
       checkpoint_outputs: string[]
       checkpoint_output_contracts?: StrumCheckpointOutputContracts
       inference_capability: string | null
+      private_request_fields: string[]
+      catalog_inspection_option_keys: string[]
+      training_requirements: string[]
+      promotion_jobs: StrumPromotionJobDescriptor[]
     }>
   > => ipcRenderer.invoke('training:pipelines'),
 
@@ -240,6 +246,7 @@ const api = {
       checkpointCount: number
       deployable: boolean
       checkpointManifestHash: string
+      artifactId?: string
       createdAt: string
     }>
     profiles: Array<{
@@ -265,7 +272,7 @@ const api = {
       modelId: string
       manifestSha256: string
       schemaVersion: number
-      compatibility: Record<string, string | number>
+      compatibility: Record<string, string | number | boolean | null>
       components: Array<{ id: string; sha256: string; byteLength: number }>
       profiles: Array<{
         profileId: string
@@ -287,7 +294,7 @@ const api = {
     modelId: string
     manifestSha256: string
     schemaVersion: number
-    compatibility: Record<string, string | number>
+    compatibility: Record<string, string | number | boolean | null>
     components: Array<{ id: string; sha256: string; byteLength: number }>
     profiles: Array<{
       profileId: string
@@ -334,13 +341,16 @@ const api = {
     parentId: string
     catalogName: string
     pipelineId: string
+    prepare: Record<string, unknown>
   }): Promise<{
     pipelineId: string
     eligibleCount: number
     recordCount: number
     excluded: Record<string, number>
-    audioPolicy: string
+    audioPolicy: Record<string, unknown>
     estimatedStorageBytes: number
+    storageEstimateCapped: boolean
+    storageEstimateSemantics: string
   }> => ipcRenderer.invoke('training:inspectCatalog', options),
 
   prepareTrainingDataset: (options: {

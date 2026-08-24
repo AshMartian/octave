@@ -26,7 +26,7 @@ function candidate({
     model_id: 'catalog-guitar-v1',
     manifest_sha256: manifestSha256,
     schema_version: 1,
-    compatibility: { protocol_major: 1 },
+    compatibility: { manifest_schema: 1, strum_version: '>=1.0.0' },
     components: [{ id: 'chart_transform', sha256: 'e'.repeat(64), byte_length: 42 }],
     profiles: [
       {
@@ -243,5 +243,33 @@ describe('discovered STRUM profile boundaries', () => {
         difficultyPolicy: 'hard'
       })
     ).rejects.toThrow(/no executable STRUM Auto Chart profile/)
+  })
+
+  it('rejects path-bearing compatibility metadata before checkpoint discovery reaches IPC', async () => {
+    const inspection = candidate({ artifactId: artifactA, manifestSha256: manifestA })
+    inspection.compatibility = {
+      manifest_schema: 1,
+      strum_version: '>=1.0.0',
+      strum_revision: 'source:/private/bundle'
+    }
+    selectedFolder = await addBundle('bundle-path-metadata', inspection)
+    await expect(chooseCheckpointFolder()).rejects.toThrow('valid checkpoint discovery response')
+  })
+
+  it('preserves a null STRUM dirty-state as an unknown, safe compatibility value', async () => {
+    const inspection = candidate({ artifactId: artifactA, manifestSha256: manifestA })
+    inspection.compatibility = {
+      manifest_schema: 1,
+      strum_version: '>=1.0.0',
+      strum_source_dirty: null
+    }
+    selectedFolder = await addBundle('bundle-unknown-dirty-state', inspection)
+    await expect(chooseCheckpointFolder()).resolves.toMatchObject({
+      candidates: [
+        expect.objectContaining({
+          compatibility: expect.objectContaining({ strum_source_dirty: null })
+        })
+      ]
+    })
   })
 })

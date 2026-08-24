@@ -6,7 +6,10 @@ import {
   type Dispatch,
   type SetStateAction
 } from 'react'
-import type { StrumCheckpointOutputContracts } from '../../../shared/strumTrainingContracts'
+import type {
+  StrumCheckpointOutputContracts,
+  StrumPromotionJobDescriptor
+} from '../../../shared/strumTrainingContracts'
 import './DatasetCurationModal.css'
 
 type SourceCandidate = {
@@ -70,17 +73,20 @@ type TrainingPipeline = {
   id: string
   display_name: string
   kind: string
-  catalog_requirements: {
-    instrument: string
-    difficulties: string[]
-    audio_roles: string[]
-    audio_policy: string
-  }
+  version: number
+  status: string
+  preparation_status: string
+  training_status: string
+  catalog_requirements: Record<string, unknown>
   prepare_schema: Record<string, unknown>
-  train_schema: Record<string, unknown>
+  train_schema: Record<string, unknown> | null
   checkpoint_outputs: string[]
   checkpoint_output_contracts?: StrumCheckpointOutputContracts
   inference_capability: string | null
+  private_request_fields: string[]
+  catalog_inspection_option_keys: string[]
+  training_requirements: string[]
+  promotion_jobs: StrumPromotionJobDescriptor[]
 }
 
 type TrainingControlValue = string | number | boolean
@@ -111,6 +117,7 @@ type TrainingRun = {
   checkpointCount: number
   deployable: boolean
   checkpointManifestHash: string
+  artifactId?: string
   createdAt: string
 }
 
@@ -128,7 +135,7 @@ type DiscoveredCheckpoint = {
   modelId: string
   manifestSha256: string
   schemaVersion: number
-  compatibility: Record<string, string | number>
+  compatibility: Record<string, string | number | boolean | null>
   components: Array<{ id: string; sha256: string; byteLength: number }>
   profiles: DiscoveredCheckpointProfile[]
   rejectedProfileCount: number
@@ -223,6 +230,20 @@ function candidateLabel(candidate: SourceCandidate): string {
   const artist = candidate.metadata.artist
   const name = candidate.metadata.name
   return artist && name ? `${artist} — ${name}` : `${candidate.kind} source`
+}
+
+function catalogRequirementInstrument(requirements: Record<string, unknown>): string {
+  if (typeof requirements.instrument === 'string') return requirements.instrument
+  if (Array.isArray(requirements.instruments) && typeof requirements.instruments[0] === 'string') {
+    return requirements.instruments[0]
+  }
+  return 'training'
+}
+
+function audioPolicyLabel(policy: Record<string, unknown> | undefined): string {
+  if (!policy || typeof policy.kind !== 'string') return 'See STRUM requirements'
+  if (policy.kind === 'not_required') return 'Not required'
+  return policy.kind.replaceAll('_', ' ')
 }
 
 function trainingSchemaControls(schema: Record<string, unknown>): TrainingSchemaControl[] {
@@ -503,7 +524,7 @@ export function TrainingModal({
     eligibleCount: number
     recordCount: number
     excluded: Record<string, number>
-    audioPolicy: string
+    audioPolicy: Record<string, unknown>
   } | null>(null)
   const [trainingTasks, setTrainingTasks] = useState<TrainingTask[]>([])
   const [trainingRuns, setTrainingRuns] = useState<TrainingRun[]>([])
@@ -557,7 +578,9 @@ export function TrainingModal({
     [selectedPipelineId, trainingTasks]
   )
   const selectedPipelineName = selectedPipeline?.display_name ?? 'STRUM'
-  const selectedInstrument = selectedPipeline?.catalog_requirements.instrument ?? 'training'
+  const selectedInstrument = selectedPipeline
+    ? catalogRequirementInstrument(selectedPipeline.catalog_requirements)
+    : 'training'
   const selectedDiscoveredProfile = useMemo(
     () =>
       selectedDiscoveredCheckpoint?.profiles.find(
@@ -723,7 +746,8 @@ export function TrainingModal({
       .inspectTrainingCatalog({
         parentId: catalogParent.parentId,
         catalogName: selectedCatalog.catalogName,
-        pipelineId: selectedPipelineId
+        pipelineId: selectedPipelineId,
+        prepare: resolvedPrepareConfig
       })
       .then((inspection) => {
         if (current) setCatalogInspection(inspection)
@@ -734,7 +758,14 @@ export function TrainingModal({
     return () => {
       current = false
     }
-  }, [activeStep, catalogParent, selectedCatalog, selectedPipelineId, trainingRuntime])
+  }, [
+    activeStep,
+    catalogParent,
+    resolvedPrepareConfig,
+    selectedCatalog,
+    selectedPipelineId,
+    trainingRuntime
+  ])
 
   useEffect(() => {
     if (activeStep !== 'deploy' || !selectedArtifactId) {
@@ -1632,7 +1663,7 @@ export function TrainingModal({
                     </div>
                     <div>
                       <span>Audio policy</span>
-                      <strong>{catalogInspection?.audioPolicy ?? 'Prefer Guitar, then mix'}</strong>
+                      <strong>{audioPolicyLabel(catalogInspection?.audioPolicy)}</strong>
                     </div>
                     <div>
                       <span>Split</span>

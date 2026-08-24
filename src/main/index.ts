@@ -1181,13 +1181,21 @@ ipcMain.handle('training:inspectCheckpoint', async (_event, runId: string) => {
 
 ipcMain.handle(
   'training:inspectCatalog',
-  async (_event, options: { parentId: string; catalogName: string; pipelineId: string }) => {
+  async (
+    _event,
+    options: {
+      parentId: string
+      catalogName: string
+      pipelineId: string
+      prepare: Record<string, unknown>
+    }
+  ) => {
     const root = datasetCatalogRoot(options.parentId, options.catalogName)
     if (!root || !existsSync(join(root, 'catalog.json'))) {
       throw new Error('Select a catalog from the active catalog parent first.')
     }
     try {
-      return await inspectTrainingCatalog(root, options.pipelineId)
+      return await inspectTrainingCatalog(root, options.pipelineId, options.prepare)
     } catch {
       throw new Error('STRUM could not inspect the selected catalog.')
     }
