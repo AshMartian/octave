@@ -400,7 +400,13 @@ const api = {
         | 'cancelled'
       code?: string
       message: string
-      result?: Record<string, unknown> | (StrumPromotionJobResult & { promotionId: string })
+      result?:
+        | Record<string, unknown>
+        | (StrumPromotionJobResult & {
+            promotionId: string
+            artifactId?: string
+            deploymentStatus?: 'ready' | 'not_deployable'
+          })
     }) => void
   ): (() => void) => {
     const listener = (
@@ -421,7 +427,13 @@ const api = {
           | 'cancelled'
         code?: string
         message: string
-        result?: Record<string, unknown> | (StrumPromotionJobResult & { promotionId: string })
+        result?:
+          | Record<string, unknown>
+          | (StrumPromotionJobResult & {
+              promotionId: string
+              artifactId?: string
+              deploymentStatus?: 'ready' | 'not_deployable'
+            })
       }
     ): void => callback(progress)
     ipcRenderer.on('training:progress', listener)

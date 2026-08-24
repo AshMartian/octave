@@ -503,6 +503,7 @@ describe('STRUM d8 training adapter', () => {
     })
     expect(packageRequest?.evaluation).toEqual(evaluationRequest?.output)
     expect(JSON.stringify(packageRequest)).toContain(scratch)
+    expect(sends.at(-1)?.result).toMatchObject({ artifactId, deploymentStatus: 'not_deployable' })
   })
 
   it('fails a hostile promotion terminal without publishing worker paths', async () => {

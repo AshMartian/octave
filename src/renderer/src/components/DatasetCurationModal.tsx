@@ -8,7 +8,8 @@ import {
 } from 'react'
 import type {
   StrumCheckpointOutputContracts,
-  StrumPromotionJobDescriptor
+  StrumPromotionJobDescriptor,
+  StrumPromotionJobResult
 } from '../../../shared/strumTrainingContracts'
 import './DatasetCurationModal.css'
 
@@ -178,6 +179,12 @@ type TrainingJob = {
     | 'cancelled'
   code?: string
   message: string
+}
+
+type TrainingPromotionResult = StrumPromotionJobResult & {
+  promotionId: string
+  artifactId?: string
+  deploymentStatus?: 'ready' | 'not_deployable'
 }
 
 const CATALOG_PARENT_STORAGE_KEY = 'octave.datasetCatalogParent'
@@ -541,6 +548,12 @@ export function TrainingModal({
   const [trainingJob, setTrainingJob] = useState<TrainingJob | null>(null)
   const [prepareConfig, setPrepareConfig] = useState<Record<string, TrainingControlValue>>({})
   const [trainConfig, setTrainConfig] = useState<Record<string, TrainingControlValue>>({})
+  const [promotionArtifactId, setPromotionArtifactId] = useState('')
+  const [promotionJobs, setPromotionJobs] = useState<StrumPromotionJobDescriptor[]>([])
+  const [promotionConfigs, setPromotionConfigs] = useState<
+    Record<string, Record<string, TrainingControlValue>>
+  >({})
+  const [promotionResults, setPromotionResults] = useState<TrainingPromotionResult[]>([])
 
   const selectedPipeline = useMemo(
     () => trainingPipelines.find((pipeline) => pipeline.id === selectedPipelineId) ?? null,
@@ -587,6 +600,14 @@ export function TrainingModal({
         (profile) => profile.profileId === selectedDiscoveredProfileId
       ) ?? null,
     [selectedDiscoveredCheckpoint, selectedDiscoveredProfileId]
+  )
+  const promotionRuns = useMemo(
+    () => trainingRuns.filter((run) => Boolean(run.artifactId)),
+    [trainingRuns]
+  )
+  const selectedPromotionRun = useMemo(
+    () => promotionRuns.find((run) => run.artifactId === promotionArtifactId) ?? null,
+    [promotionArtifactId, promotionRuns]
   )
 
   const refreshLibrary = useCallback(async (): Promise<void> => {
@@ -714,6 +735,33 @@ export function TrainingModal({
   }, [selectedPipelineTasks])
 
   useEffect(() => {
+    setPromotionArtifactId((current) =>
+      promotionRuns.some((run) => run.artifactId === current)
+        ? current
+        : (promotionRuns[0]?.artifactId ?? '')
+    )
+  }, [promotionRuns])
+
+  useEffect(() => {
+    if (!promotionArtifactId) {
+      setPromotionJobs([])
+      return
+    }
+    let current = true
+    void window.api
+      .listTrainingPromotionJobs(promotionArtifactId)
+      .then((jobs) => {
+        if (current) setPromotionJobs(jobs)
+      })
+      .catch(() => {
+        if (current) setPromotionJobs([])
+      })
+    return () => {
+      current = false
+    }
+  }, [promotionArtifactId, trainingRuns])
+
+  useEffect(() => {
     const unsubscribe = window.api.onTrainingProgress((event) => {
       setTrainingJob({
         jobId: event.jobId,
@@ -724,7 +772,20 @@ export function TrainingModal({
         code: event.code,
         message: event.message
       })
-      if (event.state === 'succeeded') void refreshTrainingState()
+      if (event.state === 'succeeded') {
+        const promotion = event.result as TrainingPromotionResult | undefined
+        if (promotion?.format === 'strum-post-train-job-result/v1') {
+          setPromotionResults((current) => [
+            ...current.filter((result) => result.promotionId !== promotion.promotionId),
+            promotion
+          ])
+          if (promotion.artifactId && promotion.deploymentStatus === 'ready') {
+            setSelectedArtifactId(promotion.artifactId)
+            setActiveStep('deploy')
+          }
+        }
+        void refreshTrainingState()
+      }
       if (event.state === 'failed') setError(event.message)
     })
     return unsubscribe
@@ -1167,6 +1228,30 @@ export function TrainingModal({
       })
     } catch {
       setError('STRUM could not start this training run.')
+    }
+  }
+
+  const startPromotion = async (job: StrumPromotionJobDescriptor): Promise<void> => {
+    if (!promotionArtifactId || job.status !== 'available') return
+    setError(null)
+    try {
+      const controls = trainingSchemaControls(job.options_schema)
+      const options = schemaConfig(controls, promotionConfigs[job.id] ?? {})
+      const started = await window.api.startTrainingPromotionJob({
+        candidateArtifactId: promotionArtifactId,
+        jobId: job.id,
+        options
+      })
+      setTrainingJob({
+        jobId: started.jobId,
+        sequence: 0,
+        stage: 'post_training_promotion',
+        state: 'queued',
+        progress: 0,
+        message: `Queuing ${job.display_name} locally.`
+      })
+    } catch {
+      setError('STRUM could not start this post-training job.')
     }
   }
 
@@ -1819,6 +1904,91 @@ export function TrainingModal({
                     </div>
                   ))}
                 </div>
+              )}
+              {promotionRuns.length > 0 && (
+                <section className="training-promotion-panel">
+                  <h4>Evaluate and package a candidate</h4>
+                  <p className="training-inline-note">
+                    STRUM advertises the available post-training gates. OCTAVE sends only their
+                    declared options and keeps candidate and evidence locations private.
+                  </p>
+                  <label className="training-control">
+                    Trained candidate
+                    <select
+                      value={promotionArtifactId}
+                      onChange={(event) => setPromotionArtifactId(event.target.value)}
+                    >
+                      {promotionRuns.map((run) => (
+                        <option key={run.artifactId} value={run.artifactId}>
+                          {run.pipelineId} · {run.checkpointManifestHash.slice(0, 12)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  {promotionJobs.length === 0 ? (
+                    <p className="dataset-message warning">
+                      No available STRUM post-training jobs for this candidate.
+                    </p>
+                  ) : (
+                    promotionJobs.map((job) => {
+                      const controls = trainingSchemaControls(job.options_schema)
+                      const values = schemaConfig(controls, promotionConfigs[job.id] ?? {})
+                      const running =
+                        trainingJob &&
+                        !['succeeded', 'failed', 'cancelled'].includes(trainingJob.state ?? '')
+                      return (
+                        <article className="training-promotion-card" key={job.id}>
+                          <div>
+                            <strong>{job.display_name}</strong>
+                            <small>
+                              {job.kind === 'evaluation'
+                                ? 'Evaluation evidence'
+                                : 'Profile package'}{' '}
+                              · {job.deployment_scope.replaceAll('_', ' ')}
+                            </small>
+                          </div>
+                          <TrainingSchemaControls
+                            controls={controls}
+                            values={values}
+                            setValues={(update) =>
+                              setPromotionConfigs((current) => ({
+                                ...current,
+                                [job.id]:
+                                  typeof update === 'function'
+                                    ? update(current[job.id] ?? {})
+                                    : update
+                              }))
+                            }
+                          />
+                          <button
+                            className="dataset-secondary"
+                            disabled={Boolean(running) || job.status !== 'available'}
+                            onClick={() => void startPromotion(job)}
+                          >
+                            {job.kind === 'evaluation' ? 'Evaluate candidate' : 'Package profile'}
+                          </button>
+                        </article>
+                      )
+                    })
+                  )}
+                  {promotionResults
+                    .filter((result) => result.pipeline_id === selectedPromotionRun?.pipelineId)
+                    .map((result) => (
+                      <article className="training-promotion-result" key={result.promotionId}>
+                        <strong>{result.job_id}</strong>
+                        <span>{result.output_kind.replaceAll('_', ' ')}</span>
+                        {Object.entries(result.result).map(([key, value]) =>
+                          typeof value === 'string' || typeof value === 'number' ? (
+                            <small key={key}>
+                              {key.replaceAll('_', ' ')}: {String(value)}
+                            </small>
+                          ) : key === 'metrics' && value && typeof value === 'object' ? (
+                            <small key={key}>metrics recorded</small>
+                          ) : null
+                        )}
+                      </article>
+                    ))}
+                </section>
               )}
             </section>
           ) : (
