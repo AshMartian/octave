@@ -183,6 +183,7 @@ type TrainingJob = {
 
 type TrainingPromotionResult = StrumPromotionJobResult & {
   promotionId: string
+  candidateArtifactId: string
   artifactId?: string
   deploymentStatus?: 'ready' | 'not_deployable'
 }
@@ -554,6 +555,7 @@ export function TrainingModal({
     Record<string, Record<string, TrainingControlValue>>
   >({})
   const [promotionResults, setPromotionResults] = useState<TrainingPromotionResult[]>([])
+  const [promotionJobCandidates, setPromotionJobCandidates] = useState<Record<string, string>>({})
 
   const selectedPipeline = useMemo(
     () => trainingPipelines.find((pipeline) => pipeline.id === selectedPipelineId) ?? null,
@@ -604,10 +606,6 @@ export function TrainingModal({
   const promotionRuns = useMemo(
     () => trainingRuns.filter((run) => Boolean(run.artifactId)),
     [trainingRuns]
-  )
-  const selectedPromotionRun = useMemo(
-    () => promotionRuns.find((run) => run.artifactId === promotionArtifactId) ?? null,
-    [promotionArtifactId, promotionRuns]
   )
 
   const refreshLibrary = useCallback(async (): Promise<void> => {
@@ -774,10 +772,11 @@ export function TrainingModal({
       })
       if (event.state === 'succeeded') {
         const promotion = event.result as TrainingPromotionResult | undefined
-        if (promotion?.format === 'strum-post-train-job-result/v1') {
+        const candidateArtifactId = promotionJobCandidates[event.jobId]
+        if (promotion?.format === 'strum-post-train-job-result/v1' && candidateArtifactId) {
           setPromotionResults((current) => [
             ...current.filter((result) => result.promotionId !== promotion.promotionId),
-            promotion
+            { ...promotion, candidateArtifactId }
           ])
           if (promotion.artifactId && promotion.deploymentStatus === 'ready') {
             setSelectedArtifactId(promotion.artifactId)
@@ -789,7 +788,7 @@ export function TrainingModal({
       if (event.state === 'failed') setError(event.message)
     })
     return unsubscribe
-  }, [refreshTrainingState])
+  }, [promotionJobCandidates, refreshTrainingState])
 
   useEffect(() => {
     if (
@@ -1242,6 +1241,10 @@ export function TrainingModal({
         jobId: job.id,
         options
       })
+      setPromotionJobCandidates((current) => ({
+        ...current,
+        [started.jobId]: promotionArtifactId
+      }))
       setTrainingJob({
         jobId: started.jobId,
         sequence: 0,
@@ -1972,7 +1975,7 @@ export function TrainingModal({
                     })
                   )}
                   {promotionResults
-                    .filter((result) => result.pipeline_id === selectedPromotionRun?.pipelineId)
+                    .filter((result) => result.candidateArtifactId === promotionArtifactId)
                     .map((result) => (
                       <article className="training-promotion-result" key={result.promotionId}>
                         <strong>{result.job_id}</strong>

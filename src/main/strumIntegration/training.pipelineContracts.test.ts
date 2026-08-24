@@ -223,6 +223,31 @@ describe('STRUM checkpoint output-contract descriptors', () => {
     await expect(listTrainingPipelines()).resolves.toEqual([])
   })
 
+  it('fails closed for package descriptors that expose caller policy overrides', async () => {
+    pipelinePayload = [
+      pipelineDescriptor({
+        promotion_jobs: [
+          {
+            id: 'guitar.profile-package/v1',
+            display_name: 'Package',
+            kind: 'package',
+            status: 'available',
+            options_schema: {
+              type: 'object',
+              properties: { minimum_onset_f1: { type: 'number', default: 0 } },
+              required: []
+            },
+            private_request_fields: ['experiment', 'output'],
+            optional_private_request_fields: [],
+            output_kind: 'profile_bundle',
+            deployment_scope: 'deployable_after_profile_validation'
+          }
+        ]
+      })
+    ]
+    await expect(listTrainingPipelines()).resolves.toEqual([])
+  })
+
   it('exposes a normalized, path-free promotion descriptor without making it executable', async () => {
     pipelinePayload = [
       pipelineDescriptor({
