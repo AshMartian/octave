@@ -200,13 +200,23 @@ available, and timeout/failure totals. It never returns source locations,
 package entry names, metadata, hashes, parser errors, or candidate IDs.
 
 The inventory accepts only the package group selected through OCTAVE's trusted
-dialog. It has bounded package count, package/entry byte limits, and a
-cancellable SNG decode timeout. ZIP and RB3CON inspection reads chart metadata
-only; it does not decrypt audio, transcode charts, materialize a catalog, or
-change rights, consent, selection, or catalog eligibility. “Exact Expert
-Vocals” means one literal `PART VOCALS` track with observed Vocal note labels;
-Vocal tracks do not use the five-lane difficulty bands, but catalog coverage
-records a present Vocal part as Expert.
+dialog. Folder discovery is an incremental, cancellable directory walk with
+package and directory limits; it does not open package contents. Each selected
+SNG, ZIP, or RB3CON is then inspected in a dedicated worker with a hard timeout.
+The worker itself opens one descriptor, validates a 256 MiB cap, reads a stable
+bounded snapshot, hashes that snapshot, and parses only those bytes. This means
+a path replacement after folder discovery cannot cause an oversized or different
+container to be parsed. ZIP and RB3CON inspection reads chart metadata only; it
+does not decrypt audio, transcode charts, materialize a catalog, or change
+rights, consent, selection, or catalog eligibility.
+
+Inventory counts are completed-result counts. `inspected`, `readable`, chart,
+identity, and duplicate totals advance only after a worker result; a completed
+safe refusal is reported as unreadable/failed. A cancellation or timeout is
+reported separately and does not inflate the completed package totals. “Exact
+Expert Vocals” means one literal `PART VOCALS` track with observed Vocal note
+labels; Vocal tracks do not use the five-lane difficulty bands, but catalog
+coverage records a present Vocal part as Expert.
 
 STRUM rejects a catalog without both root files, with a staging marker, or with
 any asset/hash validation failure. It never tries to repair an incomplete

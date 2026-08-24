@@ -1,4 +1,4 @@
-import { readdir } from 'fs/promises'
+import { opendir } from 'fs/promises'
 import { join, resolve } from 'path'
 
 const MAX_DISCOVERED_PACKAGE_COUNT = 1_000
@@ -15,6 +15,8 @@ export interface PackageSourceDiscovery {
 export interface PackageSourceDiscoveryOptions {
   signal?: AbortSignal
   onDirectoryScanned?: (directoryCount: number) => void
+  /** Test/UI hook invoked per directory entry, after cancellation checks. */
+  onEntryScanned?: (entryCount: number) => void
 }
 
 function isDatasetPackage(fileName: string): boolean {
@@ -40,6 +42,7 @@ export async function discoverDatasetPackageSources(
   const pending = [resolve(folderPath)]
   const packagePaths: string[] = []
   let directoryCount = 0
+  let entryCount = 0
   let directoryLimitReached = false
   const deadline = Date.now() + DISCOVERY_TIMEOUT_MS
   while (pending.length > 0) {
@@ -51,24 +54,31 @@ export async function discoverDatasetPackageSources(
     }
     const current = pending.pop()
     if (!current) break
-    const entries = await readdir(current, { withFileTypes: true })
+    const directory = await opendir(current)
     directoryCount += 1
     options.onDirectoryScanned?.(directoryCount)
-    for (const entry of entries) {
-      if (options.signal?.aborted) throw cancelled()
-      const entryPath = join(current, entry.name)
-      if (entry.isDirectory()) {
-        pending.push(entryPath)
-      } else if (entry.isFile() && isDatasetPackage(entry.name)) {
-        packagePaths.push(entryPath)
-        if (packagePaths.length >= MAX_DISCOVERED_PACKAGE_COUNT) {
-          return {
-            packagePaths: packagePaths.sort((left, right) => left.localeCompare(right)),
-            packageLimitReached: true,
-            directoryLimitReached
+    try {
+      for await (const entry of directory) {
+        if (options.signal?.aborted) throw cancelled()
+        if (Date.now() > deadline) throw new Error('Package discovery timed out.')
+        entryCount += 1
+        options.onEntryScanned?.(entryCount)
+        const entryPath = join(current, entry.name)
+        if (entry.isDirectory()) {
+          pending.push(entryPath)
+        } else if (entry.isFile() && isDatasetPackage(entry.name)) {
+          packagePaths.push(entryPath)
+          if (packagePaths.length >= MAX_DISCOVERED_PACKAGE_COUNT) {
+            return {
+              packagePaths: packagePaths.sort((left, right) => left.localeCompare(right)),
+              packageLimitReached: true,
+              directoryLimitReached
+            }
           }
         }
       }
+    } finally {
+      await directory.close().catch(() => undefined)
     }
     // Give Electron a chance to service cancellation and input between dirs.
     await new Promise<void>((done) => setImmediate(done))

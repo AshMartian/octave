@@ -2025,6 +2025,8 @@ export function TrainingModal({
                       </header>
                       {group.inventory && (
                         <p className="dataset-package-inventory" aria-live="polite">
+                          {group.inventory.inspectedPackageCount}/
+                          {group.inventory.selectedPackageCount} completed ·{' '}
                           {group.inventory.validNotesMidiCount} valid MIDI ·{' '}
                           {group.inventory.chartOnlyCount} chart-only ·{' '}
                           {group.inventory.invalidOrMissingNotesMidiCount} invalid/missing MIDI ·{' '}

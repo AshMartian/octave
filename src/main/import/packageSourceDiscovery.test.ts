@@ -37,6 +37,25 @@ describe('discoverDatasetPackageSources', () => {
     ).rejects.toThrow('cancelled')
   })
 
+  it('checks cancellation between entries instead of buffering a whole directory', async () => {
+    const incrementalDir = join(testDir, 'incremental')
+    await mkdir(incrementalDir, { recursive: true })
+    await Promise.all(
+      Array.from(
+        { length: 128 },
+        async (_, index) => await writeFile(join(incrementalDir, `${index}.zip`), '')
+      )
+    )
+    const controller = new AbortController()
+
+    await expect(
+      discoverDatasetPackageSources(incrementalDir, {
+        signal: controller.signal,
+        onEntryScanned: () => controller.abort()
+      })
+    ).rejects.toThrow('cancelled')
+  })
+
   it('stops at the package limit instead of walking an unbounded selection', async () => {
     const limitDir = join(testDir, 'limit')
     await mkdir(limitDir, { recursive: true })

@@ -1,6 +1,5 @@
 import { createHash } from 'crypto'
-import { createReadStream } from 'fs'
-import { open, stat } from 'fs/promises'
+import { open } from 'fs/promises'
 import { join } from 'path'
 import { Readable } from 'stream'
 import { Worker } from 'worker_threads'
@@ -13,7 +12,6 @@ import type { DatasetCatalogSource } from './sngTrainingExporter'
 
 const NOTES_MIDI = 'notes.mid'
 const NOTES_CHART = 'notes.chart'
-const MAX_PACKAGE_BYTES = 2 * 1024 * 1024 * 1024
 const MAX_MIDI_BYTES = 64 * 1024 * 1024
 const MAX_ZIP_ENTRIES = 2_000
 const MAX_ZIP_ENTRY_BYTES = 64 * 1024 * 1024
@@ -29,12 +27,12 @@ const MAX_INVENTORY_PACKAGE_BYTES = 256 * 1024 * 1024
 export interface DatasetPackageSourceInventory {
   /** Packages requested by the opaque selection, before the bounded work limit. */
   selectedPackageCount: number
-  /** Packages actually inspected; further selections are reported but not opened. */
+  /** Packages with a completed worker result; cancelled/timed-out work is excluded. */
   inspectedPackageCount: number
   packageLimitReachedCount: number
   /** The caller explicitly stopped inspection; counts cover completed work only. */
   cancelled: boolean
-  /** A package file could be opened and was within the bounded input limit. */
+  /** Completed worker results backed by a bounded package snapshot. */
   readablePackageCount: number
   /** The container parser reached its package/header representation. */
   readableHeaderCount: number
@@ -69,9 +67,17 @@ export interface PackageInspection {
 }
 
 export interface IsolatedPackageInspection {
+  outcome: 'inspected'
   containerHash: string | null
   inspection: PackageInspection
 }
+
+export interface RejectedPackageInspection {
+  /** A worker-completed safe refusal; no source-specific error crosses IPC. */
+  outcome: 'rejected'
+}
+
+type IsolatedPackageResult = IsolatedPackageInspection | RejectedPackageInspection
 
 export interface DatasetPackageInventoryOptions {
   /** Ends queued/current work without exposing source-specific failure detail. */
@@ -80,7 +86,12 @@ export interface DatasetPackageInventoryOptions {
   inspectInIsolation?: (
     source: DatasetCatalogSource,
     signal: AbortSignal
-  ) => Promise<IsolatedPackageInspection>
+  ) => Promise<IsolatedPackageResult>
+}
+
+export interface InventorySnapshotOptions {
+  /** Test seam for validating descriptor identity across a path replacement. */
+  afterOpen?: () => Promise<void>
 }
 
 function emptyInventory(selectedPackageCount: number): DatasetPackageSourceInventory {
@@ -258,22 +269,39 @@ function hasExactExpertPartVocals(midi: Midi): boolean {
   return tracks[0].notes.some((note) => (note.midi >= 36 && note.midi <= 84) || note.midi === 96)
 }
 
-async function readLimitedFile(filePath: string, maxBytes: number): Promise<Buffer> {
+/**
+ * Open once and read that descriptor only. A rename after `open` cannot swap
+ * in an oversized package between validation, hashing, and parsing.
+ */
+export async function readInventoryPackageSnapshot(
+  filePath: string,
+  options: InventorySnapshotOptions = {}
+): Promise<Buffer> {
   const handle = await open(filePath, 'r')
   try {
+    await options.afterOpen?.()
     const info = await handle.stat()
-    if (info.size > maxBytes) throw new Error('Package entry is too large.')
+    if (!info.isFile() || info.size > MAX_INVENTORY_PACKAGE_BYTES)
+      throw new Error('Package is unavailable or too large.')
     const bytes = Buffer.alloc(info.size)
-    await handle.read(bytes, 0, bytes.length, 0)
+    let offset = 0
+    while (offset < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset)
+      if (bytesRead === 0) throw new Error('Package changed while being read.')
+      offset += bytesRead
+    }
+    const afterRead = await handle.stat()
+    if (!afterRead.isFile() || afterRead.size !== info.size)
+      throw new Error('Package changed while being read.')
     return bytes
   } finally {
     await handle.close()
   }
 }
 
-async function inspectSng(sourcePath: string): Promise<PackageInspection> {
+async function inspectSng(packageBytes: Buffer): Promise<PackageInspection> {
   return await new Promise((resolve, reject) => {
-    const input = createReadStream(sourcePath)
+    const input = Readable.from([packageBytes])
     let settled = false
     let headerReadable = false
     let expectedFiles: number | null = null
@@ -364,8 +392,8 @@ async function inspectSng(sourcePath: string): Promise<PackageInspection> {
   })
 }
 
-function inspectZip(sourcePath: string): PackageInspection {
-  const archive = new AdmZip(sourcePath)
+function inspectZip(packageBytes: Buffer): PackageInspection {
+  const archive = new AdmZip(packageBytes)
   const entries = archive.getEntries()
   if (entries.length > MAX_ZIP_ENTRIES) throw new Error('ZIP archive has too many entries.')
   const charts = new Map<string, InventoryChart>()
@@ -411,8 +439,8 @@ function findConMidi(
   )
 }
 
-async function inspectCon(sourcePath: string): Promise<PackageInspection> {
-  const parser = new StfsParser(await readLimitedFile(sourcePath, MAX_PACKAGE_BYTES))
+function inspectCon(packageBytes: Buffer): PackageInspection {
+  const parser = new StfsParser(packageBytes)
   const { entries } = parser.parse()
   const dta = Object.entries(entries).find(([entryPath]) =>
     normalizedEntryName(entryPath).endsWith('songs/songs.dta')
@@ -431,50 +459,39 @@ async function inspectCon(sourcePath: string): Promise<PackageInspection> {
 }
 
 /** Runs only in the isolated inventory worker, never on Electron's main thread. */
-export async function inspectPackageInWorker(
-  source: DatasetCatalogSource
+async function inspectPackageBytesInWorker(
+  source: DatasetCatalogSource,
+  packageBytes: Buffer
 ): Promise<PackageInspection> {
-  if (source.kind === 'sng') return await inspectSng(source.sourcePath)
-  if (source.kind === 'zip') return inspectZip(source.sourcePath)
-  if (source.kind === 'rb3con') return await inspectCon(source.sourcePath)
+  if (source.kind === 'sng') return inspectSng(packageBytes)
+  if (source.kind === 'zip') return inspectZip(packageBytes)
+  if (source.kind === 'rb3con') return inspectCon(packageBytes)
   throw new Error('Only externally selected package sources may be inventoried.')
 }
 
-/** Runs only in the isolated inventory worker, never on Electron's main thread. */
-export async function hashContainerInWorker(sourcePath: string): Promise<string | null> {
-  const info = await stat(sourcePath)
-  if (info.size > MAX_PACKAGE_BYTES) return null
-  const digest = createHash('sha256')
-  await new Promise<void>((resolve, reject) => {
-    const stream = createReadStream(sourcePath)
-    const timeout = setTimeout(() => {
-      stream.destroy(new Error('Package identity read timed out.'))
-    }, PACKAGE_TIMEOUT_MS)
-    stream.on('data', (chunk: string | Buffer) => digest.update(chunk))
-    stream.on('error', (error) => {
-      clearTimeout(timeout)
-      reject(error)
-    })
-    stream.on('end', () => {
-      clearTimeout(timeout)
-      resolve()
-    })
-  })
-  return digest.digest('hex')
+/**
+ * This worker-only operation owns the security boundary: no main-process
+ * preflight is trusted, and all work uses a single cap-validated file handle.
+ */
+export async function inspectIsolatedPackageInWorker(
+  source: DatasetCatalogSource
+): Promise<IsolatedPackageInspection> {
+  const packageBytes = await readInventoryPackageSnapshot(source.sourcePath)
+  return {
+    outcome: 'inspected',
+    containerHash: createHash('sha256').update(packageBytes).digest('hex'),
+    inspection: await inspectPackageBytesInWorker(source, packageBytes)
+  }
 }
 
 function inventoryAbortError(): Error {
   return new Error('Package inventory cancelled.')
 }
 
-function isAbort(error: unknown): boolean {
-  return error instanceof Error && /cancelled/i.test(error.message)
-}
-
 function inspectInWorker(
   source: DatasetCatalogSource,
   signal: AbortSignal
-): Promise<IsolatedPackageInspection> {
+): Promise<IsolatedPackageResult> {
   return new Promise((resolve, reject) => {
     let settled = false
     // `packageSourceInventory.ts` is code-split into out/main/chunks while the
@@ -512,10 +529,7 @@ function inspectInWorker(
         finish(() => reject(new Error('Package inspection failed.')))
         return
       }
-      const value = result as unknown as {
-        containerHash: string | null
-        inspection: PackageInspection
-      }
+      const value = result as unknown as IsolatedPackageResult
       finish(() => resolve(value))
     })
     worker.once('error', () => finish(() => reject(new Error('Package inspection failed.'))))
@@ -552,16 +566,24 @@ export async function inventoryDatasetPackageSources(
       inventory.cancelled = true
       break
     }
-    inventory.inspectedPackageCount += 1
     try {
-      const info = await stat(source.sourcePath)
-      if (!info.isFile() || info.size > MAX_INVENTORY_PACKAGE_BYTES)
-        throw new Error('Package is unavailable or too large.')
-      inventory.readablePackageCount += 1
       const isolated = await (options.inspectInIsolation ?? inspectInWorker)(
         source,
         controller.signal
       )
+      if (isolated.outcome === 'rejected') {
+        // The worker completed a deliberate, path-free safe refusal. It is a
+        // complete result, unlike a timeout/cancellation, so the aggregate
+        // counters remain mutually consistent.
+        inventory.inspectedPackageCount += 1
+        inventory.unreadablePackageCount += 1
+        inventory.decodeFailureCount += 1
+        continue
+      }
+      // Do not expose an in-flight attempt as inspected/readable. A completed
+      // worker result is the only point at which these counts become true.
+      inventory.inspectedPackageCount += 1
+      inventory.readablePackageCount += 1
       const containerHash = isolated.containerHash
       // A failed/unavailable identity contributes exactly once. It is not a
       // decode failure and must not be double-counted after the worker returns.
@@ -586,9 +608,11 @@ export async function inventoryDatasetPackageSources(
         else midiHashes.add(midiHash)
       }
     } catch (error) {
-      inventory.unreadablePackageCount += 1
-      if (isTimeout(error)) inventory.decodeTimeoutCount += 1
-      else if (!isAbort(error)) inventory.decodeFailureCount += 1
+      // Terminated work never produced a completed package result, so it must
+      // not make `readable + unreadable > inspected` in the renderer contract.
+      if (isTimeout(error)) {
+        inventory.decodeTimeoutCount += 1
+      }
     }
   }
   if (controller.signal.aborted) inventory.cancelled = true

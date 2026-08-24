@@ -1,21 +1,24 @@
-import { mkdir, rm, truncate, writeFile } from 'fs/promises'
+import { mkdir, rename, rm, truncate, writeFile } from 'fs/promises'
 import { join } from 'path'
 import AdmZip from 'adm-zip'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import {
-  hashContainerInWorker,
-  inspectPackageInWorker,
+  inspectIsolatedPackageInWorker,
   inventoryDatasetPackageSources,
+  readInventoryPackageSnapshot,
   type DatasetPackageInventoryOptions
 } from './packageSourceInventory'
 
 describe('inventoryDatasetPackageSources', () => {
   const testDir = join(__dirname, '../../../out/package_source_inventory_test_temp')
   const localInspection: DatasetPackageInventoryOptions = {
-    inspectInIsolation: async (source) => ({
-      containerHash: await hashContainerInWorker(source.sourcePath),
-      inspection: await inspectPackageInWorker(source)
-    })
+    inspectInIsolation: async (source) => {
+      try {
+        return await inspectIsolatedPackageInWorker(source)
+      } catch {
+        return { outcome: 'rejected' }
+      }
+    }
   }
 
   function midiWithTrack(trackName: string, note = 60): Buffer {
@@ -127,14 +130,29 @@ describe('inventoryDatasetPackageSources', () => {
         }
       })
       expect(inventory).toMatchObject({
-        inspectedPackageCount: 1,
-        unreadablePackageCount: 1,
+        inspectedPackageCount: 0,
+        unreadablePackageCount: 0,
         decodeTimeoutCount: 1,
         decodeFailureCount: 0,
         cancelled: false
       })
     }
   )
+
+  it('keeps the opened bounded snapshot when its path is replaced', async () => {
+    const packagePath = join(testDir, 'snapshot-before-replace.zip')
+    const replacementPath = join(testDir, 'snapshot-oversized-replacement.zip')
+    const initialBytes = Buffer.from('bounded snapshot')
+    await writeFile(packagePath, initialBytes)
+    await writeFile(replacementPath, '')
+    await truncate(replacementPath, 256 * 1024 * 1024 + 1)
+
+    await expect(
+      readInventoryPackageSnapshot(packagePath, {
+        afterOpen: async () => await rename(replacementPath, packagePath)
+      })
+    ).resolves.toEqual(initialBytes)
+  })
 
   it.each(['sng', 'zip', 'rb3con'] as const)(
     'cancels isolated %s inspection without counting it as a decode failure',
@@ -155,8 +173,8 @@ describe('inventoryDatasetPackageSources', () => {
           })
       })
       await expect(inventoryPromise).resolves.toMatchObject({
-        inspectedPackageCount: 1,
-        unreadablePackageCount: 1,
+        inspectedPackageCount: 0,
+        unreadablePackageCount: 0,
         decodeTimeoutCount: 0,
         decodeFailureCount: 0,
         cancelled: true
@@ -164,7 +182,7 @@ describe('inventoryDatasetPackageSources', () => {
     }
   )
 
-  it('applies the safe input limit to SNG, ZIP, and RB3CON before inspection', async () => {
+  it('counts only completed worker rejections for SNG, ZIP, and RB3CON', async () => {
     const sources = await Promise.all(
       (['sng', 'zip', 'rb3con'] as const).map(async (kind) => {
         const packagePath = join(testDir, `oversize-${kind}.${kind === 'rb3con' ? 'rb3con' : kind}`)
@@ -177,10 +195,10 @@ describe('inventoryDatasetPackageSources', () => {
     const inventory = await inventoryDatasetPackageSources(sources, {
       inspectInIsolation: async () => {
         isolationCalls += 1
-        throw new Error('must not inspect oversized package')
+        return { outcome: 'rejected' }
       }
     })
-    expect(isolationCalls).toBe(0)
+    expect(isolationCalls).toBe(3)
     expect(inventory).toMatchObject({
       inspectedPackageCount: 3,
       readablePackageCount: 0,
@@ -189,6 +207,22 @@ describe('inventoryDatasetPackageSources', () => {
     })
   })
 
+  it.each(['sng', 'zip', 'rb3con'] as const)(
+    'enforces the inventory cap in the worker-owned %s snapshot path',
+    async (kind) => {
+      const packagePath = join(
+        testDir,
+        `worker-cap-race-${kind}.${kind === 'rb3con' ? 'rb3con' : kind}`
+      )
+      await writeFile(packagePath, '')
+      await truncate(packagePath, 256 * 1024 * 1024 + 1)
+
+      await expect(
+        inspectIsolatedPackageInWorker({ kind, sourcePath: packagePath })
+      ).rejects.toThrow('too large')
+    }
+  )
+
   it('counts an unavailable container identity exactly once', async () => {
     const packagePath = join(testDir, 'identity-unavailable.zip')
     await writeFile(packagePath, 'fixture')
@@ -196,6 +230,7 @@ describe('inventoryDatasetPackageSources', () => {
       [{ kind: 'zip', sourcePath: packagePath }],
       {
         inspectInIsolation: async () => ({
+          outcome: 'inspected',
           containerHash: null,
           inspection: { headerReadable: true, charts: [] }
         })
