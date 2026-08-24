@@ -26,6 +26,8 @@ import catalogSchema from '../../../docs/reference/song-source-catalog.schema.js
 import { StfsParser } from './conImporter'
 import { parseDta } from './dtaParser'
 import { decryptMoggBuffer } from './moggDecrypt'
+import { readInventoryPackageSnapshot } from './packageSourceInventory'
+import { normalizedPackageEntryLocator, packageEntryIdentity } from './packageSourceIdentity'
 
 const EXPORT_FORMAT = 'octave-training-midi-export/v1'
 const NOTES_MIDI = 'notes.mid'
@@ -93,6 +95,15 @@ export interface DatasetCatalogSource {
    * package. This is kept in the main process and is never written to a catalog.
    */
   entryId?: string
+  /**
+   * Main-process-only review proof for an external package entry.  This is
+   * intentionally absent from catalogs, IPC DTOs, task views, and logs.
+   */
+  packageReview?: {
+    containerSha256: string
+    midiSha256: string
+    entryLocator: string
+  }
 }
 
 export interface DatasetSourceSummary {
@@ -116,6 +127,8 @@ interface CatalogCandidate {
   audio: Partial<Record<CatalogAudioRole, CatalogAudioInput>>
   isStrumGenerated: boolean
   containerSha256?: string
+  /** Adapter-private stable key used only for matching an opaque entry ID. */
+  entryLocator: string
   /** Main-process UI admission state; never serialized to a catalog record. */
   requiresOptIn: boolean
 }
@@ -387,10 +400,11 @@ async function readCatalogAudioFromFolder(
 }
 
 async function extractSngNotesMidi(
-  sngPath: string,
+  sngSource: string | Buffer,
   includeAudio = true
 ): Promise<{
   midi: Buffer
+  entryLocator: string
   metadata: Record<string, string>
   audio: Partial<Record<CatalogAudioRole, CatalogAudioInput>>
   isStrumGenerated: boolean
@@ -408,7 +422,8 @@ async function extractSngNotesMidi(
     }
     const fail = (error: unknown): void =>
       settle(() => reject(error instanceof Error ? error : new Error(String(error))))
-    const input = createReadStream(sngPath)
+    const input =
+      typeof sngSource === 'string' ? createReadStream(sngSource) : Readable.from([sngSource])
     const sngStream = new SngStream(Readable.toWeb(input) as ReadableStream<Uint8Array>, {
       generateSongIni: false
     })
@@ -449,7 +464,13 @@ async function extractSngNotesMidi(
           settle(() =>
             resolve(
               notesMidi && metadata
-                ? { midi: notesMidi, metadata, audio, isStrumGenerated: generatedByStrum }
+                ? {
+                    midi: notesMidi,
+                    entryLocator: NOTES_MIDI,
+                    metadata,
+                    audio,
+                    isStrumGenerated: generatedByStrum
+                  }
                 : null
             )
           )
@@ -495,17 +516,20 @@ function findConMogg(
 }
 
 async function extractConNotesMidi(
-  conPath: string,
+  conSource: string | Buffer,
   includeAudio = true
 ): Promise<
   Array<{
     midi: Buffer
+    entryLocator: string
     metadata: Record<string, string>
     audio: Partial<Record<CatalogAudioRole, CatalogAudioInput>>
     isStrumGenerated: boolean
   }>
 > {
-  const parser = new StfsParser(await readFile(conPath))
+  const parser = new StfsParser(
+    typeof conSource === 'string' ? await readFile(conSource) : conSource
+  )
   const { entries } = parser.parse()
   const dta = Object.entries(entries).find(([entryPath]) =>
     entryPath.toLowerCase().endsWith('songs/songs.dta')
@@ -530,6 +554,7 @@ async function extractConNotesMidi(
     return [
       {
         midi,
+        entryLocator: normalizedPackageEntryLocator(song.shortname),
         metadata: sanitizeMetadata({
           name: song.name,
           artist: song.artist,
@@ -634,15 +659,16 @@ function safeZipEntryName(entryName: string): string | null {
 }
 
 function extractZipNotesMidi(
-  sourcePath: string,
+  source: string | Buffer,
   includeAudio = true
 ): Array<{
   midi: Buffer
+  entryLocator: string
   metadata: Record<string, string>
   audio: Partial<Record<CatalogAudioRole, CatalogAudioInput>>
   isStrumGenerated: boolean
 }> {
-  const archive = new AdmZip(sourcePath)
+  const archive = new AdmZip(source)
   const entries = archive.getEntries()
   if (entries.length > MAX_ZIP_ENTRIES) throw new Error('ZIP archive has too many entries.')
   const files = new Map<string, AdmZip.IZipEntry>()
@@ -657,6 +683,7 @@ function extractZipNotesMidi(
 
   const candidates: Array<{
     midi: Buffer
+    entryLocator: string
     metadata: Record<string, string>
     audio: Partial<Record<CatalogAudioRole, CatalogAudioInput>>
     isStrumGenerated: boolean
@@ -680,7 +707,13 @@ function extractZipNotesMidi(
         if (input && !audio[input[0]]) audio[input[0]] = input[1]
       }
     }
-    candidates.push({ midi, metadata, audio, isStrumGenerated: isStrumGenerated(rawMetadata) })
+    candidates.push({
+      midi,
+      entryLocator: normalizedPackageEntryLocator(directory),
+      metadata,
+      audio,
+      isStrumGenerated: isStrumGenerated(rawMetadata)
+    })
   }
   return candidates
 }
@@ -689,28 +722,58 @@ async function inspectDatasetSource(
   source: DatasetCatalogSource,
   includeAudio = true
 ): Promise<CatalogCandidate[]> {
+  const reviewedBytes = source.packageReview
+    ? await readInventoryPackageSnapshot(source.sourcePath)
+    : undefined
+  if (
+    source.packageReview &&
+    sha256Buffer(reviewedBytes as Buffer) !== source.packageReview.containerSha256
+  ) {
+    throw new Error('Reviewed package changed or is unavailable.')
+  }
   if (source.kind === 'sng') {
-    const extracted = await extractSngNotesMidi(source.sourcePath, includeAudio)
+    const extracted = await extractSngNotesMidi(reviewedBytes ?? source.sourcePath, includeAudio)
     if (!extracted) return []
     const candidates = [
       {
         kind: source.kind,
         midi: extracted.midi,
+        entryLocator: extracted.entryLocator,
         metadata: redactMetadata(extracted.metadata),
         audio: extracted.audio,
         isStrumGenerated: extracted.isStrumGenerated,
-        containerSha256: await sha256File(source.sourcePath),
+        containerSha256:
+          source.packageReview?.containerSha256 ?? (await sha256File(source.sourcePath)),
         requiresOptIn: false
       }
     ]
-    return selectCatalogEntries(candidates, source.entryId)
+    return selectedReviewedCatalogEntries(candidates, source)
   }
   if (source.kind === 'rb3con') {
-    const containerSha256 = await sha256File(source.sourcePath)
-    const candidates = (await extractConNotesMidi(source.sourcePath, includeAudio)).map(
+    const containerSha256 =
+      source.packageReview?.containerSha256 ?? (await sha256File(source.sourcePath))
+    const candidates = (
+      await extractConNotesMidi(reviewedBytes ?? source.sourcePath, includeAudio)
+    ).map((candidate) => ({
+      kind: source.kind,
+      midi: candidate.midi,
+      entryLocator: candidate.entryLocator,
+      metadata: redactMetadata(candidate.metadata),
+      audio: candidate.audio,
+      isStrumGenerated: candidate.isStrumGenerated,
+      containerSha256,
+      requiresOptIn: false
+    }))
+    return selectedReviewedCatalogEntries(candidates, source)
+  }
+  if (source.kind === 'zip') {
+    const containerSha256 =
+      source.packageReview?.containerSha256 ?? (await sha256File(source.sourcePath))
+    const candidates = extractZipNotesMidi(reviewedBytes ?? source.sourcePath, includeAudio).map(
       (candidate) => ({
         kind: source.kind,
         midi: candidate.midi,
+        entryLocator: candidate.entryLocator,
         metadata: redactMetadata(candidate.metadata),
         audio: candidate.audio,
         isStrumGenerated: candidate.isStrumGenerated,
@@ -718,42 +781,35 @@ async function inspectDatasetSource(
         requiresOptIn: false
       })
     )
-    return selectCatalogEntries(candidates, source.entryId)
-  }
-  if (source.kind === 'zip') {
-    const containerSha256 = await sha256File(source.sourcePath)
-    const candidates = extractZipNotesMidi(source.sourcePath, includeAudio).map((candidate) => ({
-      kind: source.kind,
-      midi: candidate.midi,
-      metadata: redactMetadata(candidate.metadata),
-      audio: candidate.audio,
-      isStrumGenerated: candidate.isStrumGenerated,
-      containerSha256,
-      requiresOptIn: false
-    }))
-    return selectCatalogEntries(candidates, source.entryId)
+    return selectedReviewedCatalogEntries(candidates, source)
   }
   const metadata = parseIniFile(await readFile(path.join(source.sourcePath, 'song.ini'), 'utf8'))
   const candidates = [
     {
       kind: source.kind,
       midi: await readFile(path.join(source.sourcePath, NOTES_MIDI)),
+      entryLocator: NOTES_MIDI,
       metadata: redactMetadata(sanitizeMetadata(metadata)),
       audio: includeAudio ? await readCatalogAudioFromFolder(source.sourcePath) : {},
       isStrumGenerated: isStrumGenerated(metadata),
       requiresOptIn: !isDatasetOptedIn(metadata.dataset_opt_in)
     }
   ]
-  return selectCatalogEntries(candidates, source.entryId)
+  return selectedReviewedCatalogEntries(candidates, source)
 }
 
-function catalogEntryId(candidate: CatalogCandidate, entryIndex: number): string {
-  // Content alone is not sufficient here: a multi-song package can legally
-  // contain two songs with byte-identical MIDI. Bind the opaque selection to
-  // its stable package order as well, without exposing its entry name/path.
+function catalogEntryId(candidate: CatalogCandidate): string {
+  if (candidate.kind === 'sng' || candidate.kind === 'rb3con' || candidate.kind === 'zip') {
+    return packageEntryIdentity(
+      candidate.kind,
+      candidate.containerSha256 ?? '',
+      normalizedPackageEntryLocator(candidate.entryLocator),
+      sha256Buffer(candidate.midi)
+    )
+  }
   return sha256Buffer(
     Buffer.from(
-      `${candidate.kind}\u0000${candidate.containerSha256 ?? ''}\u0000${entryIndex}\u0000${sha256Buffer(candidate.midi)}`,
+      `${candidate.kind}\u0000${normalizedPackageEntryLocator(candidate.entryLocator)}\u0000${sha256Buffer(candidate.midi)}`,
       'utf8'
     )
   )
@@ -765,9 +821,27 @@ function selectCatalogEntries(
 ): CatalogCandidate[] {
   if (!entryId) return candidates
   if (!/^[a-f0-9]{64}$/.test(entryId)) return []
-  return candidates.filter(
-    (candidate, entryIndex) => catalogEntryId(candidate, entryIndex) === entryId
+  return candidates.filter((candidate) => catalogEntryId(candidate) === entryId)
+}
+
+function selectedReviewedCatalogEntries(
+  candidates: CatalogCandidate[],
+  source: DatasetCatalogSource
+): CatalogCandidate[] {
+  const selected = selectCatalogEntries(candidates, source.entryId)
+  if (!source.packageReview) return selected
+  const review = source.packageReview
+  const exact = selected.filter(
+    (candidate) =>
+      candidate.containerSha256 === review.containerSha256 &&
+      normalizedPackageEntryLocator(candidate.entryLocator) ===
+        normalizedPackageEntryLocator(review.entryLocator) &&
+      sha256Buffer(candidate.midi) === review.midiSha256 &&
+      catalogEntryId(candidate) === source.entryId
   )
+  if (exact.length !== 1)
+    throw new Error('Reviewed package changed or selected chart is unavailable.')
+  return exact
 }
 
 function summarizeCatalogCandidate(candidate: CatalogCandidate): DatasetSourceSummary {
@@ -793,9 +867,9 @@ export async function summarizeDatasetSourceEntries(
   source: DatasetCatalogSource
 ): Promise<DatasetSourceEntrySummary[]> {
   try {
-    return (await inspectDatasetSource(source, false)).map((candidate, entryIndex) => ({
+    return (await inspectDatasetSource(source, false)).map((candidate) => ({
       ...summarizeCatalogCandidate(candidate),
-      entryId: catalogEntryId(candidate, entryIndex)
+      entryId: catalogEntryId(candidate)
     }))
   } catch {
     return []
@@ -2207,6 +2281,11 @@ export async function buildSongSourceCatalog(options: {
       try {
         candidates = await inspectDatasetSource(source)
       } catch {
+        if (source.packageReview) {
+          // An explicit review selection must never quietly turn into a
+          // partial catalog when the source was replaced after approval.
+          throw new Error('A reviewed package changed or selected chart is unavailable.')
+        }
         skipped.push({ sourceIndex, reason: 'Source could not be normalized' })
         continue
       }

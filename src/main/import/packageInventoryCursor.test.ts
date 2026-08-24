@@ -24,7 +24,8 @@ function inspected(midiHash: string): IsolatedPackageInspection {
           validNotesMidi: true,
           hasChart: false,
           exactExpertPartVocals: false,
-          midiHash
+          midiHash,
+          entryLocator: 'fixture'
         }
       ]
     }

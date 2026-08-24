@@ -10,6 +10,7 @@ import { SngStream, type SngHeader } from 'parse-sng'
 import { StfsParser } from './conImporter'
 import { parseDta } from './dtaParser'
 import type { DatasetCatalogSource } from './sngTrainingExporter'
+import { normalizedPackageEntryLocator, packageEntryIdentity } from './packageSourceIdentity'
 
 const NOTES_MIDI = 'notes.mid'
 const NOTES_CHART = 'notes.chart'
@@ -70,6 +71,8 @@ export interface InventoryChart {
   exactExpertPartVocals: boolean
   /** SHA-256 is aggregate-only bookkeeping and never crosses main/renderer IPC. */
   midiHash: string | null
+  /** Main-process-only adapter key used to bind a later exact extraction. */
+  entryLocator: string | null
 }
 
 export interface PackageInspection {
@@ -127,12 +130,24 @@ export interface DatasetPackageInventorySession {
   readonly __opaqueDatasetPackageInventorySession?: never
 }
 
+/** Private evidence retained by OCTAVE after a completed inventory. */
+export interface DatasetPackageReviewEntry {
+  source: DatasetCatalogSource
+  containerSha256: string
+  midiSha256: string
+  entryLocator: string
+  entryId: string
+  exactExpertPartVocals: boolean
+  duplicateMidi: boolean
+}
+
 interface DatasetPackageInventorySessionState {
   sources: readonly DatasetCatalogSource[]
   inventory: DatasetPackageSourceInventory
   midiHashes: Set<string>
   containerHashes: Set<string>
   nextSourceIndex: number
+  reviewEntries: DatasetPackageReviewEntry[]
 }
 
 const inventorySessionStates = new WeakMap<
@@ -149,6 +164,7 @@ interface RawInventoryChart {
   midi: Buffer | null
   midiCount: number
   hasChart: boolean
+  entryLocator: string
 }
 
 interface RawPackageInspection {
@@ -198,7 +214,8 @@ export function createDatasetPackageInventorySession(
     inventory,
     midiHashes: new Set<string>(),
     containerHashes: new Set<string>(),
-    nextSourceIndex: 0
+    nextSourceIndex: 0,
+    reviewEntries: []
   })
   return session
 }
@@ -223,6 +240,18 @@ export function isDatasetPackageInventorySessionComplete(
 ): boolean {
   const state = sessionState(session)
   return state.nextSourceIndex >= state.sources.length
+}
+
+/**
+ * Return only main-process evidence after a fully completed pass.  Callers
+ * must replace every field with opaque renderer capabilities before IPC.
+ */
+export function getDatasetPackageInventorySessionReviewEntries(
+  session: DatasetPackageInventorySession
+): DatasetPackageReviewEntry[] {
+  const state = sessionState(session)
+  if (state.nextSourceIndex < state.sources.length) return []
+  return state.reviewEntries.map((entry) => ({ ...entry, source: { ...entry.source } }))
 }
 
 function normalizedEntryName(value: string): string {
@@ -497,7 +526,8 @@ async function inspectSng(packageBytes: Buffer): Promise<RawPackageInspection> {
                   {
                     midi: notesMidiCount === 1 ? notesMidi : null,
                     midiCount: notesMidiCount,
-                    hasChart
+                    hasChart,
+                    entryLocator: NOTES_MIDI
                   }
                 ]
               }),
@@ -539,7 +569,12 @@ function inspectZip(
     const base = name.slice(name.lastIndexOf('/') + 1)
     if (base !== NOTES_MIDI && base !== NOTES_CHART) continue
     const directory = entryDirectory(name)
-    const chart = charts.get(directory) ?? { midi: null, midiCount: 0, hasChart: false }
+    const chart = charts.get(directory) ?? {
+      midi: null,
+      midiCount: 0,
+      hasChart: false,
+      entryLocator: directory
+    }
     if (!charts.has(directory) && charts.size >= limits.maxChartCount) {
       throw new Error('ZIP archive has too many chart candidates.')
     }
@@ -586,13 +621,22 @@ function inspectCon(packageBytes: Buffer): RawPackageInspection {
   if (!dta) return { headerReadable: true, charts: [] }
   const songs = Object.values(parseDta(dta.toString('latin1')))
   const allowGlobalFallback = songs.length === 1
+  const locators = new Set<string>()
   return {
     headerReadable: true,
-    charts: songs.map((song) => ({
-      midi: findConMidi(entries, song.shortname, allowGlobalFallback),
-      midiCount: 1,
-      hasChart: false
-    }))
+    charts: songs.map((song) => {
+      const entryLocator = normalizedPackageEntryLocator(song.shortname)
+      if (!entryLocator || locators.has(entryLocator)) {
+        throw new Error('RB3CON contains ambiguous song entries.')
+      }
+      locators.add(entryLocator)
+      return {
+        midi: findConMidi(entries, song.shortname, allowGlobalFallback),
+        midiCount: 1,
+        hasChart: false,
+        entryLocator
+      }
+    })
   }
 }
 
@@ -614,14 +658,16 @@ function summarizeRawChart(chart: RawInventoryChart): InventoryChart {
       validNotesMidi: false,
       hasChart: chart.hasChart,
       exactExpertPartVocals: false,
-      midiHash: null
+      midiHash: null,
+      entryLocator: null
     }
   }
   return {
     validNotesMidi: true,
     hasChart: chart.hasChart,
     exactExpertPartVocals: hasExactExpertPartVocals(midi),
-    midiHash: createHash('sha256').update(chart.midi).digest('hex')
+    midiHash: createHash('sha256').update(chart.midi).digest('hex'),
+    entryLocator: normalizedPackageEntryLocator(chart.entryLocator)
   }
 }
 
@@ -793,9 +839,28 @@ export async function runDatasetPackageInventorySession(
         }
         inventory.validNotesMidiCount += 1
         if (chart.exactExpertPartVocals) inventory.exactExpertPartVocalsCount += 1
-        if (chart.midiHash && state.midiHashes.has(chart.midiHash))
-          inventory.duplicateMidiCount += 1
+        const duplicateMidi = Boolean(chart.midiHash && state.midiHashes.has(chart.midiHash))
+        if (duplicateMidi) inventory.duplicateMidiCount += 1
         else if (chart.midiHash) state.midiHashes.add(chart.midiHash)
+        // A valid chart from a completed snapshot has all three values. Keep
+        // them private for the later user-review capability; never include
+        // this evidence in aggregate IPC or progress events.
+        if (containerHash && chart.midiHash && chart.entryLocator !== null) {
+          state.reviewEntries.push({
+            source: { ...source },
+            containerSha256: containerHash,
+            midiSha256: chart.midiHash,
+            entryLocator: chart.entryLocator,
+            entryId: packageEntryIdentity(
+              source.kind as 'sng' | 'rb3con' | 'zip',
+              containerHash,
+              chart.entryLocator,
+              chart.midiHash
+            ),
+            exactExpertPartVocals: chart.exactExpertPartVocals,
+            duplicateMidi
+          })
+        }
       }
     } catch (error) {
       // Terminated work never produced a completed package result, so it must

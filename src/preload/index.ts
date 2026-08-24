@@ -95,6 +95,23 @@ const api = {
     /** Opaque main-owned resume capability, not a source identifier. */
     resumeCursor: string | null
     cursorRejected: boolean
+    reviewCandidates: Array<{
+      candidateId: string
+      groupId: string
+      kind: 'sng' | 'rb3con' | 'zip'
+      songCount: number
+      metadata: Record<string, string>
+      midiValid: true
+      instruments: Record<
+        string,
+        { status: 'present'; difficulties: string[]; trackNames: string[] }
+      >
+      trainingUse: 'review_required'
+      warnings: Array<{ code: string }>
+      isStrumGenerated: false
+      canonicalVocalMidi: boolean
+      duplicateMidi: boolean
+    }> | null
   } | null> => ipcRenderer.invoke('dataset:inspectPackageGroup', groupId, resumeCursor),
 
   cancelDatasetPackageInventory: (groupId: string): Promise<boolean> =>

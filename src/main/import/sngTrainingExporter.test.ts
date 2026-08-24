@@ -1,3 +1,4 @@
+import { createHash } from 'crypto'
 import { existsSync } from 'fs'
 import {
   chmod,
@@ -7,6 +8,7 @@ import {
   rename,
   rm,
   symlink,
+  unlink,
   utimes,
   writeFile
 } from 'fs/promises'
@@ -27,6 +29,11 @@ import {
   summarizeDatasetSource,
   summarizeDatasetSourceEntries
 } from './sngTrainingExporter'
+import {
+  createDatasetPackageInventorySession,
+  getDatasetPackageInventorySessionReviewEntries,
+  runDatasetPackageInventorySession
+} from './packageSourceInventory'
 
 describe('exportSngTrainingMidi', () => {
   const testDir = join(__dirname, '../../../out/sng_training_exporter_test_temp')
@@ -539,6 +546,120 @@ describe('exportSngTrainingMidi', () => {
       metadata: { name: 'STRUM Song' },
       rights: { training_use: 'allowed' }
     })
+  })
+
+  it('materializes only a review-selected ZIP chart from its exact snapshot', async () => {
+    const archivePath = join(testDir, 'reviewed-shifted-order.zip')
+    const archive = new AdmZip()
+    // The inventory sees `z` when this chart-only entry appears first, while
+    // the legacy exporter used to enumerate MIDI entries in a different order.
+    archive.addFile('z/notes.chart', Buffer.from('[Song]\n{\n  Resolution = 192\n}\n'))
+    archive.addFile('a/notes.mid', guitarMidi('PART GUITAR'))
+    archive.addFile('a/song.ini', Buffer.from('[song]\nname = First MIDI\n'))
+    archive.addFile('z/notes.mid', guitarMidi('PART VOCALS'))
+    archive.addFile('z/song.ini', Buffer.from('[song]\nname = Reviewed Vocal\n'))
+    archive.writeZip(archivePath)
+
+    const session = createDatasetPackageInventorySession([{ kind: 'zip', sourcePath: archivePath }])
+    await runDatasetPackageInventorySession(session, {
+      inspectInIsolation: async () => {
+        const bytes = await readFile(archivePath)
+        const zip = new AdmZip(bytes)
+        // Use the real worker path in production; this focused seam verifies
+        // only the review-to-catalog identity binding below.
+        const entries = zip.getEntries()
+        const zMidi = entries.find((entry) => entry.entryName === 'z/notes.mid')?.getData()
+        const aMidi = entries.find((entry) => entry.entryName === 'a/notes.mid')?.getData()
+        if (!zMidi || !aMidi) throw new Error('fixture missing MIDI')
+        return {
+          outcome: 'inspected' as const,
+          containerHash: createHash('sha256').update(bytes).digest('hex'),
+          inspection: {
+            headerReadable: true,
+            charts: [
+              {
+                validNotesMidi: true,
+                hasChart: true,
+                exactExpertPartVocals: true,
+                midiHash: createHash('sha256').update(zMidi).digest('hex'),
+                entryLocator: 'z/'
+              },
+              {
+                validNotesMidi: true,
+                hasChart: false,
+                exactExpertPartVocals: false,
+                midiHash: createHash('sha256').update(aMidi).digest('hex'),
+                entryLocator: 'a/'
+              }
+            ]
+          }
+        }
+      }
+    })
+    const reviewed = getDatasetPackageInventorySessionReviewEntries(session).find(
+      (entry) => entry.entryLocator === 'z/'
+    )
+    if (!reviewed) throw new Error('Expected reviewed Vocal entry')
+    const parentDir = join(testDir, 'reviewed-shifted-parent')
+    await mkdir(parentDir, { recursive: true })
+    await buildSongSourceCatalog({
+      sources: [
+        {
+          ...reviewed.source,
+          entryId: reviewed.entryId,
+          packageReview: {
+            containerSha256: reviewed.containerSha256,
+            midiSha256: reviewed.midiSha256,
+            entryLocator: reviewed.entryLocator
+          }
+        }
+      ],
+      parentDir,
+      catalogName: 'reviewed-shifted',
+      catalogId: 'reviewed-shifted',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    const record = JSON.parse(
+      await readFile(join(parentDir, 'reviewed-shifted', 'records.jsonl'), 'utf8')
+    ) as { metadata: { name: string }; import: { container_sha256: string } }
+    expect(record.metadata.name).toBe('Reviewed Vocal')
+    expect(record.import.container_sha256).toBe(reviewed.containerSha256)
+
+    const replacementPath = join(testDir, 'reviewed-replacement.zip')
+    const replacement = new AdmZip()
+    replacement.addFile('z/notes.mid', guitarMidi('PART GUITAR'))
+    replacement.writeZip(replacementPath)
+    await unlink(archivePath)
+    await symlink(replacementPath, archivePath)
+    await expect(
+      buildSongSourceCatalog({
+        sources: [
+          {
+            ...reviewed.source,
+            entryId: reviewed.entryId,
+            packageReview: {
+              containerSha256: reviewed.containerSha256,
+              midiSha256: reviewed.midiSha256,
+              entryLocator: reviewed.entryLocator
+            }
+          }
+        ],
+        parentDir,
+        catalogName: 'reviewed-replaced',
+        catalogId: 'reviewed-replaced',
+        provenance: 'Reviewed',
+        license: 'test-only',
+        octaveVersion: 'test',
+        mode: 'clone',
+        sourceCatalogName: 'reviewed-shifted'
+      })
+    ).rejects.toThrow('reviewed package')
+    expect(existsSync(join(parentDir, 'reviewed-replaced'))).toBe(false)
+    expect(
+      JSON.parse(await readFile(join(parentDir, 'reviewed-shifted', 'records.jsonl'), 'utf8'))
+    ).toMatchObject({ metadata: { name: 'Reviewed Vocal' } })
   })
 
   it('returns only a safe code for parser failures and cleans failed staging directories', async () => {

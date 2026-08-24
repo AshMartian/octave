@@ -69,6 +69,7 @@ import {
   type SongSourceCatalogWriteMode
 } from './import/sngTrainingExporter'
 import {
+  getDatasetPackageInventorySessionReviewEntries,
   getDatasetPackageInventorySessionResult,
   isDatasetPackageInventorySessionComplete,
   MAX_DATASET_PACKAGE_INVENTORY_DEADLINE_MS,
@@ -169,6 +170,74 @@ type DatasetCatalogParentBookmark = {
   parentId: string
   name: string
   path: string
+}
+
+type PackageReviewCandidateDto = {
+  candidateId: string
+  groupId: string
+  kind: 'sng' | 'rb3con' | 'zip'
+  songCount: number
+  metadata: Record<string, string>
+  midiValid: true
+  instruments: Record<string, { status: 'present'; difficulties: string[]; trackNames: string[] }>
+  trainingUse: 'review_required'
+  warnings: Array<{ code: string }>
+  isStrumGenerated: false
+  /** Safe filter only; actual track names, hashes, and locations stay private. */
+  canonicalVocalMidi: boolean
+  duplicateMidi: boolean
+}
+
+function clearPackageReviewCandidates(groupId: string): void {
+  for (const [candidateId, candidateGroupId] of datasetPackageCandidateGroups) {
+    if (candidateGroupId !== groupId) continue
+    datasetSources.delete(candidateId)
+    datasetPackageCandidateGroups.delete(candidateId)
+    approvedDatasetPackageIds.delete(candidateId)
+  }
+  completedDatasetPackageInventories.delete(groupId)
+}
+
+function createPackageReviewCandidates(
+  groupId: string,
+  entries: ReturnType<typeof getDatasetPackageInventorySessionReviewEntries>
+): PackageReviewCandidateDto[] {
+  clearPackageReviewCandidates(groupId)
+  return entries.map((entry) => {
+    const candidateId = randomUUID()
+    datasetSources.set(candidateId, {
+      ...entry.source,
+      entryId: entry.entryId,
+      packageReview: {
+        containerSha256: entry.containerSha256,
+        midiSha256: entry.midiSha256,
+        entryLocator: entry.entryLocator
+      }
+    })
+    datasetPackageCandidateGroups.set(candidateId, groupId)
+    return {
+      candidateId,
+      groupId,
+      kind: entry.source.kind as 'sng' | 'rb3con' | 'zip',
+      songCount: 1,
+      metadata: {},
+      midiValid: true,
+      instruments: (entry.exactExpertPartVocals
+        ? {
+            vocals: {
+              status: 'present',
+              difficulties: ['expert'],
+              trackNames: ['Canonical lead vocals']
+            }
+          }
+        : {}) as PackageReviewCandidateDto['instruments'],
+      trainingUse: 'review_required',
+      warnings: entry.duplicateMidi ? [{ code: 'duplicate_notes_midi' }] : [],
+      isStrumGenerated: false,
+      canonicalVocalMidi: entry.exactExpertPartVocals,
+      duplicateMidi: entry.duplicateMidi
+    }
+  })
 }
 
 function datasetCatalogParentBookmarkPath(): string {
@@ -967,7 +1036,7 @@ ipcMain.handle(
     if (groupId) {
       datasetPackageInventoryControllers.get(groupId)?.abort()
       datasetPackageGroups.delete(groupId)
-      completedDatasetPackageInventories.delete(groupId)
+      clearPackageReviewCandidates(groupId)
       datasetPackageInventoryCursors.clearGroup(groupId)
       return
     }
@@ -983,7 +1052,7 @@ ipcMain.handle(
       if (!stillReferenced) {
         datasetPackageInventoryControllers.get(knownGroupId)?.abort()
         datasetPackageGroups.delete(knownGroupId)
-        completedDatasetPackageInventories.delete(knownGroupId)
+        clearPackageReviewCandidates(knownGroupId)
         datasetPackageInventoryCursors.clearGroup(knownGroupId)
       }
     }
@@ -1007,6 +1076,9 @@ ipcMain.handle(
       ? { cursor: resumeCursor as string, session: cursorResolution.session }
       : datasetPackageInventoryCursors.begin(groupId, sources)
     if (!started.session) return { inventory: null, resumeCursor: null, cursorRejected: true }
+    // Starting a new inventory invalidates all review capabilities and any
+    // approval made from the prior snapshot. A resume retains its same session.
+    if (!cursorResolution) clearPackageReviewCandidates(groupId)
     const controller = new AbortController()
     datasetPackageInventoryControllers.set(groupId, controller)
     const abort = (): void => controller.abort()
@@ -1033,15 +1105,25 @@ ipcMain.handle(
         return null
       }
       if (isDatasetPackageInventorySessionComplete(started.session)) {
+        const reviewCandidates = createPackageReviewCandidates(
+          groupId,
+          getDatasetPackageInventorySessionReviewEntries(started.session)
+        )
         datasetPackageInventoryCursors.complete(started.cursor)
         completedDatasetPackageInventories.add(groupId)
         return {
           inventory: getDatasetPackageInventorySessionResult(started.session),
           resumeCursor: null,
-          cursorRejected: false
+          cursorRejected: false,
+          reviewCandidates
         }
       }
-      return { inventory, resumeCursor: started.cursor, cursorRejected: false }
+      return {
+        inventory,
+        resumeCursor: started.cursor,
+        cursorRejected: false,
+        reviewCandidates: null
+      }
     } catch {
       // The service is already aggregate-only. Keep IPC failures generic so a
       // renderer never receives source paths or parser error details.
@@ -1206,7 +1288,7 @@ ipcMain.handle('dataset:setSongOptIn', async (_event, candidateId: string, opted
 
 ipcMain.handle('dataset:setPackageApproved', (_event, candidateId: string, approved: boolean) => {
   const source = datasetSources.get(candidateId)
-  if (!source || source.kind === 'octave-library') return false
+  if (!source || source.kind === 'octave-library' || !source.packageReview) return false
   const groupId = datasetPackageCandidateGroups.get(candidateId)
   if (!groupId || !completedDatasetPackageInventories.has(groupId)) return false
   if (approved) approvedDatasetPackageIds.add(candidateId)

@@ -3,10 +3,13 @@ import { join } from 'path'
 import AdmZip from 'adm-zip'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import {
+  createDatasetPackageInventorySession,
+  getDatasetPackageInventorySessionReviewEntries,
   inspectIsolatedPackageInWorker,
   inspectZipForInventoryTest,
   inventoryDatasetPackageSources,
   readInventoryPackageSnapshot,
+  runDatasetPackageInventorySession,
   type DatasetPackageInventoryOptions
 } from './packageSourceInventory'
 
@@ -98,6 +101,40 @@ describe('inventoryDatasetPackageSources', () => {
     ).resolves.toMatchObject({
       validNotesMidiCount: 1,
       exactExpertPartVocalsCount: 0
+    })
+  })
+
+  it('retains canonical ZIP locators rather than parser enumeration order', async () => {
+    const archive = new AdmZip()
+    // `z` is first in inventory because of notes.chart, not notes.mid.
+    archive.addFile('z/notes.chart', Buffer.from('[Song]\n{}\n'))
+    archive.addFile('a/notes.mid', midiWithTrack('PART GUITAR'))
+    archive.addFile('z/notes.mid', midiWithTrack('PART VOCALS'))
+    const packagePath = join(testDir, 'canonical-locator-order.zip')
+    archive.writeZip(packagePath)
+    const session = createDatasetPackageInventorySession([{ kind: 'zip', sourcePath: packagePath }])
+    await runDatasetPackageInventorySession(session, localInspection)
+    const reviewEntries = getDatasetPackageInventorySessionReviewEntries(session)
+    expect(reviewEntries.map((entry) => entry.entryLocator).sort()).toEqual(['a/', 'z/'])
+    expect(new Set(reviewEntries.map((entry) => entry.entryId)).size).toBe(2)
+    expect(reviewEntries.find((entry) => entry.entryLocator === 'z/')?.exactExpertPartVocals).toBe(
+      true
+    )
+  })
+
+  it('retains a valid root-level ZIP notes.mid review entry', async () => {
+    const archive = new AdmZip()
+    archive.addFile('notes.mid', midiWithTrack('PART VOCALS'))
+    const packagePath = join(testDir, 'root-notes-midi.zip')
+    archive.writeZip(packagePath)
+    const session = createDatasetPackageInventorySession([{ kind: 'zip', sourcePath: packagePath }])
+    await runDatasetPackageInventorySession(session, localInspection)
+    const reviewEntries = getDatasetPackageInventorySessionReviewEntries(session)
+    expect(reviewEntries).toHaveLength(1)
+    expect(reviewEntries[0]).toMatchObject({
+      entryLocator: '',
+      exactExpertPartVocals: true,
+      source: { kind: 'zip', sourcePath: packagePath }
     })
   })
 

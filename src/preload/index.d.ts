@@ -76,6 +76,23 @@ interface ChartEditorAPI {
     } | null
     resumeCursor: string | null
     cursorRejected: boolean
+    reviewCandidates: Array<{
+      candidateId: string
+      groupId: string
+      kind: 'sng' | 'rb3con' | 'zip'
+      songCount: number
+      metadata: Record<string, string>
+      midiValid: true
+      instruments: Record<
+        string,
+        { status: 'present'; difficulties: string[]; trackNames: string[] }
+      >
+      trainingUse: 'review_required'
+      warnings: Array<{ code: string }>
+      isStrumGenerated: false
+      canonicalVocalMidi: boolean
+      duplicateMidi: boolean
+    }> | null
   } | null>
   cancelDatasetPackageInventory: (groupId: string) => Promise<boolean>
   onDatasetPackageInventoryProgress: (

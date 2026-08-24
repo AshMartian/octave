@@ -26,6 +26,9 @@ type SourceCandidate = {
   trainingUse: 'allowed' | 'review_required'
   warnings: Array<{ code: string }>
   isStrumGenerated?: boolean
+  /** A safe filter flag; original track names and package details stay private. */
+  canonicalVocalMidi?: boolean
+  duplicateMidi?: boolean
 }
 
 type CatalogSaveMode = 'create' | 'update' | 'clone'
@@ -590,6 +593,7 @@ export function TrainingModal({
     completedPackageCount: number
     totalPackageCount: number
   } | null>(null)
+  const [showCanonicalVocalMidiOnly, setShowCanonicalVocalMidiOnly] = useState(false)
   const [prepareConfig, setPrepareConfig] = useState<Record<string, TrainingControlValue>>({})
   const [trainConfig, setTrainConfig] = useState<Record<string, TrainingControlValue>>({})
   const [promotionArtifactId, setPromotionArtifactId] = useState('')
@@ -1125,9 +1129,23 @@ export function TrainingModal({
       const resumeCursor = response.resumeCursor ?? undefined
       setPackageGroups((current) =>
         current.map((entry) =>
-          entry.groupId === group.groupId ? { ...entry, inventory, resumeCursor } : entry
+          entry.groupId === group.groupId
+            ? {
+                ...entry,
+                inventory,
+                resumeCursor,
+                candidates: response.reviewCandidates ?? entry.candidates
+              }
+            : entry
         )
       )
+      if (response.reviewCandidates) {
+        setSelectedPackages((current) => {
+          const next = new Set(current)
+          for (const candidate of group.candidates) next.delete(candidate.candidateId)
+          return next
+        })
+      }
     } catch {
       setError('Could not inventory the selected package sources.')
     } finally {
@@ -1534,7 +1552,9 @@ export function TrainingModal({
             {selectable
               ? candidate.isStrumGenerated
                 ? 'STRUM charted · select to explicitly include'
-                : 'available for review'
+                : candidate.canonicalVocalMidi
+                  ? 'canonical Vocal MIDI · select to explicitly include'
+                  : 'MIDI-backed · select to explicitly include'
               : candidate.trainingUse.replace('_', ' ')}
             {!selectable && candidate.isStrumGenerated ? ' · STRUM generated' : ''}
             {Object.entries(candidate.instruments)
@@ -2026,6 +2046,14 @@ export function TrainingModal({
                       {scanningPackages ? '×' : '＋'}
                     </span>
                   </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowCanonicalVocalMidiOnly((current) => !current)}
+                    disabled={exporting || packageCandidates.length === 0}
+                    aria-pressed={showCanonicalVocalMidiOnly}
+                  >
+                    {showCanonicalVocalMidiOnly ? 'Show all MIDI' : 'Canonical Vocal MIDI'}
+                  </button>
                 </div>
                 <div className="dataset-package-list">
                   {packageGroups.map((group) => (
@@ -2098,7 +2126,9 @@ export function TrainingModal({
                           · {inventoryProgress?.completedPackageCount ?? 0} completed
                         </p>
                       )}
-                      {group.candidates.map((entry) => renderCandidate(entry, true))}
+                      {group.candidates
+                        .filter((entry) => !showCanonicalVocalMidiOnly || entry.canonicalVocalMidi)
+                        .map((entry) => renderCandidate(entry, true))}
                     </section>
                   ))}
                   {!scanningPackages && packageGroups.length === 0 && (
