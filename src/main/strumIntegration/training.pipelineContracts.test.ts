@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 
 let pipelinePayload: unknown[] = []
+let runtimeCapabilities = ['dataset_prepare', 'training_start', 'post_train_job_discovery']
 
 vi.mock('electron', () => ({
   app: { getPath: () => '/tmp/octave-training-contract-test', isPackaged: false },
@@ -25,7 +26,7 @@ vi.mock('child_process', () => ({
         `${JSON.stringify({
           protocol_version: '1.0',
           runtime_id: 'test-runtime',
-          capabilities: ['dataset_prepare']
+          capabilities: runtimeCapabilities
         })}\n`
       )
       return
@@ -41,6 +42,28 @@ vi.mock('child_process', () => ({
 import { listTrainingPipelines } from './training'
 
 const pipelineId = 'strum.instrument-chart/pro-guitar/v1'
+
+function pipelineDescriptor(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: pipelineId,
+    display_name: 'Pro Guitar',
+    kind: 'instrument_chart',
+    version: 1,
+    status: 'catalog_ready',
+    preparation_status: 'available',
+    training_status: 'available',
+    catalog_requirements: { instrument: 'guitar' },
+    prepare_schema: { type: 'object', properties: {}, required: [] },
+    train_schema: { type: 'object', properties: {}, required: [] },
+    checkpoint_outputs: ['pro.guitar.event_attributes'],
+    inference_capability: 'chart.transform/v1',
+    private_request_fields: ['catalog_root'],
+    catalog_inspection_option_keys: [],
+    training_requirements: ['profile_evaluation'],
+    promotion_jobs: [],
+    ...overrides
+  }
+}
 
 function outputContracts(): Record<string, unknown> {
   return {
@@ -132,7 +155,7 @@ function outputContracts(): Record<string, unknown> {
 
 describe('STRUM checkpoint output-contract descriptors', () => {
   it('exposes a selected-candidate map without private paths or deployment authority', async () => {
-    pipelinePayload = [{ id: pipelineId, checkpoint_output_contracts: outputContracts() }]
+    pipelinePayload = [pipelineDescriptor({ checkpoint_output_contracts: outputContracts() })]
 
     const [pipeline] = await listTrainingPipelines()
     expect(pipeline.checkpoint_output_contracts).toEqual({
@@ -161,20 +184,106 @@ describe('STRUM checkpoint output-contract descriptors', () => {
     const contracts = outputContracts()
     const candidates = contracts.by_candidate_kind as Record<string, Record<string, unknown>>
     candidates['known_event_attributes/v1'].unsafe_path = '/private/checkpoint'
-    pipelinePayload = [{ id: pipelineId, checkpoint_output_contracts: contracts }]
+    pipelinePayload = [pipelineDescriptor({ checkpoint_output_contracts: contracts })]
 
     await expect(listTrainingPipelines()).resolves.toEqual([])
   })
 
   it('keeps existing descriptors that do not use candidate output contracts', async () => {
+    pipelinePayload = [pipelineDescriptor({ checkpoint_output_contracts: undefined })]
+
+    await expect(listTrainingPipelines()).resolves.toEqual([
+      expect.objectContaining({
+        id: pipelineId,
+        checkpoint_outputs: ['pro.guitar.event_attributes']
+      })
+    ])
+  })
+
+  it('rejects path-bearing promotion metadata instead of forwarding it to the renderer', async () => {
     pipelinePayload = [
-      {
-        id: 'guitar.onset-fret/v1',
-        display_name: 'Guitar onset + fret',
-        checkpoint_outputs: ['guitar.onset', 'guitar.fret']
-      }
+      pipelineDescriptor({
+        promotion_jobs: [
+          {
+            id: 'chart-transform.profile-evaluate/v1',
+            display_name: 'Evaluate',
+            kind: 'evaluation',
+            status: 'available',
+            options_schema: { type: 'object', properties: {}, required: [] },
+            private_request_fields: ['bundle_root'],
+            optional_private_request_fields: [],
+            output_kind: 'evaluation_report',
+            deployment_scope: 'evaluation_evidence_only',
+            quality_policy: { policy_id: 'private/path' }
+          }
+        ]
+      })
     ]
 
-    await expect(listTrainingPipelines()).resolves.toEqual(pipelinePayload)
+    await expect(listTrainingPipelines()).resolves.toEqual([])
+  })
+
+  it('exposes a normalized, path-free promotion descriptor without making it executable', async () => {
+    pipelinePayload = [
+      pipelineDescriptor({
+        promotion_jobs: [
+          {
+            id: 'chart-transform.profile-evaluate/v1',
+            display_name: 'Evaluate held-out transform',
+            kind: 'evaluation',
+            status: 'available',
+            options_schema: {
+              type: 'object',
+              properties: { device: { type: 'string', enum: ['cpu', 'cuda'], default: 'cpu' } },
+              required: []
+            },
+            private_request_fields: ['bundle_root', 'dataset_manifest', 'output'],
+            optional_private_request_fields: ['catalog_root'],
+            output_kind: 'evaluation_report',
+            deployment_scope: 'evaluation_evidence_only',
+            quality_policy: { policy_id: 'chart-transform-held-out/v1', schema_version: 1 }
+          }
+        ]
+      })
+    ]
+
+    const [descriptor] = await listTrainingPipelines()
+    expect(descriptor.promotion_jobs).toEqual([
+      expect.objectContaining({
+        id: 'chart-transform.profile-evaluate/v1',
+        private_request_fields: ['bundle_root', 'dataset_manifest', 'output']
+      })
+    ])
+    expect(JSON.stringify(descriptor.promotion_jobs)).not.toMatch(/[/\\](home|tmp|run)[/\\]/)
+  })
+
+  it('withholds promotion metadata unless the runtime advertises discovery support', async () => {
+    runtimeCapabilities = ['dataset_prepare', 'training_start']
+    pipelinePayload = [
+      pipelineDescriptor({
+        promotion_jobs: [
+          {
+            id: 'chart-transform.profile-evaluate/v1',
+            display_name: 'Evaluate',
+            kind: 'evaluation',
+            status: 'available',
+            options_schema: { type: 'object', properties: {}, required: [] },
+            private_request_fields: ['bundle_root'],
+            optional_private_request_fields: [],
+            output_kind: 'evaluation_report',
+            deployment_scope: 'evaluation_evidence_only'
+          }
+        ]
+      })
+    ]
+    await expect(listTrainingPipelines()).resolves.toEqual([
+      expect.objectContaining({ promotion_jobs: [] })
+    ])
+    runtimeCapabilities = ['dataset_prepare', 'training_start', 'post_train_job_discovery']
+  })
+
+  it('rejects a renderer-visible display string containing a private path', async () => {
+    pipelinePayload = [pipelineDescriptor({ display_name: 'Diagnostic at /private/catalog' })]
+    await expect(listTrainingPipelines()).resolves.toEqual([])
   })
 })

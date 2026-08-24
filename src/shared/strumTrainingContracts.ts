@@ -12,6 +12,25 @@ export interface StrumCheckpointOutputContracts {
   by_candidate_kind: Record<string, StrumCheckpointOutputCandidate>
 }
 
+/**
+ * Path-free STRUM-owned post-training metadata. This is descriptive only:
+ * later main-process APIs resolve its private fields from opaque candidates.
+ */
+export interface StrumPromotionJobDescriptor {
+  id: string
+  display_name: string
+  kind: 'evaluation' | 'package'
+  status: 'available' | 'planned' | 'unavailable'
+  options_schema: Record<string, unknown>
+  private_request_fields: string[]
+  optional_private_request_fields: string[]
+  output_kind: string
+  deployment_scope: string
+  quality_policy?: Record<string, unknown>
+  calibration_policy?: Record<string, unknown>
+  checkpoint_selection_policy?: Record<string, unknown>
+}
+
 export interface StrumCheckpointOutputCandidate {
   component_outputs: string[]
   model_outputs: string[]

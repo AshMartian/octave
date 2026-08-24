@@ -9,7 +9,8 @@ import type {
   StrumCheckpointCandidateOutputContract,
   StrumCheckpointCandidateTargetContract,
   StrumCheckpointOutputCandidate,
-  StrumCheckpointOutputContracts
+  StrumCheckpointOutputContracts,
+  StrumPromotionJobDescriptor
 } from '../../shared/strumTrainingContracts'
 import { resolvePythonCommand, type PythonCommand } from './runner'
 import { sanitizeTrainingSchemaValues } from './trainingSchema'
@@ -34,18 +35,28 @@ export type TrainingPipeline = {
   id: string
   display_name: string
   kind: string
-  catalog_requirements: {
-    instrument: string
-    difficulties: string[]
-    audio_roles: string[]
-    audio_policy: string
-  }
+  version: number
+  status: string
+  preparation_status: string
+  training_status: string
+  catalog_requirements: Record<string, unknown>
   prepare_schema: Record<string, unknown>
-  train_schema: Record<string, unknown>
+  train_schema: Record<string, unknown> | null
   checkpoint_outputs: string[]
   checkpoint_output_contracts?: StrumCheckpointOutputContracts
   inference_capability: string | null
+  private_request_fields: string[]
+  catalog_inspection_option_keys: string[]
+  training_requirements: string[]
+  promotion_jobs: TrainingPromotionJob[]
 }
+
+/**
+ * Public, path-free metadata for a STRUM-owned post-training operation. The
+ * renderer may describe this metadata, but it never receives values for the
+ * declared private request fields.
+ */
+export type TrainingPromotionJob = StrumPromotionJobDescriptor
 
 export type TrainingRuntime = {
   runtimeId: string
@@ -65,8 +76,10 @@ export type TrainingCatalogInspection = {
   eligibleCount: number
   recordCount: number
   excluded: Record<string, number>
-  audioPolicy: string
+  audioPolicy: Record<string, unknown>
   estimatedStorageBytes: number
+  storageEstimateCapped: boolean
+  storageEstimateSemantics: string
 }
 
 export type TrainingTask = {
@@ -86,6 +99,8 @@ export type TrainingRun = {
   checkpointCount: number
   deployable: boolean
   checkpointManifestHash: string
+  /** Opaque identity of a worker re-inspected candidate, if registration succeeded. */
+  artifactId?: string
   createdAt: string
 }
 
@@ -144,7 +159,7 @@ export type DiscoveredCheckpoint = {
   modelId: string
   manifestSha256: string
   schemaVersion: number
-  compatibility: Record<string, string | number>
+  compatibility: Record<string, string | number | boolean | null>
   components: Array<{ id: string; sha256: string; byteLength: number }>
   profiles: DiscoveredCheckpointProfile[]
   rejectedProfileCount: number
@@ -213,7 +228,18 @@ type WorkerInvocation = {
 
 type TrainingRegistry = {
   tasks: Array<TrainingTask & { taskRoot: string; catalogRoot: string }>
-  runs: Array<TrainingRun & { outputRoot: string }>
+  runs: Array<
+    TrainingRun & {
+      outputRoot: string
+      /** Main-process-only promotion binding. Never expose these paths through IPC. */
+      candidateBinding?: {
+        artifactId: string
+        bundleRoot: string
+        taskView: string
+        catalogRoot: string
+      }
+    }
+  >
   profiles?: StoredAutoChartProfile[]
   defaultProfileId?: string
 }
@@ -516,7 +542,9 @@ function normalizeRuntime(
     capabilities: [
       ...new Set([
         ...(Array.isArray(value.capabilities) ? value.capabilities.map(String) : []),
-        ...(Array.isArray(value.capabilities) && value.capabilities.includes('dataset_prepare')
+        ...(Array.isArray(value.capabilities) &&
+        value.capabilities.includes('dataset_prepare') &&
+        value.capabilities.includes('training_start')
           ? ['training']
           : [])
       ])
@@ -667,6 +695,8 @@ export async function chooseInstalledTrainingRuntime(): Promise<TrainingRuntime 
 const CHECKPOINT_OUTPUT_CONTRACTS_FORMAT = 'strum-candidate-checkpoint-output-contracts/v1'
 const MAX_OUTPUT_CONTRACT_CANDIDATES = 16
 const MAX_OUTPUT_CONTRACT_LIST_LENGTH = 32
+const MAX_PIPELINE_METADATA_DEPTH = 8
+const MAX_PIPELINE_METADATA_ENTRIES = 64
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
@@ -692,6 +722,154 @@ function isSafeContractName(value: unknown): value is string {
 
 function isSafeContractToken(value: unknown): value is string {
   return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value)
+}
+
+function isSafeDisplayText(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= 512 &&
+    !value.includes('\\') &&
+    !value.includes('/') &&
+    !Array.from(value).some((character) => character.charCodeAt(0) < 32) &&
+    !value.includes('..') &&
+    !value.startsWith('/')
+  )
+}
+
+function isSafeMetadataString(value: unknown): value is string {
+  return isSafeDisplayText(value) || isSafeContractName(value)
+}
+
+function normalizeNonNegativeCount(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null
+}
+
+function normalizeExclusionReasonCounts(value: unknown): Record<string, number> | null {
+  if (!isRecord(value) || Object.keys(value).length > MAX_PIPELINE_METADATA_ENTRIES) return null
+  const normalized: Record<string, number> = {}
+  for (const [key, rawCount] of Object.entries(value)) {
+    const count = normalizeNonNegativeCount(rawCount)
+    if (!isSafeContractToken(key) || count === null) return null
+    normalized[key] = count
+  }
+  return normalized
+}
+
+/**
+ * Pipeline policy/schema metadata is descriptive only, but it still crosses
+ * into the renderer. Keep it bounded and path-free instead of forwarding an
+ * arbitrary worker object. Versioned identifiers are the sole allowed slash
+ * containing values.
+ */
+function normalizePipelineMetadata(value: unknown, depth = 0): unknown | null {
+  if (depth > MAX_PIPELINE_METADATA_DEPTH) return null
+  if (value === null || typeof value === 'boolean') return value
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null
+  if (typeof value === 'string') return isSafeMetadataString(value) ? value : null
+  if (Array.isArray(value)) {
+    if (value.length > MAX_PIPELINE_METADATA_ENTRIES) return null
+    const normalized = value.map((entry) => normalizePipelineMetadata(entry, depth + 1))
+    return normalized.some((entry) => entry === null) ? null : normalized
+  }
+  if (!isRecord(value) || Object.keys(value).length > MAX_PIPELINE_METADATA_ENTRIES) return null
+  const normalized: Record<string, unknown> = {}
+  for (const [key, entry] of Object.entries(value)) {
+    if (!isSafeContractToken(key)) return null
+    const next = normalizePipelineMetadata(entry, depth + 1)
+    if (next === null) return null
+    normalized[key] = next
+  }
+  return normalized
+}
+
+function normalizeMetadataRecord(value: unknown): Record<string, unknown> | null {
+  const normalized = normalizePipelineMetadata(value)
+  return isRecord(normalized) ? normalized : null
+}
+
+function normalizeContractTokenList(
+  value: unknown,
+  maximum = MAX_OUTPUT_CONTRACT_LIST_LENGTH
+): string[] | null {
+  if (!Array.isArray(value) || value.length > maximum || !value.every(isSafeContractToken))
+    return null
+  return new Set(value).size === value.length ? [...value] : null
+}
+
+function normalizePromotionJob(value: unknown): TrainingPromotionJob | null {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(
+      value,
+      [
+        'id',
+        'display_name',
+        'kind',
+        'status',
+        'options_schema',
+        'private_request_fields',
+        'optional_private_request_fields',
+        'output_kind',
+        'deployment_scope',
+        'quality_policy',
+        'calibration_policy',
+        'checkpoint_selection_policy'
+      ],
+      [
+        'id',
+        'display_name',
+        'kind',
+        'status',
+        'options_schema',
+        'private_request_fields',
+        'optional_private_request_fields',
+        'output_kind',
+        'deployment_scope'
+      ]
+    ) ||
+    !isSafeContractName(value.id) ||
+    !isSafeDisplayText(value.display_name) ||
+    (value.kind !== 'evaluation' && value.kind !== 'package') ||
+    !['available', 'planned', 'unavailable'].includes(String(value.status)) ||
+    !isSafeContractToken(value.output_kind) ||
+    !isSafeContractToken(value.deployment_scope)
+  ) {
+    return null
+  }
+  const optionsSchema = normalizeMetadataRecord(value.options_schema)
+  const privateFields = normalizeContractTokenList(value.private_request_fields)
+  const optionalPrivateFields = normalizeContractTokenList(value.optional_private_request_fields)
+  if (!optionsSchema || !privateFields || !optionalPrivateFields) return null
+  if (privateFields.some((field) => optionalPrivateFields.includes(field))) return null
+  const policies = ['quality_policy', 'calibration_policy', 'checkpoint_selection_policy'] as const
+  const normalizedPolicies = Object.fromEntries(
+    policies.map((key) => [
+      key,
+      value[key] === undefined ? undefined : normalizeMetadataRecord(value[key])
+    ])
+  ) as Record<(typeof policies)[number], Record<string, unknown> | null | undefined>
+  if (Object.values(normalizedPolicies).some((policy) => policy === null)) return null
+  return {
+    id: value.id,
+    display_name: value.display_name,
+    kind: value.kind,
+    status: value.status as TrainingPromotionJob['status'],
+    options_schema: optionsSchema,
+    private_request_fields: privateFields,
+    optional_private_request_fields: optionalPrivateFields,
+    output_kind: value.output_kind,
+    deployment_scope: value.deployment_scope,
+    ...(normalizedPolicies.quality_policy
+      ? { quality_policy: normalizedPolicies.quality_policy }
+      : {}),
+    ...(normalizedPolicies.calibration_policy
+      ? { calibration_policy: normalizedPolicies.calibration_policy }
+      : {}),
+    ...(normalizedPolicies.checkpoint_selection_policy
+      ? { checkpoint_selection_policy: normalizedPolicies.checkpoint_selection_policy }
+      : {})
+  }
 }
 
 function normalizeContractStrings(
@@ -1048,22 +1226,142 @@ function normalizeCheckpointOutputContracts(
 }
 
 function normalizeTrainingPipeline(value: unknown): TrainingPipeline | null {
-  if (!isRecord(value) || typeof value.id !== 'string') return null
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(
+      value,
+      [
+        'id',
+        'display_name',
+        'kind',
+        'version',
+        'catalog_requirements',
+        'prepare_schema',
+        'train_schema',
+        'checkpoint_outputs',
+        'checkpoint_output_contracts',
+        'inference_capability',
+        'status',
+        'preparation_status',
+        'training_status',
+        'private_request_fields',
+        'catalog_inspection_option_keys',
+        'training_requirements',
+        'training_contract',
+        'promotion_jobs'
+      ],
+      [
+        'id',
+        'display_name',
+        'kind',
+        'version',
+        'catalog_requirements',
+        'prepare_schema',
+        'train_schema',
+        'checkpoint_outputs',
+        'inference_capability',
+        'status',
+        'preparation_status',
+        'training_status',
+        'private_request_fields',
+        'catalog_inspection_option_keys',
+        'training_requirements',
+        'promotion_jobs'
+      ]
+    ) ||
+    !isSafeContractName(value.id) ||
+    !isSafeDisplayText(value.display_name) ||
+    !isSafeContractToken(value.kind) ||
+    typeof value.version !== 'number' ||
+    !Number.isSafeInteger(value.version) ||
+    value.version < 1 ||
+    !isSafeContractToken(value.status) ||
+    !isSafeContractToken(value.preparation_status) ||
+    !isSafeContractToken(value.training_status) ||
+    (value.inference_capability !== null && !isSafeContractName(value.inference_capability))
+  ) {
+    return null
+  }
+  const version = Number(value.version)
+  const catalogRequirements = normalizeMetadataRecord(value.catalog_requirements)
+  const prepareSchema = normalizeMetadataRecord(value.prepare_schema)
+  const trainSchema =
+    value.train_schema === null ? null : normalizeMetadataRecord(value.train_schema)
+  const checkpointOutputs = normalizeContractTokenList(value.checkpoint_outputs)
+  const privateFields = normalizeContractTokenList(value.private_request_fields)
+  const inspectionKeys = normalizeContractTokenList(value.catalog_inspection_option_keys)
+  const trainingRequirements = Array.isArray(value.training_requirements)
+    ? value.training_requirements.every(
+        (requirement) => isSafeContractToken(requirement) || isSafeContractName(requirement)
+      ) && new Set(value.training_requirements).size === value.training_requirements.length
+      ? ([...value.training_requirements] as string[])
+      : null
+    : null
+  const promotionJobs = Array.isArray(value.promotion_jobs)
+    ? value.promotion_jobs.map(normalizePromotionJob)
+    : null
+  if (
+    !catalogRequirements ||
+    !prepareSchema ||
+    (trainSchema === null && value.train_schema !== null) ||
+    !checkpointOutputs ||
+    !privateFields ||
+    !inspectionKeys ||
+    !trainingRequirements ||
+    !promotionJobs ||
+    promotionJobs.some((job) => job === null) ||
+    promotionJobs.length > 16 ||
+    new Set(promotionJobs.map((job) => job?.id)).size !== promotionJobs.length
+  ) {
+    return null
+  }
   const rawContracts = value.checkpoint_output_contracts
-  if (rawContracts === undefined) return value as TrainingPipeline
-  const contracts = normalizeCheckpointOutputContracts(rawContracts, value.id)
-  if (!contracts) return null
-  return { ...(value as TrainingPipeline), checkpoint_output_contracts: contracts }
+  const contracts =
+    rawContracts === undefined
+      ? undefined
+      : normalizeCheckpointOutputContracts(rawContracts, value.id)
+  if (rawContracts !== undefined && !contracts) return null
+  return {
+    id: value.id,
+    display_name: value.display_name,
+    kind: value.kind,
+    version,
+    status: value.status,
+    preparation_status: value.preparation_status,
+    training_status: value.training_status,
+    catalog_requirements: catalogRequirements,
+    prepare_schema: prepareSchema,
+    train_schema: trainSchema,
+    checkpoint_outputs: checkpointOutputs,
+    ...(contracts ? { checkpoint_output_contracts: contracts } : {}),
+    inference_capability: value.inference_capability,
+    private_request_fields: privateFields,
+    catalog_inspection_option_keys: inspectionKeys,
+    training_requirements: trainingRequirements,
+    promotion_jobs: promotionJobs.filter((job): job is TrainingPromotionJob => job !== null)
+  }
 }
 
 export async function listTrainingPipelines(): Promise<TrainingPipeline[]> {
   const runtime = await probeTrainingRuntime()
-  if (!runtime.capabilities.includes('training')) return []
+  if (
+    !runtime.capabilities.includes('dataset_prepare') ||
+    !runtime.capabilities.includes('training_start')
+  )
+    return []
+  const promotionDiscoveryAvailable = runtime.capabilities.includes('post_train_job_discovery')
   const payload = await runWorkerJson(['pipeline', 'list', '--json'])
   const pipelines = Array.isArray(payload.pipelines) ? payload.pipelines : []
   return pipelines.flatMap((pipeline) => {
     const normalized = normalizeTrainingPipeline(pipeline)
-    return normalized ? [normalized] : []
+    return normalized
+      ? [
+          {
+            ...normalized,
+            promotion_jobs: promotionDiscoveryAvailable ? normalized.promotion_jobs : []
+          }
+        ]
+      : []
   })
 }
 
@@ -1076,32 +1374,77 @@ async function resolveTrainingPipeline(pipelineId: string): Promise<TrainingPipe
 
 export async function inspectTrainingCatalog(
   catalogRoot: string,
-  pipelineId: string
+  pipelineId: string,
+  requestedOptions: Record<string, unknown>
 ): Promise<TrainingCatalogInspection> {
+  const pipeline = await resolveTrainingPipeline(pipelineId)
+  const preparedOptions = sanitizeTrainingSchemaValues(
+    pipeline.prepare_schema,
+    requestedOptions,
+    'catalog inspection'
+  )
+  const inspectionOptions = Object.fromEntries(
+    Object.entries(preparedOptions).filter(([key]) =>
+      pipeline.catalog_inspection_option_keys.includes(key)
+    )
+  )
   const payload = await runWorkerJson([
     'catalog',
     'inspect',
-    '--catalog',
+    '--catalog-root',
     catalogRoot,
     '--pipeline',
     pipelineId,
+    '--options',
+    JSON.stringify(inspectionOptions),
     '--json'
   ])
+  const expectedKeys = [
+    'status',
+    'catalog_id',
+    'record_count',
+    'allowed_record_count',
+    'pipeline_id',
+    'eligible_count',
+    'exclusion_reason_counts',
+    'audio_policy',
+    'estimated_storage_bytes',
+    'storage_estimate_capped',
+    'storage_estimate_semantics',
+    'eligibility_selection'
+  ]
+  const recordCount = normalizeNonNegativeCount(payload.record_count)
+  const allowedRecordCount = normalizeNonNegativeCount(payload.allowed_record_count)
+  const eligibleCount = normalizeNonNegativeCount(payload.eligible_count)
+  const estimatedStorageBytes = normalizeNonNegativeCount(payload.estimated_storage_bytes)
+  if (
+    !hasOnlyKeys(payload, expectedKeys) ||
+    payload.status !== 'ready' ||
+    !isSafeContractToken(payload.catalog_id) ||
+    payload.pipeline_id !== pipelineId ||
+    recordCount === null ||
+    allowedRecordCount === null ||
+    eligibleCount === null ||
+    estimatedStorageBytes === null ||
+    (payload.storage_estimate_capped !== true && payload.storage_estimate_capped !== false) ||
+    !isSafeDisplayText(payload.storage_estimate_semantics)
+  ) {
+    throw new Error('STRUM returned an invalid catalog inspection result.')
+  }
+  const excluded = normalizeExclusionReasonCounts(payload.exclusion_reason_counts)
+  const audioPolicy = normalizeMetadataRecord(payload.audio_policy)
+  if (!excluded || !audioPolicy || !normalizeMetadataRecord(payload.eligibility_selection)) {
+    throw new Error('STRUM returned an invalid catalog inspection result.')
+  }
   return {
-    pipelineId: String(payload.pipeline_id ?? pipelineId),
-    eligibleCount: Number(payload.eligible_count ?? 0),
-    recordCount: Number(payload.record_count ?? 0),
-    excluded:
-      typeof payload.excluded === 'object' && payload.excluded
-        ? Object.fromEntries(
-            Object.entries(payload.excluded as Record<string, unknown>).map(([key, value]) => [
-              key,
-              Number(value)
-            ])
-          )
-        : {},
-    audioPolicy: String(payload.audio_policy ?? ''),
-    estimatedStorageBytes: Number(payload.estimated_storage_bytes ?? 0)
+    pipelineId,
+    eligibleCount,
+    recordCount,
+    excluded,
+    audioPolicy,
+    estimatedStorageBytes,
+    storageEstimateCapped: payload.storage_estimate_capped,
+    storageEstimateSemantics: payload.storage_estimate_semantics
   }
 }
 
@@ -1132,6 +1475,7 @@ export async function listTrainingArtifacts(): Promise<{
         checkpointCount: run.checkpointCount,
         deployable: run.deployable,
         checkpointManifestHash: run.checkpointManifestHash,
+        ...(run.artifactId ? { artifactId: run.artifactId } : {}),
         createdAt: run.createdAt
       })),
     profiles: (registry.profiles ?? [])
@@ -1245,10 +1589,10 @@ function normalizeDiscoveredCheckpoint(value: unknown): DiscoveredCheckpoint | n
   const artifactId = candidate.artifact_id
   const modelId = candidate.model_id
   const manifestSha256 = candidate.manifest_sha256
-  const schemaVersion = Number(candidate.schema_version)
+  const schemaVersion = candidate.schema_version
   const components = Array.isArray(candidate.components) ? candidate.components : null
   const profiles = Array.isArray(candidate.profiles) ? candidate.profiles : null
-  const rejectedProfileCount = Number(candidate.rejected_profile_count)
+  const rejectedProfileCount = candidate.rejected_profile_count
   const deploymentStatus = candidate.deployment_status
   const rawCompatibility = candidate.compatibility
   if (
@@ -1256,10 +1600,12 @@ function normalizeDiscoveredCheckpoint(value: unknown): DiscoveredCheckpoint | n
     !isSafeIdentifier(modelId) ||
     typeof manifestSha256 !== 'string' ||
     !/^[a-f0-9]{64}$/.test(manifestSha256) ||
+    typeof schemaVersion !== 'number' ||
     !Number.isSafeInteger(schemaVersion) ||
     schemaVersion < 1 ||
     !components ||
     !profiles ||
+    typeof rejectedProfileCount !== 'number' ||
     !Number.isSafeInteger(rejectedProfileCount) ||
     rejectedProfileCount < 0 ||
     (deploymentStatus !== 'ready' && deploymentStatus !== 'not_deployable') ||
@@ -1273,15 +1619,8 @@ function normalizeDiscoveredCheckpoint(value: unknown): DiscoveredCheckpoint | n
   const normalizedProfiles = profiles.map(normalizeDiscoveredProfile)
   if (normalizedComponents.some((component) => component === null)) return null
   if (normalizedProfiles.some((profile) => profile === null)) return null
-  const compatibility = Object.fromEntries(
-    Object.entries(rawCompatibility as Record<string, unknown>).flatMap(([key, entry]) =>
-      /^[a-z][a-z0-9_]{0,63}$/.test(key) &&
-      (typeof entry === 'string' || (typeof entry === 'number' && Number.isFinite(entry))) &&
-      entry.toString().length <= 128
-        ? [[key, entry]]
-        : []
-    )
-  )
+  const compatibility = normalizeDiscoveredCompatibility(rawCompatibility)
+  if (!compatibility) return null
   return {
     artifactId,
     modelId,
@@ -1296,6 +1635,49 @@ function normalizeDiscoveredCheckpoint(value: unknown): DiscoveredCheckpoint | n
     ),
     rejectedProfileCount,
     deploymentStatus
+  }
+}
+
+function normalizeDiscoveredCompatibility(
+  value: unknown
+): Record<string, string | number | boolean | null> | null {
+  if (!isRecord(value)) return null
+  const keys = Object.keys(value)
+  const manifestSchema = value.manifest_schema
+  const strumVersion = value.strum_version
+  const allowed = new Set([
+    'manifest_schema',
+    'strum_version',
+    'strum_revision',
+    'strum_source_dirty'
+  ])
+  if (
+    keys.length < 2 ||
+    keys.length > allowed.size ||
+    !keys.every((key) => allowed.has(key)) ||
+    typeof manifestSchema !== 'number' ||
+    !Number.isSafeInteger(manifestSchema) ||
+    manifestSchema < 1 ||
+    typeof strumVersion !== 'string' ||
+    !/^>=\d+(?:\.\d+){0,3}(?:[-+][A-Za-z0-9._-]+)?$/.test(strumVersion)
+  ) {
+    return null
+  }
+  if (
+    (value.strum_revision !== undefined && !isSafeContractToken(value.strum_revision)) ||
+    (value.strum_source_dirty !== undefined &&
+      value.strum_source_dirty !== null &&
+      typeof value.strum_source_dirty !== 'boolean')
+  ) {
+    return null
+  }
+  return {
+    manifest_schema: manifestSchema,
+    strum_version: strumVersion,
+    ...(value.strum_revision === undefined ? {} : { strum_revision: value.strum_revision }),
+    ...(value.strum_source_dirty === undefined
+      ? {}
+      : { strum_source_dirty: value.strum_source_dirty })
   }
 }
 
@@ -1458,58 +1840,35 @@ export async function inspectDiscoveredCheckpoint(
   return inspection
 }
 
-function normalizeCheckpoint(
-  payload: Record<string, unknown>,
-  run: TrainingRun
-): TrainingCheckpoint {
-  if (
-    payload.run_id !== run.runId ||
-    payload.pipeline_id !== run.pipelineId ||
-    payload.manifest_hash !== run.checkpointManifestHash
-  ) {
-    throw new Error('The checkpoint does not match the selected training run.')
-  }
-  const components = Array.isArray(payload.components)
-    ? payload.components.flatMap((component) => {
-        if (!component || typeof component !== 'object') return []
-        const value = component as Record<string, unknown>
-        const id = typeof value.id === 'string' ? value.id : ''
-        const sha256 = typeof value.sha256 === 'string' ? value.sha256 : ''
-        const byteLength = Number(value.byte_length)
-        return id &&
-          /^[a-z0-9_.-]{1,80}$/.test(id) &&
-          /^[a-f0-9]{64}$/.test(sha256) &&
-          Number.isSafeInteger(byteLength) &&
-          byteLength >= 0
-          ? [{ id, sha256, byteLength }]
-          : []
-      })
-    : []
-  if (components.length !== run.checkpointCount) {
-    throw new Error('The checkpoint bundle is incomplete.')
-  }
-  return {
-    runId: run.runId,
-    pipelineId: run.pipelineId,
-    runtimeId: String(payload.runtime_id ?? ''),
-    taskViewId: String(payload.task_view_id ?? ''),
-    taskViewHash: String(payload.task_view_hash ?? ''),
-    checkpointManifestHash: run.checkpointManifestHash,
-    deployable: payload.deployable === true,
-    deploymentReason:
-      typeof payload.deployment_reason === 'string' ? payload.deployment_reason : null,
-    components
-  }
-}
-
 export async function inspectTrainingCheckpoint(runId: string): Promise<TrainingCheckpoint> {
   const registry = await readRegistry()
   const run = registry.runs.find((entry) => entry.runId === runId && existsSync(entry.outputRoot))
   if (!run) throw new Error('The selected training run is no longer available.')
-  return normalizeCheckpoint(
-    await runWorkerJson(['checkpoint', 'inspect', '--checkpoint', run.outputRoot, '--json']),
-    run
+  const candidate = normalizeDiscoveredCheckpoint(
+    await runWorkerJson(['checkpoint', 'inspect', '--model-root', run.outputRoot, '--json'])
   )
+  if (
+    !candidate ||
+    candidate.manifestSha256 !== run.checkpointManifestHash ||
+    (run.artifactId !== undefined && candidate.artifactId !== run.artifactId)
+  ) {
+    throw new Error('The checkpoint does not match the selected training run.')
+  }
+  return {
+    runId: run.runId,
+    pipelineId: run.pipelineId,
+    runtimeId: (await probeTrainingRuntime()).runtimeId,
+    taskViewId: run.taskViewId,
+    taskViewHash:
+      registry.tasks.find((task) => task.taskViewId === run.taskViewId)?.contentHash ?? '',
+    checkpointManifestHash: candidate.manifestSha256,
+    deployable: candidate.deploymentStatus === 'ready',
+    deploymentReason:
+      candidate.deploymentStatus === 'ready'
+        ? null
+        : 'requires STRUM profile evaluation and promotion',
+    components: candidate.components
+  }
 }
 
 export async function saveDiscoveredAutoChartProfile(options: {
@@ -1855,6 +2214,16 @@ async function startJsonEventJob(
   let remainder = ''
   let terminal = false
   let cleanedUp = false
+  const safeStage = (value: unknown): string =>
+    isSafeContractToken(value) ? String(value) : 'running'
+  const safeCode = (value: unknown): string | undefined =>
+    isSafeContractToken(value) ? String(value) : undefined
+  const localMessage = (state: string, stage: string): string => {
+    if (state === 'succeeded') return 'Completed locally.'
+    if (state === 'cancelled') return 'The STRUM training job was cancelled.'
+    if (state === 'failed') return 'STRUM rejected or could not complete this local job.'
+    return `STRUM is processing ${stage.replaceAll('_', ' ')} locally.`
+  }
   const cleanup = async (fallbackState?: 'failed' | 'cancelled'): Promise<void> => {
     if (cleanedUp) return
     cleanedUp = true
@@ -1885,29 +2254,37 @@ async function startJsonEventJob(
     for (const line of lines) {
       try {
         const event = JSON.parse(line) as Record<string, unknown>
-        if (event.event !== 'progress' && event.event !== 'terminal') continue
+        // A worker terminal record is final even when its process buffers a
+        // duplicate line before close. Never invoke registration twice.
+        if (terminal) continue
+        const legacyEvent = event.event
+        const isLegacyProgress = legacyEvent === 'progress'
+        const isLegacyTerminal = legacyEvent === 'terminal'
+        const state = typeof event.state === 'string' ? event.state : ''
+        const isCurrentState = ['running', 'succeeded', 'failed', 'cancelled'].includes(state)
+        if (!isLegacyProgress && !isLegacyTerminal && !isCurrentState) continue
         const sequence = Number(event.sequence)
         if (!Number.isInteger(sequence) || sequence <= job.sequence) continue
         job.sequence = sequence
-        const message = String(event.message ?? 'STRUM is processing locally.')
-        const code = event.code ? String(event.code) : undefined
-        if (event.event === 'progress') {
+        const stage = safeStage(event.stage)
+        const code = safeCode(event.code)
+        const normalizedState = isLegacyProgress ? 'running' : state
+        if (isLegacyProgress || normalizedState === 'running') {
           broadcast({
             jobId,
             sequence,
-            stage: String(event.stage ?? 'running'),
+            stage,
             progress: Number(event.progress ?? 0),
             state: 'running',
             code,
-            message
+            message: localMessage('running', stage)
           })
           continue
         }
         terminal = true
-        const state = String(event.state)
         if (
           !job.cancelling &&
-          state === 'succeeded' &&
+          normalizedState === 'succeeded' &&
           event.result &&
           typeof event.result === 'object'
         ) {
@@ -1938,9 +2315,9 @@ async function startJsonEventJob(
             jobId,
             sequence,
             stage: 'complete',
-            state: job.cancelling || state === 'cancelled' ? 'cancelled' : 'failed',
+            state: job.cancelling || normalizedState === 'cancelled' ? 'cancelled' : 'failed',
             code,
-            message
+            message: localMessage(normalizedState, stage)
           })
         }
       } catch {
@@ -1966,28 +2343,43 @@ export async function startTrainingPrepare(options: {
   const prepare = sanitizeTrainingSchemaValues(pipeline.prepare_schema, options.prepare, 'prepare')
   const jobId = randomUUID()
   const taskViewId = `task-${randomUUID()}`
-  const taskRoot = join(trainingRoot(), 'tasks', taskViewId)
+  // Worker d8 writes one task-view manifest at its declared output location.
+  // Keep that location private; the renderer only receives OCTAVE's opaque ID.
+  const taskRoot = join(trainingRoot(), 'tasks', `${taskViewId}.json`)
   await mkdir(join(trainingRoot(), 'tasks'), { recursive: true })
   await startJsonEventJob(
     jobId,
     ['dataset', 'prepare'],
     {
-      job_id: jobId,
-      task_id: taskViewId,
       catalog_root: options.catalogRoot,
-      task_root: taskRoot,
       pipeline_id: options.pipelineId,
-      prepare
+      output: taskRoot,
+      options: prepare
     },
     async (result) => {
+      const workerTaskViewId = result.task_view_id
+      const recordCount = result.record_count
+      if (
+        result.status !== 'prepared' ||
+        result.pipeline_id !== options.pipelineId ||
+        !isSafeContractToken(workerTaskViewId) ||
+        typeof recordCount !== 'number' ||
+        !Number.isSafeInteger(recordCount) ||
+        recordCount < 0 ||
+        !isSafeContractToken(result.output_name)
+      ) {
+        throw new Error('STRUM returned an invalid prepared task result.')
+      }
       const registry = await readRegistry()
       const task: TrainingTask & { taskRoot: string; catalogRoot: string } = {
         taskViewId,
         catalogId: options.catalogId,
         catalogName: options.catalogName,
         pipelineId: options.pipelineId,
-        eligibleCount: Number(result.eligible_count ?? 0),
-        contentHash: String(result.content_hash ?? ''),
+        eligibleCount: recordCount,
+        // This is STRUM's path-free task-view identity, retained under the
+        // historical public field name for the existing renderer.
+        contentHash: workerTaskViewId,
         createdAt: new Date().toISOString(),
         taskRoot,
         catalogRoot: options.catalogRoot
@@ -2018,6 +2410,7 @@ export async function startTrainingRun(options: {
     throw new Error('The selected task view belongs to a different training pipeline.')
   }
   const pipeline = await resolveTrainingPipeline(options.pipelineId)
+  if (!pipeline.train_schema) throw new Error('This STRUM pipeline has no training schema.')
   const train = sanitizeTrainingSchemaValues(pipeline.train_schema, options.train, 'train')
   const jobId = randomUUID()
   const runId = `run-${randomUUID()}`
@@ -2027,29 +2420,66 @@ export async function startTrainingRun(options: {
     jobId,
     ['train', 'start'],
     {
-      job_id: jobId,
-      run_id: runId,
-      task_root: task.taskRoot,
-      catalog_root: task.catalogRoot,
-      output_root: outputRoot,
       pipeline_id: options.pipelineId,
-      train
+      task_view: task.taskRoot,
+      catalog_root: task.catalogRoot,
+      output: outputRoot,
+      options: train
     },
     async (result) => {
+      if (
+        result.status !== 'completed' ||
+        result.pipeline_id !== options.pipelineId ||
+        !isSafeContractToken(result.bundle_name) ||
+        !/^[a-f0-9]{64}$/.test(String(result.manifest_sha256 ?? '')) ||
+        !Array.isArray(result.components)
+      ) {
+        throw new Error('STRUM returned an invalid training result.')
+      }
+      const inspection = normalizeDiscoveredCheckpoint(
+        await runWorkerJson(['checkpoint', 'inspect', '--model-root', outputRoot, '--json'])
+      )
+      if (
+        !inspection ||
+        inspection.manifestSha256 !== result.manifest_sha256 ||
+        inspection.components.length !== result.components.length
+      ) {
+        throw new Error('STRUM could not re-inspect the trained candidate.')
+      }
       const current = await readRegistry()
-      const run: TrainingRun & { outputRoot: string } = {
+      const run: TrainingRun & {
+        outputRoot: string
+        candidateBinding: {
+          artifactId: string
+          bundleRoot: string
+          taskView: string
+          catalogRoot: string
+        }
+      } = {
         runId,
         taskViewId: task.taskViewId,
         pipelineId: options.pipelineId,
-        checkpointCount: Number(result.checkpoint_count ?? 0),
-        deployable: Boolean(result.deployable),
-        checkpointManifestHash: String(result.checkpoint_manifest_hash ?? ''),
+        checkpointCount: inspection.components.length,
+        deployable: inspection.deploymentStatus === 'ready',
+        checkpointManifestHash: inspection.manifestSha256,
+        artifactId: inspection.artifactId,
         createdAt: new Date().toISOString(),
-        outputRoot
+        outputRoot,
+        candidateBinding: {
+          artifactId: inspection.artifactId,
+          bundleRoot: outputRoot,
+          taskView: task.taskRoot,
+          catalogRoot: task.catalogRoot
+        }
       }
       current.runs = [...current.runs.filter((entry) => entry.runId !== runId), run]
       await writeRegistry(current)
-      return { runId, checkpointCount: run.checkpointCount, deployable: run.deployable }
+      return {
+        runId,
+        artifactId: run.artifactId,
+        checkpointCount: run.checkpointCount,
+        deployable: run.deployable
+      }
     },
     runId
   )
