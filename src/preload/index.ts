@@ -404,6 +404,7 @@ const api = {
         | Record<string, unknown>
         | (StrumPromotionJobResult & {
             promotionId: string
+            candidateArtifactId: string
             artifactId?: string
             deploymentStatus?: 'ready' | 'not_deployable'
           })
@@ -431,6 +432,7 @@ const api = {
           | Record<string, unknown>
           | (StrumPromotionJobResult & {
               promotionId: string
+              candidateArtifactId: string
               artifactId?: string
               deploymentStatus?: 'ready' | 'not_deployable'
             })
