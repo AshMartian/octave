@@ -62,6 +62,7 @@ export type TrainingPromotionJob = StrumPromotionJobDescriptor
 export type TrainingPromotionResult = StrumPromotionJobResult & {
   /** Opaque OCTAVE identity for chaining private evidence between jobs. */
   promotionId: string
+  candidateArtifactId: string
   /** Present only after OCTAVE re-inspects a packaged model bundle. */
   artifactId?: string
   deploymentStatus?: DiscoveredCheckpoint['deploymentStatus']
@@ -1409,7 +1410,8 @@ function normalizePromotionResult(
   value: unknown,
   pipelineId: string,
   job: TrainingPromotionJob,
-  promotionId: string
+  promotionId: string,
+  candidateArtifactId: string
 ): TrainingPromotionResult | null {
   if (
     !isRecord(value) ||
@@ -1444,7 +1446,8 @@ function normalizePromotionResult(
     output_kind: job.output_kind,
     deployment_scope: job.deployment_scope,
     result,
-    promotionId
+    promotionId,
+    candidateArtifactId
   }
 }
 
@@ -1631,7 +1634,13 @@ export async function startPromotionJob(options: {
     jobId
   )
   await startJsonEventJob(jobId, ['promotion', 'start'], request, async (result) => {
-    const normalized = normalizePromotionResult(result, run.pipelineId, job, `promotion-${jobId}`)
+    const normalized = normalizePromotionResult(
+      result,
+      run.pipelineId,
+      job,
+      `promotion-${jobId}`,
+      options.candidateArtifactId
+    )
     if (!normalized) throw new Error('STRUM returned an invalid post-training result.')
     const packagedInspection =
       job.kind === 'package'
