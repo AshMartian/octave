@@ -321,7 +321,13 @@ interface ChartEditorAPI {
         | 'cancelled'
       code?: string
       message: string
-      result?: Record<string, unknown> | (StrumPromotionJobResult & { promotionId: string })
+      result?:
+        | Record<string, unknown>
+        | (StrumPromotionJobResult & {
+            promotionId: string
+            artifactId?: string
+            deploymentStatus?: 'ready' | 'not_deployable'
+          })
     }) => void
   ) => () => void
   openLyricsFileDialog: () => Promise<{ filePath: string; content: string } | null>

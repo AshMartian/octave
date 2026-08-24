@@ -62,6 +62,9 @@ export type TrainingPromotionJob = StrumPromotionJobDescriptor
 export type TrainingPromotionResult = StrumPromotionJobResult & {
   /** Opaque OCTAVE identity for chaining private evidence between jobs. */
   promotionId: string
+  /** Present only after OCTAVE re-inspects a packaged model bundle. */
+  artifactId?: string
+  deploymentStatus?: DiscoveredCheckpoint['deploymentStatus']
 }
 
 export type TrainingRuntime = {
@@ -1617,6 +1620,15 @@ export async function startPromotionJob(options: {
   await startJsonEventJob(jobId, ['promotion', 'start'], request, async (result) => {
     const normalized = normalizePromotionResult(result, run.pipelineId, job, `promotion-${jobId}`)
     if (!normalized) throw new Error('STRUM returned an invalid post-training result.')
+    const packagedInspection =
+      job.kind === 'package'
+        ? normalizeDiscoveredCheckpoint(
+            await runWorkerJson(['checkpoint', 'inspect', '--model-root', outputRoot, '--json'])
+          )
+        : null
+    if (job.kind === 'package' && !packagedInspection) {
+      throw new Error('STRUM could not re-inspect the packaged model bundle.')
+    }
     const registry = await readRegistry()
     const stored: StoredPromotion = {
       ...normalized,
@@ -1629,7 +1641,13 @@ export async function startPromotionJob(options: {
       stored
     ]
     await writeRegistry(registry)
-    return normalized
+    if (!packagedInspection) return normalized
+    discoveredCheckpointRoots.set(packagedInspection.artifactId, outputRoot)
+    return {
+      ...normalized,
+      artifactId: packagedInspection.artifactId,
+      deploymentStatus: packagedInspection.deploymentStatus
+    }
   })
   return { jobId }
 }
