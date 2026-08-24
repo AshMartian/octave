@@ -250,4 +250,15 @@ inventory-limit hits. This identifies a sufficient *review pool* for a
 consent-controlled, MIDI-only Vocal catalog expansion. It remains inventory
 evidence—not automatic approval, materialization, training, or deployment.
 
+**2026-08-24 approved Vocal expansion result:** After explicit approval through
+the snapshot-bound per-chart bridge, all 143 canonical-Vocal candidates
+deduplicated against the inherited catalog by exact `notes.mid` hash. The
+atomically published `octave-smb-approved-vocal-expansion-20260824` revision
+therefore remains at 212 allowed records and adds zero records; no source data
+was overwritten. All four Vocal pipelines inspect and prepare successfully
+with the same 18 eligible records and a 13 / 3 / 2 Train / Validation / Test
+partition. The current limitation is now verified coverage and audio/difficulty
+quality—not catalog import mechanics. New approved source material with enough
+Expert Vocal coverage is required to reach the 40 / 10 / 10 Lead-Vocal gate.
+
 Every delivery needs shared protocol fixtures and a real-catalog smoke test. Integration tests must prove that no original source path crosses into a task view, experiment/checkpoint manifest, renderer payload, progress event, log, or user-visible error.
