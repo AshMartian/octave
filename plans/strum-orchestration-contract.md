@@ -229,4 +229,15 @@ claims.
 For the learned Expert-to-Hard transform, the explicit Guitar/Bass/Keys/Drums
 selections resolve 138 / 139 / 21 / 199 catalog chart pairs respectively.
 
+**2026-08-24 bounded source-inventory sample:** A real five-minute,
+read-only pass over the mounted 280-package SMB group settled 198 packages
+(196 completed: 195 readable and one rejected; two timed out). Among the
+readable completed packages it found 144 MIDI-backed charts, 49 chart-only
+packages, and 95 with an exact canonical `PART VOCALS` track; no duplicate
+MIDI/container identities were reported in that completed subset. This is a
+lower bound only because the job returned `cancelled: true` at its deadline.
+Chart-only packages are not Vocal-label candidates under the current
+MIDI-first contract. The next catalog expansion pass must use only reviewed,
+MIDI-backed sources and preserve the existing rights/consent boundary.
+
 Every delivery needs shared protocol fixtures and a real-catalog smoke test. Integration tests must prove that no original source path crosses into a task view, experiment/checkpoint manifest, renderer payload, progress event, log, or user-visible error.
