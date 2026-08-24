@@ -69,10 +69,13 @@ import {
   type SongSourceCatalogWriteMode
 } from './import/sngTrainingExporter'
 import {
-  inventoryDatasetPackageSources,
-  MAX_DATASET_PACKAGE_INVENTORY_DEADLINE_MS
+  getDatasetPackageInventorySessionResult,
+  isDatasetPackageInventorySessionComplete,
+  MAX_DATASET_PACKAGE_INVENTORY_DEADLINE_MS,
+  runDatasetPackageInventorySession
 } from './import/packageSourceInventory'
 import { discoverDatasetPackageSources } from './import/packageSourceDiscovery'
+import { PackageInventoryCursorStore } from './import/packageInventoryCursor'
 import {
   ImportCancelledError,
   PartialImportError,
@@ -143,6 +146,7 @@ const datasetPackageCandidateGroups = new Map<string, string>()
 const completedDatasetPackageInventories = new Set<string>()
 const datasetPackageDiscoveryControllers = new Map<number, AbortController>()
 const datasetPackageInventoryControllers = new Map<string, AbortController>()
+const datasetPackageInventoryCursors = new PackageInventoryCursorStore()
 const datasetCatalogParents = new Map<string, string>()
 const approvedDatasetPackageIds = new Set<string>()
 const DATASET_CATALOG_PARENT_KEY = 'dataset-catalog-parent.json'
@@ -961,8 +965,10 @@ ipcMain.handle(
       datasetPackageCandidateGroups.delete(candidateId)
     }
     if (groupId) {
+      datasetPackageInventoryControllers.get(groupId)?.abort()
       datasetPackageGroups.delete(groupId)
       completedDatasetPackageInventories.delete(groupId)
+      datasetPackageInventoryCursors.clearGroup(groupId)
       return
     }
     // Compatibility path for callers from an older preload: only forget a
@@ -974,45 +980,81 @@ ipcMain.handle(
             candidate.sourcePath === source.sourcePath && candidate.kind === source.kind
         )
       )
-      if (!stillReferenced) datasetPackageGroups.delete(knownGroupId)
+      if (!stillReferenced) {
+        datasetPackageInventoryControllers.get(knownGroupId)?.abort()
+        datasetPackageGroups.delete(knownGroupId)
+        completedDatasetPackageInventories.delete(knownGroupId)
+        datasetPackageInventoryCursors.clearGroup(knownGroupId)
+      }
     }
   }
 )
 
-ipcMain.handle('dataset:inspectPackageGroup', async (_event, groupId: string) => {
-  const sources = datasetPackageGroups.get(groupId)
-  if (!sources || datasetPackageInventoryControllers.has(groupId)) return null
-  const controller = new AbortController()
-  datasetPackageInventoryControllers.set(groupId, controller)
-  const abort = (): void => controller.abort()
-  _event.sender.once('destroyed', abort)
-  try {
-    const inventory = await inventoryDatasetPackageSources(sources, {
-      signal: controller.signal,
-      deadlineMs: MAX_DATASET_PACKAGE_INVENTORY_DEADLINE_MS,
-      onProgress: (progress) => {
-        // This event intentionally contains only aggregate counts. The
-        // renderer already owns the active opaque group; locations, source
-        // identifiers, entry names, hashes, buffers, and errors remain main/
-        // worker-local.
-        if (!_event.sender.isDestroyed()) {
-          _event.sender.send('dataset:packageInventoryProgress', progress)
+ipcMain.handle(
+  'dataset:inspectPackageGroup',
+  async (_event, groupId: string, resumeCursor?: string) => {
+    const sources = datasetPackageGroups.get(groupId)
+    if (!sources || datasetPackageInventoryControllers.has(groupId)) return null
+    const cursorResolution = resumeCursor
+      ? datasetPackageInventoryCursors.resume(groupId, sources, resumeCursor)
+      : null
+    if (cursorResolution?.cursorRejected) {
+      // A token never selects a path. An absent, cross-group, or stale token is
+      // rejected generically and the renderer can start a fresh bounded run.
+      return { inventory: null, resumeCursor: null, cursorRejected: true }
+    }
+    const started = cursorResolution
+      ? { cursor: resumeCursor as string, session: cursorResolution.session }
+      : datasetPackageInventoryCursors.begin(groupId, sources)
+    if (!started.session) return { inventory: null, resumeCursor: null, cursorRejected: true }
+    const controller = new AbortController()
+    datasetPackageInventoryControllers.set(groupId, controller)
+    const abort = (): void => controller.abort()
+    _event.sender.once('destroyed', abort)
+    try {
+      const inventory = await runDatasetPackageInventorySession(started.session, {
+        signal: controller.signal,
+        deadlineMs: MAX_DATASET_PACKAGE_INVENTORY_DEADLINE_MS,
+        onProgress: (progress) => {
+          // This event intentionally contains only aggregate counts. The
+          // renderer already owns the active opaque group; locations, source
+          // identifiers, entry names, hashes, buffers, and errors remain main/
+          // worker-local.
+          if (!_event.sender.isDestroyed()) {
+            _event.sender.send('dataset:packageInventoryProgress', progress)
+          }
+        }
+      })
+      // Group removal revokes both its cursor and active controller. Do not
+      // resurrect a removed group by writing completion state or returning a
+      // resume capability after its in-flight worker settles.
+      if (datasetPackageGroups.get(groupId) !== sources) {
+        datasetPackageInventoryCursors.complete(started.cursor)
+        return null
+      }
+      if (isDatasetPackageInventorySessionComplete(started.session)) {
+        datasetPackageInventoryCursors.complete(started.cursor)
+        completedDatasetPackageInventories.add(groupId)
+        return {
+          inventory: getDatasetPackageInventorySessionResult(started.session),
+          resumeCursor: null,
+          cursorRejected: false
         }
       }
-    })
-    if (!inventory.cancelled) completedDatasetPackageInventories.add(groupId)
-    return inventory
-  } catch {
-    // The service is already aggregate-only. Keep IPC failures generic so a
-    // renderer never receives source paths or parser error details.
-    return null
-  } finally {
-    _event.sender.removeListener('destroyed', abort)
-    if (datasetPackageInventoryControllers.get(groupId) === controller) {
-      datasetPackageInventoryControllers.delete(groupId)
+      return { inventory, resumeCursor: started.cursor, cursorRejected: false }
+    } catch {
+      // The service is already aggregate-only. Keep IPC failures generic so a
+      // renderer never receives source paths or parser error details.
+      datasetPackageInventoryCursors.complete(started.cursor)
+      return null
+    } finally {
+      _event.sender.removeListener('destroyed', abort)
+      if (datasetPackageInventoryControllers.get(groupId) === controller) {
+        datasetPackageInventoryControllers.delete(groupId)
+      }
     }
   }
-})
+)
 
 ipcMain.handle('dataset:cancelPackageInventory', (_event, groupId: string) => {
   const controller = datasetPackageInventoryControllers.get(groupId)

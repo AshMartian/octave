@@ -78,6 +78,8 @@ type PackageGroup = {
   directoryLimitReached: boolean
   candidates: PackageCandidate[]
   inventory?: PackageInventory
+  /** Opaque main-owned token returned only for a partial inventory. */
+  resumeCursor?: string
 }
 
 type TrainingRuntime = {
@@ -1104,10 +1106,27 @@ export function TrainingModal({
     })
     setError(null)
     try {
-      const inventory = await window.api.inspectDatasetPackageGroup(group.groupId)
+      const response = await window.api.inspectDatasetPackageGroup(
+        group.groupId,
+        group.resumeCursor
+      )
+      if (!response) throw new Error('Package inventory unavailable')
+      if (response.cursorRejected) {
+        setPackageGroups((current) =>
+          current.map((entry) =>
+            entry.groupId === group.groupId ? { ...entry, resumeCursor: undefined } : entry
+          )
+        )
+        setError('The previous inventory cursor is no longer valid. Start a new inventory.')
+        return
+      }
+      const inventory = response.inventory
       if (!inventory) throw new Error('Package inventory unavailable')
+      const resumeCursor = response.resumeCursor ?? undefined
       setPackageGroups((current) =>
-        current.map((entry) => (entry.groupId === group.groupId ? { ...entry, inventory } : entry))
+        current.map((entry) =>
+          entry.groupId === group.groupId ? { ...entry, inventory, resumeCursor } : entry
+        )
       )
     } catch {
       setError('Could not inventory the selected package sources.')
@@ -2042,7 +2061,9 @@ export function TrainingModal({
                           >
                             {inventoryingGroupId === group.groupId
                               ? 'Cancel inventory'
-                              : 'Inventory'}
+                              : group.resumeCursor
+                                ? 'Resume inventory'
+                                : 'Inventory'}
                           </button>
                           <button
                             onClick={() => void removePackageGroup(group)}
@@ -2073,8 +2094,8 @@ export function TrainingModal({
                       {inventoryingGroupId === group.groupId && (
                         <p className="dataset-package-inventory" aria-live="polite">
                           Inventorying — {inventoryProgress?.processedPackageCount ?? 0}/{' '}
-                          {inventoryProgress?.totalPackageCount ?? group.candidates.length}{' '}
-                          settled · {inventoryProgress?.completedPackageCount ?? 0} completed
+                          {inventoryProgress?.totalPackageCount ?? group.candidates.length} settled
+                          · {inventoryProgress?.completedPackageCount ?? 0} completed
                         </p>
                       )}
                       {group.candidates.map((entry) => renderCandidate(entry, true))}

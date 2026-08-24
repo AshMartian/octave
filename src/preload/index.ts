@@ -70,26 +70,32 @@ const api = {
     ipcRenderer.invoke('dataset:removePackageGroup', candidateIds, groupId),
 
   inspectDatasetPackageGroup: (
-    groupId: string
+    groupId: string,
+    resumeCursor?: string
   ): Promise<{
-    selectedPackageCount: number
-    inspectedPackageCount: number
-    packageLimitReachedCount: number
-    cancelled: boolean
-    readablePackageCount: number
-    readableHeaderCount: number
-    unreadablePackageCount: number
-    inspectedChartCount: number
-    validNotesMidiCount: number
-    invalidOrMissingNotesMidiCount: number
-    chartOnlyCount: number
-    exactExpertPartVocalsCount: number
-    duplicateMidiCount: number
-    duplicateContainerCount: number
-    containerIdentityUnavailableCount: number
-    decodeTimeoutCount: number
-    decodeFailureCount: number
-  } | null> => ipcRenderer.invoke('dataset:inspectPackageGroup', groupId),
+    inventory: {
+      selectedPackageCount: number
+      inspectedPackageCount: number
+      packageLimitReachedCount: number
+      cancelled: boolean
+      readablePackageCount: number
+      readableHeaderCount: number
+      unreadablePackageCount: number
+      inspectedChartCount: number
+      validNotesMidiCount: number
+      invalidOrMissingNotesMidiCount: number
+      chartOnlyCount: number
+      exactExpertPartVocalsCount: number
+      duplicateMidiCount: number
+      duplicateContainerCount: number
+      containerIdentityUnavailableCount: number
+      decodeTimeoutCount: number
+      decodeFailureCount: number
+    } | null
+    /** Opaque main-owned resume capability, not a source identifier. */
+    resumeCursor: string | null
+    cursorRejected: boolean
+  } | null> => ipcRenderer.invoke('dataset:inspectPackageGroup', groupId, resumeCursor),
 
   cancelDatasetPackageInventory: (groupId: string): Promise<boolean> =>
     ipcRenderer.invoke('dataset:cancelPackageInventory', groupId),

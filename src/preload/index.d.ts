@@ -51,24 +51,31 @@ interface ChartEditorAPI {
   } | null>
   cancelDatasetPackageDiscovery: () => Promise<boolean>
   removeDatasetPackageGroup: (candidateIds: string[], groupId?: string) => Promise<void>
-  inspectDatasetPackageGroup: (groupId: string) => Promise<{
-    selectedPackageCount: number
-    inspectedPackageCount: number
-    packageLimitReachedCount: number
-    cancelled: boolean
-    readablePackageCount: number
-    readableHeaderCount: number
-    unreadablePackageCount: number
-    inspectedChartCount: number
-    validNotesMidiCount: number
-    invalidOrMissingNotesMidiCount: number
-    chartOnlyCount: number
-    exactExpertPartVocalsCount: number
-    duplicateMidiCount: number
-    duplicateContainerCount: number
-    containerIdentityUnavailableCount: number
-    decodeTimeoutCount: number
-    decodeFailureCount: number
+  inspectDatasetPackageGroup: (
+    groupId: string,
+    resumeCursor?: string
+  ) => Promise<{
+    inventory: {
+      selectedPackageCount: number
+      inspectedPackageCount: number
+      packageLimitReachedCount: number
+      cancelled: boolean
+      readablePackageCount: number
+      readableHeaderCount: number
+      unreadablePackageCount: number
+      inspectedChartCount: number
+      validNotesMidiCount: number
+      invalidOrMissingNotesMidiCount: number
+      chartOnlyCount: number
+      exactExpertPartVocalsCount: number
+      duplicateMidiCount: number
+      duplicateContainerCount: number
+      containerIdentityUnavailableCount: number
+      decodeTimeoutCount: number
+      decodeFailureCount: number
+    } | null
+    resumeCursor: string | null
+    cursorRejected: boolean
   } | null>
   cancelDatasetPackageInventory: (groupId: string) => Promise<boolean>
   onDatasetPackageInventoryProgress: (

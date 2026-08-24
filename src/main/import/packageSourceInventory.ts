@@ -118,6 +118,28 @@ export interface DatasetPackageInventoryProgress {
   totalPackageCount: number
 }
 
+/**
+ * Main-process-only resumable state. It is deliberately opaque: MIDI and
+ * container hashes, source locations, and the next package remain private to
+ * the process that created it and cannot be reconstructed by a renderer.
+ */
+export interface DatasetPackageInventorySession {
+  readonly __opaqueDatasetPackageInventorySession?: never
+}
+
+interface DatasetPackageInventorySessionState {
+  sources: readonly DatasetCatalogSource[]
+  inventory: DatasetPackageSourceInventory
+  midiHashes: Set<string>
+  containerHashes: Set<string>
+  nextSourceIndex: number
+}
+
+const inventorySessionStates = new WeakMap<
+  DatasetPackageInventorySession,
+  DatasetPackageInventorySessionState
+>()
+
 export interface InventorySnapshotOptions {
   /** Test seam for validating descriptor identity across a path replacement. */
   afterOpen?: () => Promise<void>
@@ -159,6 +181,48 @@ function emptyInventory(selectedPackageCount: number): DatasetPackageSourceInven
     decodeTimeoutCount: 0,
     decodeFailureCount: 0
   }
+}
+
+/** Starts a main-owned bounded inventory session that may be resumed later. */
+export function createDatasetPackageInventorySession(
+  sources: readonly DatasetCatalogSource[]
+): DatasetPackageInventorySession {
+  const boundedSources = sources
+    .slice(0, MAX_PACKAGE_COUNT)
+    .map((source) => ({ kind: source.kind, sourcePath: source.sourcePath }))
+  const inventory = emptyInventory(sources.length)
+  inventory.packageLimitReachedCount = sources.length - boundedSources.length
+  const session = Object.freeze({}) as DatasetPackageInventorySession
+  inventorySessionStates.set(session, {
+    sources: boundedSources,
+    inventory,
+    midiHashes: new Set<string>(),
+    containerHashes: new Set<string>(),
+    nextSourceIndex: 0
+  })
+  return session
+}
+
+function sessionState(
+  session: DatasetPackageInventorySession
+): DatasetPackageInventorySessionState {
+  const state = inventorySessionStates.get(session)
+  if (!state) throw new Error('Unknown package inventory session.')
+  return state
+}
+
+/** Returns only the renderer-safe aggregate snapshot for a main-owned session. */
+export function getDatasetPackageInventorySessionResult(
+  session: DatasetPackageInventorySession
+): DatasetPackageSourceInventory {
+  return { ...sessionState(session).inventory }
+}
+
+export function isDatasetPackageInventorySessionComplete(
+  session: DatasetPackageInventorySession
+): boolean {
+  const state = sessionState(session)
+  return state.nextSourceIndex >= state.sources.length
 }
 
 function normalizedEntryName(value: string): string {
@@ -648,27 +712,24 @@ function isTimeout(error: unknown): boolean {
 }
 
 /**
- * Inspect main-process package sources without producing catalog candidates.
- * The returned object is aggregate-only: no locations, entry names, metadata,
- * hashes, errors, or opaque IDs are present in this renderer-safe result.
+ * Runs the next bounded segment of a main-owned session. Its result and
+ * progress are aggregate-only; the state that enables resumption never leaves
+ * main and is rejected if an unknown session is supplied.
  */
-export async function inventoryDatasetPackageSources(
-  sources: readonly DatasetCatalogSource[],
+export async function runDatasetPackageInventorySession(
+  session: DatasetPackageInventorySession,
   options: DatasetPackageInventoryOptions = {}
 ): Promise<DatasetPackageSourceInventory> {
-  const inventory = emptyInventory(sources.length)
-  const midiHashes = new Set<string>()
-  const containerHashes = new Set<string>()
-  const boundedSources = sources.slice(0, MAX_PACKAGE_COUNT)
-  inventory.packageLimitReachedCount = sources.length - boundedSources.length
+  const state = sessionState(session)
+  const { inventory } = state
+  inventory.cancelled = false
   const controller = new AbortController()
-  let processedPackageCount = 0
   const publishProgress = (): void => {
     try {
       options.onProgress?.({
-        processedPackageCount,
+        processedPackageCount: state.nextSourceIndex,
         completedPackageCount: inventory.inspectedPackageCount,
-        totalPackageCount: boundedSources.length
+        totalPackageCount: state.sources.length
       })
     } catch {
       // Progress delivery must not turn a safe aggregate inventory into a
@@ -690,11 +751,12 @@ export async function inventoryDatasetPackageSources(
   if (options.signal?.aborted) controller.abort()
   else options.signal?.addEventListener('abort', abort, { once: true })
   publishProgress()
-  for (const source of boundedSources) {
+  for (; state.nextSourceIndex < state.sources.length; ) {
     if (controller.signal.aborted) {
       inventory.cancelled = true
       break
     }
+    const source = state.sources[state.nextSourceIndex]
     try {
       const isolated = await (options.inspectInIsolation ?? inspectInWorker)(
         source,
@@ -717,8 +779,8 @@ export async function inventoryDatasetPackageSources(
       // A failed/unavailable identity contributes exactly once. It is not a
       // decode failure and must not be double-counted after the worker returns.
       if (containerHash === null) inventory.containerIdentityUnavailableCount += 1
-      else if (containerHashes.has(containerHash)) inventory.duplicateContainerCount += 1
-      else containerHashes.add(containerHash)
+      else if (state.containerHashes.has(containerHash)) inventory.duplicateContainerCount += 1
+      else state.containerHashes.add(containerHash)
 
       const inspected = isolated.inspection
       if (inspected.headerReadable) inventory.readableHeaderCount += 1
@@ -731,8 +793,9 @@ export async function inventoryDatasetPackageSources(
         }
         inventory.validNotesMidiCount += 1
         if (chart.exactExpertPartVocals) inventory.exactExpertPartVocalsCount += 1
-        if (chart.midiHash && midiHashes.has(chart.midiHash)) inventory.duplicateMidiCount += 1
-        else if (chart.midiHash) midiHashes.add(chart.midiHash)
+        if (chart.midiHash && state.midiHashes.has(chart.midiHash))
+          inventory.duplicateMidiCount += 1
+        else if (chart.midiHash) state.midiHashes.add(chart.midiHash)
       }
     } catch (error) {
       // Terminated work never produced a completed package result, so it must
@@ -744,7 +807,7 @@ export async function inventoryDatasetPackageSources(
       // A cancellation terminates the in-flight worker. It must not be shown
       // as processed or completed because it has no stable aggregate result.
       if (!controller.signal.aborted) {
-        processedPackageCount += 1
+        state.nextSourceIndex += 1
         publishProgress()
       }
     }
@@ -752,5 +815,19 @@ export async function inventoryDatasetPackageSources(
   if (controller.signal.aborted) inventory.cancelled = true
   clearTimeout(deadline)
   options.signal?.removeEventListener('abort', abort)
-  return inventory
+  return { ...inventory }
+}
+
+/**
+ * One-shot compatibility entry point. Resumable callers retain the opaque
+ * session above; this function still returns only the final aggregate.
+ */
+export async function inventoryDatasetPackageSources(
+  sources: readonly DatasetCatalogSource[],
+  options: DatasetPackageInventoryOptions = {}
+): Promise<DatasetPackageSourceInventory> {
+  return await runDatasetPackageInventorySession(
+    createDatasetPackageInventorySession(sources),
+    options
+  )
 }
