@@ -71,6 +71,13 @@ interface ChartEditorAPI {
     decodeFailureCount: number
   } | null>
   cancelDatasetPackageInventory: (groupId: string) => Promise<boolean>
+  onDatasetPackageInventoryProgress: (
+    callback: (progress: {
+      processedPackageCount: number
+      completedPackageCount: number
+      totalPackageCount: number
+    }) => void
+  ) => () => void
   onDatasetScanProgress: (
     callback: (progress: {
       phase: 'discovering' | 'inspecting'

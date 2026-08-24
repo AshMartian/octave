@@ -221,6 +221,97 @@ describe('inventoryDatasetPackageSources', () => {
     }
   )
 
+  it('returns a completed-only partial aggregate when the inventory deadline expires', async () => {
+    const progress: Array<{
+      processedPackageCount: number
+      completedPackageCount: number
+      totalPackageCount: number
+    }> = []
+    let callCount = 0
+    const inventory = await inventoryDatasetPackageSources(
+      [
+        { kind: 'zip', sourcePath: join(testDir, 'deadline-first.zip') },
+        { kind: 'zip', sourcePath: join(testDir, 'deadline-inflight.zip') }
+      ],
+      {
+        deadlineMs: 20,
+        onProgress: (value) => progress.push(value),
+        inspectInIsolation: async (_source, signal) => {
+          callCount += 1
+          if (callCount === 1) {
+            return {
+              outcome: 'inspected',
+              containerHash: 'first',
+              inspection: { headerReadable: true, charts: [] }
+            }
+          }
+          return await new Promise<never>((_resolve, reject) => {
+            signal.addEventListener(
+              'abort',
+              () => reject(new Error('Package inventory cancelled.')),
+              { once: true }
+            )
+          })
+        }
+      }
+    )
+
+    expect(inventory).toMatchObject({
+      selectedPackageCount: 2,
+      inspectedPackageCount: 1,
+      readablePackageCount: 1,
+      unreadablePackageCount: 0,
+      decodeTimeoutCount: 0,
+      decodeFailureCount: 0,
+      cancelled: true
+    })
+    expect(progress).toEqual([
+      { processedPackageCount: 0, completedPackageCount: 0, totalPackageCount: 2 },
+      { processedPackageCount: 1, completedPackageCount: 1, totalPackageCount: 2 }
+    ])
+    const serialized = JSON.stringify({ inventory, progress })
+    expect(serialized).not.toContain('deadline-first')
+    expect(serialized).not.toContain('deadline-inflight')
+  })
+
+  it('returns partial progress and counters when the caller aborts after a completed worker', async () => {
+    const controller = new AbortController()
+    const progress: Array<{
+      processedPackageCount: number
+      completedPackageCount: number
+      totalPackageCount: number
+    }> = []
+    const inventory = await inventoryDatasetPackageSources(
+      [
+        { kind: 'zip', sourcePath: join(testDir, 'abort-first.zip') },
+        { kind: 'zip', sourcePath: join(testDir, 'abort-never-started.zip') }
+      ],
+      {
+        signal: controller.signal,
+        onProgress: (value) => {
+          progress.push(value)
+          if (value.completedPackageCount === 1) controller.abort()
+        },
+        inspectInIsolation: async () => ({
+          outcome: 'inspected',
+          containerHash: 'first',
+          inspection: { headerReadable: true, charts: [] }
+        })
+      }
+    )
+
+    expect(inventory).toMatchObject({
+      selectedPackageCount: 2,
+      inspectedPackageCount: 1,
+      readablePackageCount: 1,
+      cancelled: true
+    })
+    expect(progress).toEqual([
+      { processedPackageCount: 0, completedPackageCount: 0, totalPackageCount: 2 },
+      { processedPackageCount: 1, completedPackageCount: 1, totalPackageCount: 2 }
+    ])
+  })
+
   it('counts only completed worker rejections for SNG, ZIP, and RB3CON', async () => {
     const sources = await Promise.all(
       (['sng', 'zip', 'rb3con'] as const).map(async (kind) => {

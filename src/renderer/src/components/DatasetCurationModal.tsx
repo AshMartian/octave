@@ -583,6 +583,11 @@ export function TrainingModal({
   const [savingAutoChartProfile, setSavingAutoChartProfile] = useState(false)
   const [trainingJob, setTrainingJob] = useState<TrainingJob | null>(null)
   const [inventoryingGroupId, setInventoryingGroupId] = useState<string | null>(null)
+  const [inventoryProgress, setInventoryProgress] = useState<{
+    processedPackageCount: number
+    completedPackageCount: number
+    totalPackageCount: number
+  } | null>(null)
   const [prepareConfig, setPrepareConfig] = useState<Record<string, TrainingControlValue>>({})
   const [trainConfig, setTrainConfig] = useState<Record<string, TrainingControlValue>>({})
   const [promotionArtifactId, setPromotionArtifactId] = useState('')
@@ -744,9 +749,11 @@ export function TrainingModal({
   useEffect(() => {
     const unsubscribeScan = window.api.onDatasetScanProgress(setScanProgress)
     const unsubscribeSave = window.api.onDatasetSaveProgress(setSaveProgress)
+    const unsubscribeInventory = window.api.onDatasetPackageInventoryProgress(setInventoryProgress)
     return () => {
       unsubscribeScan()
       unsubscribeSave()
+      unsubscribeInventory()
     }
   }, [])
 
@@ -913,6 +920,15 @@ export function TrainingModal({
       })
       return
     }
+    if (inventoryingGroupId) {
+      onActivityChange({
+        step: 'curate',
+        phase: 'Inventorying source packages',
+        completed: inventoryProgress?.processedPackageCount ?? 0,
+        total: inventoryProgress?.totalPackageCount ?? 0
+      })
+      return
+    }
     if (exporting) {
       onActivityChange({
         step: 'curate',
@@ -932,7 +948,16 @@ export function TrainingModal({
       return
     }
     onActivityChange(null)
-  }, [exporting, onActivityChange, saveProgress, scanProgress, scanningPackages, trainingJob])
+  }, [
+    exporting,
+    inventoryingGroupId,
+    inventoryProgress,
+    onActivityChange,
+    saveProgress,
+    scanProgress,
+    scanningPackages,
+    trainingJob
+  ])
 
   useEffect(() => {
     if (!catalogParent || !selectedCatalog) {
@@ -1072,6 +1097,11 @@ export function TrainingModal({
 
   const inventoryPackageGroup = async (group: PackageGroup): Promise<void> => {
     setInventoryingGroupId(group.groupId)
+    setInventoryProgress({
+      processedPackageCount: 0,
+      completedPackageCount: 0,
+      totalPackageCount: group.candidates.length
+    })
     setError(null)
     try {
       const inventory = await window.api.inspectDatasetPackageGroup(group.groupId)
@@ -1083,6 +1113,7 @@ export function TrainingModal({
       setError('Could not inventory the selected package sources.')
     } finally {
       setInventoryingGroupId(null)
+      setInventoryProgress(null)
     }
   }
 
@@ -2033,10 +2064,17 @@ export function TrainingModal({
                           {group.inventory.exactExpertPartVocalsCount} exact Expert Vocals ·{' '}
                           {group.inventory.duplicateMidiCount} duplicate MIDI ·{' '}
                           {group.inventory.duplicateContainerCount} duplicate containers
-                          {group.inventory.cancelled ? ' · cancelled' : ''}
+                          {group.inventory.cancelled ? ' · cancelled; counts are partial' : ''}
                           {group.inventory.decodeTimeoutCount || group.inventory.decodeFailureCount
                             ? ` · ${group.inventory.decodeTimeoutCount} timed out · ${group.inventory.decodeFailureCount} failed`
                             : ''}
+                        </p>
+                      )}
+                      {inventoryingGroupId === group.groupId && (
+                        <p className="dataset-package-inventory" aria-live="polite">
+                          Inventorying — {inventoryProgress?.processedPackageCount ?? 0}/{' '}
+                          {inventoryProgress?.totalPackageCount ?? group.candidates.length}{' '}
+                          settled · {inventoryProgress?.completedPackageCount ?? 0} completed
                         </p>
                       )}
                       {group.candidates.map((entry) => renderCandidate(entry, true))}

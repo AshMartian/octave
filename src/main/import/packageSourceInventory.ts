@@ -21,6 +21,12 @@ const MAX_ZIP_EXTRACTED_CHART_BYTES = 128 * 1024 * 1024
 const MAX_PACKAGE_COUNT = 1_000
 const PACKAGE_TIMEOUT_MS = 15_000
 /**
+ * A package group can contain enough malformed or remote sources to make
+ * sequential worker timeouts impractical. Keep a normal UI inventory bounded
+ * and return its completed aggregate rather than relying on process shutdown.
+ */
+export const MAX_DATASET_PACKAGE_INVENTORY_DEADLINE_MS = 5 * 60 * 1_000
+/**
  * Inventory deliberately has a much lower cap than catalog materialization.
  * STFS parsing expands directory entries and used to buffer every embedded
  * asset; accepting a two-gigabyte package here is neither useful nor safe.
@@ -87,11 +93,29 @@ type IsolatedPackageResult = IsolatedPackageInspection | RejectedPackageInspecti
 export interface DatasetPackageInventoryOptions {
   /** Ends queued/current work without exposing source-specific failure detail. */
   signal?: AbortSignal
+  /**
+   * Maximum wall-clock time for this aggregate-only inventory. Values are
+   * clamped to the normal UI-job bound; expiry returns `cancelled: true` with
+   * only completed worker results represented in the counters.
+   */
+  deadlineMs?: number
+  /**
+   * Aggregate-only progress for a caller's own selected group. `processed`
+   * includes settled timeouts/rejections; `completed` is strictly a worker
+   * result and therefore matches `inspectedPackageCount`.
+   */
+  onProgress?: (progress: DatasetPackageInventoryProgress) => void
   /** Test and integration hook; production uses the worker isolation below. */
   inspectInIsolation?: (
     source: DatasetCatalogSource,
     signal: AbortSignal
   ) => Promise<IsolatedPackageResult>
+}
+
+export interface DatasetPackageInventoryProgress {
+  processedPackageCount: number
+  completedPackageCount: number
+  totalPackageCount: number
 }
 
 export interface InventorySnapshotOptions {
@@ -638,9 +662,34 @@ export async function inventoryDatasetPackageSources(
   const boundedSources = sources.slice(0, MAX_PACKAGE_COUNT)
   inventory.packageLimitReachedCount = sources.length - boundedSources.length
   const controller = new AbortController()
+  let processedPackageCount = 0
+  const publishProgress = (): void => {
+    try {
+      options.onProgress?.({
+        processedPackageCount,
+        completedPackageCount: inventory.inspectedPackageCount,
+        totalPackageCount: boundedSources.length
+      })
+    } catch {
+      // Progress delivery must not turn a safe aggregate inventory into a
+      // source-specific failure. The caller receives the final result below.
+    }
+  }
   const abort = (): void => controller.abort()
+  const requestedDeadlineMs = options.deadlineMs ?? MAX_DATASET_PACKAGE_INVENTORY_DEADLINE_MS
+  const deadlineMs = Math.max(
+    1,
+    Math.min(
+      Number.isFinite(requestedDeadlineMs)
+        ? Math.floor(requestedDeadlineMs)
+        : MAX_DATASET_PACKAGE_INVENTORY_DEADLINE_MS,
+      MAX_DATASET_PACKAGE_INVENTORY_DEADLINE_MS
+    )
+  )
+  const deadline = setTimeout(abort, deadlineMs)
   if (options.signal?.aborted) controller.abort()
   else options.signal?.addEventListener('abort', abort, { once: true })
+  publishProgress()
   for (const source of boundedSources) {
     if (controller.signal.aborted) {
       inventory.cancelled = true
@@ -691,9 +740,17 @@ export async function inventoryDatasetPackageSources(
       if (isTimeout(error)) {
         inventory.decodeTimeoutCount += 1
       }
+    } finally {
+      // A cancellation terminates the in-flight worker. It must not be shown
+      // as processed or completed because it has no stable aggregate result.
+      if (!controller.signal.aborted) {
+        processedPackageCount += 1
+        publishProgress()
+      }
     }
   }
   if (controller.signal.aborted) inventory.cancelled = true
+  clearTimeout(deadline)
   options.signal?.removeEventListener('abort', abort)
   return inventory
 }

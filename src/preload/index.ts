@@ -94,6 +94,25 @@ const api = {
   cancelDatasetPackageInventory: (groupId: string): Promise<boolean> =>
     ipcRenderer.invoke('dataset:cancelPackageInventory', groupId),
 
+  onDatasetPackageInventoryProgress: (
+    callback: (progress: {
+      processedPackageCount: number
+      completedPackageCount: number
+      totalPackageCount: number
+    }) => void
+  ): (() => void) => {
+    const listener = (
+      _event: Electron.IpcRendererEvent,
+      progress: {
+        processedPackageCount: number
+        completedPackageCount: number
+        totalPackageCount: number
+      }
+    ): void => callback(progress)
+    ipcRenderer.on('dataset:packageInventoryProgress', listener)
+    return () => ipcRenderer.removeListener('dataset:packageInventoryProgress', listener)
+  },
+
   onDatasetScanProgress: (
     callback: (progress: {
       phase: 'discovering' | 'inspecting'

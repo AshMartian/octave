@@ -68,7 +68,10 @@ import {
   type DatasetSourceSummary,
   type SongSourceCatalogWriteMode
 } from './import/sngTrainingExporter'
-import { inventoryDatasetPackageSources } from './import/packageSourceInventory'
+import {
+  inventoryDatasetPackageSources,
+  MAX_DATASET_PACKAGE_INVENTORY_DEADLINE_MS
+} from './import/packageSourceInventory'
 import { discoverDatasetPackageSources } from './import/packageSourceDiscovery'
 import {
   ImportCancelledError,
@@ -978,11 +981,25 @@ ipcMain.handle(
 
 ipcMain.handle('dataset:inspectPackageGroup', async (_event, groupId: string) => {
   const sources = datasetPackageGroups.get(groupId)
-  if (!sources) return null
+  if (!sources || datasetPackageInventoryControllers.has(groupId)) return null
   const controller = new AbortController()
   datasetPackageInventoryControllers.set(groupId, controller)
+  const abort = (): void => controller.abort()
+  _event.sender.once('destroyed', abort)
   try {
-    const inventory = await inventoryDatasetPackageSources(sources, { signal: controller.signal })
+    const inventory = await inventoryDatasetPackageSources(sources, {
+      signal: controller.signal,
+      deadlineMs: MAX_DATASET_PACKAGE_INVENTORY_DEADLINE_MS,
+      onProgress: (progress) => {
+        // This event intentionally contains only aggregate counts. The
+        // renderer already owns the active opaque group; locations, source
+        // identifiers, entry names, hashes, buffers, and errors remain main/
+        // worker-local.
+        if (!_event.sender.isDestroyed()) {
+          _event.sender.send('dataset:packageInventoryProgress', progress)
+        }
+      }
+    })
     if (!inventory.cancelled) completedDatasetPackageInventories.add(groupId)
     return inventory
   } catch {
@@ -990,7 +1007,10 @@ ipcMain.handle('dataset:inspectPackageGroup', async (_event, groupId: string) =>
     // renderer never receives source paths or parser error details.
     return null
   } finally {
-    datasetPackageInventoryControllers.delete(groupId)
+    _event.sender.removeListener('destroyed', abort)
+    if (datasetPackageInventoryControllers.get(groupId) === controller) {
+      datasetPackageInventoryControllers.delete(groupId)
+    }
   }
 })
 
