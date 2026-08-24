@@ -1,4 +1,5 @@
 import { createHash } from 'crypto'
+import { constants } from 'fs'
 import { open } from 'fs/promises'
 import { join } from 'path'
 import { Readable } from 'stream'
@@ -15,6 +16,8 @@ const NOTES_CHART = 'notes.chart'
 const MAX_MIDI_BYTES = 64 * 1024 * 1024
 const MAX_ZIP_ENTRIES = 2_000
 const MAX_ZIP_ENTRY_BYTES = 64 * 1024 * 1024
+const MAX_ZIP_CHART_COUNT = 256
+const MAX_ZIP_EXTRACTED_CHART_BYTES = 128 * 1024 * 1024
 const MAX_PACKAGE_COUNT = 1_000
 const PACKAGE_TIMEOUT_MS = 15_000
 /**
@@ -56,9 +59,11 @@ export interface DatasetPackageSourceInventory {
 }
 
 export interface InventoryChart {
-  midi: Buffer | null
-  midiCount: number
+  validNotesMidi: boolean
   hasChart: boolean
+  exactExpertPartVocals: boolean
+  /** SHA-256 is aggregate-only bookkeeping and never crosses main/renderer IPC. */
+  midiHash: string | null
 }
 
 export interface PackageInspection {
@@ -92,6 +97,22 @@ export interface DatasetPackageInventoryOptions {
 export interface InventorySnapshotOptions {
   /** Test seam for validating descriptor identity across a path replacement. */
   afterOpen?: () => Promise<void>
+}
+
+interface RawInventoryChart {
+  midi: Buffer | null
+  midiCount: number
+  hasChart: boolean
+}
+
+interface RawPackageInspection {
+  headerReadable: boolean
+  charts: RawInventoryChart[]
+}
+
+interface ZipInventoryLimits {
+  maxChartCount: number
+  maxExtractedChartBytes: number
 }
 
 function emptyInventory(selectedPackageCount: number): DatasetPackageSourceInventory {
@@ -277,7 +298,20 @@ export async function readInventoryPackageSnapshot(
   filePath: string,
   options: InventorySnapshotOptions = {}
 ): Promise<Buffer> {
-  const handle = await open(filePath, 'r')
+  // A symlink may have been planted after bounded discovery. Require the
+  // kernel-level no-follow flag instead of resolving user-controlled paths.
+  const noFollow = constants.O_NOFOLLOW
+  const noBlock = constants.O_NONBLOCK
+  if (
+    !Number.isInteger(noFollow) ||
+    noFollow === 0 ||
+    !Number.isInteger(noBlock) ||
+    noBlock === 0
+  ) {
+    throw new Error('Secure package snapshots are unsupported on this runtime.')
+  }
+  // O_NONBLOCK avoids hanging on a FIFO/device before fstat rejects it.
+  const handle = await open(filePath, constants.O_RDONLY | noFollow | noBlock)
   try {
     await options.afterOpen?.()
     const info = await handle.stat()
@@ -299,7 +333,7 @@ export async function readInventoryPackageSnapshot(
   }
 }
 
-async function inspectSng(packageBytes: Buffer): Promise<PackageInspection> {
+async function inspectSng(packageBytes: Buffer): Promise<RawPackageInspection> {
   return await new Promise((resolve, reject) => {
     const input = Readable.from([packageBytes])
     let settled = false
@@ -392,11 +426,18 @@ async function inspectSng(packageBytes: Buffer): Promise<PackageInspection> {
   })
 }
 
-function inspectZip(packageBytes: Buffer): PackageInspection {
+function inspectZip(
+  packageBytes: Buffer,
+  limits: ZipInventoryLimits = {
+    maxChartCount: MAX_ZIP_CHART_COUNT,
+    maxExtractedChartBytes: MAX_ZIP_EXTRACTED_CHART_BYTES
+  }
+): RawPackageInspection {
   const archive = new AdmZip(packageBytes)
   const entries = archive.getEntries()
   if (entries.length > MAX_ZIP_ENTRIES) throw new Error('ZIP archive has too many entries.')
-  const charts = new Map<string, InventoryChart>()
+  const charts = new Map<string, RawInventoryChart>()
+  let extractedChartBytes = 0
   for (const entry of entries) {
     if (entry.isDirectory) continue
     const name = safeZipEntryName(entry.entryName)
@@ -411,10 +452,19 @@ function inspectZip(packageBytes: Buffer): PackageInspection {
     if (base !== NOTES_MIDI && base !== NOTES_CHART) continue
     const directory = entryDirectory(name)
     const chart = charts.get(directory) ?? { midi: null, midiCount: 0, hasChart: false }
+    if (!charts.has(directory) && charts.size >= limits.maxChartCount) {
+      throw new Error('ZIP archive has too many chart candidates.')
+    }
     if (base === NOTES_CHART) chart.hasChart = true
     else {
       chart.midiCount += 1
-      chart.midi = chart.midiCount === 1 ? entry.getData() : null
+      if (chart.midiCount === 1) {
+        extractedChartBytes += entry.header.size
+        if (extractedChartBytes > limits.maxExtractedChartBytes) {
+          throw new Error('ZIP archive chart data exceeds the aggregate limit.')
+        }
+        chart.midi = entry.getData()
+      } else chart.midi = null
     }
     charts.set(directory, chart)
   }
@@ -439,7 +489,7 @@ function findConMidi(
   )
 }
 
-function inspectCon(packageBytes: Buffer): PackageInspection {
+function inspectCon(packageBytes: Buffer): RawPackageInspection {
   const parser = new StfsParser(packageBytes)
   const { entries } = parser.parse()
   const dta = Object.entries(entries).find(([entryPath]) =>
@@ -462,11 +512,41 @@ function inspectCon(packageBytes: Buffer): PackageInspection {
 async function inspectPackageBytesInWorker(
   source: DatasetCatalogSource,
   packageBytes: Buffer
-): Promise<PackageInspection> {
+): Promise<RawPackageInspection> {
   if (source.kind === 'sng') return inspectSng(packageBytes)
   if (source.kind === 'zip') return inspectZip(packageBytes)
   if (source.kind === 'rb3con') return inspectCon(packageBytes)
   throw new Error('Only externally selected package sources may be inventoried.')
+}
+
+function summarizeRawChart(chart: RawInventoryChart): InventoryChart {
+  const midi = chart.midiCount === 1 && chart.midi ? parseSafeMidi(chart.midi) : null
+  if (!midi || !chart.midi) {
+    return {
+      validNotesMidi: false,
+      hasChart: chart.hasChart,
+      exactExpertPartVocals: false,
+      midiHash: null
+    }
+  }
+  return {
+    validNotesMidi: true,
+    hasChart: chart.hasChart,
+    exactExpertPartVocals: hasExactExpertPartVocals(midi),
+    midiHash: createHash('sha256').update(chart.midi).digest('hex')
+  }
+}
+
+function summarizePackageInspection(raw: RawPackageInspection): PackageInspection {
+  return { headerReadable: raw.headerReadable, charts: raw.charts.map(summarizeRawChart) }
+}
+
+/** Test-only entry point for aggregate ZIP extraction limits. */
+export function inspectZipForInventoryTest(
+  packageBytes: Buffer,
+  limits: ZipInventoryLimits
+): PackageInspection {
+  return summarizePackageInspection(inspectZip(packageBytes, limits))
 }
 
 /**
@@ -480,7 +560,7 @@ export async function inspectIsolatedPackageInWorker(
   return {
     outcome: 'inspected',
     containerHash: createHash('sha256').update(packageBytes).digest('hex'),
-    inspection: await inspectPackageBytesInWorker(source, packageBytes)
+    inspection: summarizePackageInspection(await inspectPackageBytesInWorker(source, packageBytes))
   }
 }
 
@@ -595,17 +675,15 @@ export async function inventoryDatasetPackageSources(
       if (inspected.headerReadable) inventory.readableHeaderCount += 1
       for (const chart of inspected.charts) {
         inventory.inspectedChartCount += 1
-        const midi = chart.midiCount === 1 && chart.midi ? parseSafeMidi(chart.midi) : null
-        if (!midi || !chart.midi) {
+        if (!chart.validNotesMidi) {
           inventory.invalidOrMissingNotesMidiCount += 1
           if (chart.hasChart) inventory.chartOnlyCount += 1
           continue
         }
         inventory.validNotesMidiCount += 1
-        if (hasExactExpertPartVocals(midi)) inventory.exactExpertPartVocalsCount += 1
-        const midiHash = createHash('sha256').update(chart.midi).digest('hex')
-        if (midiHashes.has(midiHash)) inventory.duplicateMidiCount += 1
-        else midiHashes.add(midiHash)
+        if (chart.exactExpertPartVocals) inventory.exactExpertPartVocalsCount += 1
+        if (chart.midiHash && midiHashes.has(chart.midiHash)) inventory.duplicateMidiCount += 1
+        else if (chart.midiHash) midiHashes.add(chart.midiHash)
       }
     } catch (error) {
       // Terminated work never produced a completed package result, so it must

@@ -1,9 +1,10 @@
-import { mkdir, rename, rm, truncate, writeFile } from 'fs/promises'
+import { mkdir, rename, rm, symlink, truncate, unlink, writeFile } from 'fs/promises'
 import { join } from 'path'
 import AdmZip from 'adm-zip'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import {
   inspectIsolatedPackageInWorker,
+  inspectZipForInventoryTest,
   inventoryDatasetPackageSources,
   readInventoryPackageSnapshot,
   type DatasetPackageInventoryOptions
@@ -119,6 +120,19 @@ describe('inventoryDatasetPackageSources', () => {
     })
   })
 
+  it('refuses ZIP chart extraction above the aggregate budget before posting chart buffers', () => {
+    const archive = new AdmZip()
+    archive.addFile('first/notes.mid', Buffer.alloc(1_500_000))
+    archive.addFile('second/notes.mid', Buffer.alloc(1_500_000))
+
+    expect(() =>
+      inspectZipForInventoryTest(archive.toBuffer(), {
+        maxChartCount: 4,
+        maxExtractedChartBytes: 2_000_000
+      })
+    ).toThrow('aggregate limit')
+  })
+
   it.each(['sng', 'zip', 'rb3con'] as const)(
     'records a bounded timeout without parsing %s on the main process',
     async (kind) => {
@@ -152,6 +166,31 @@ describe('inventoryDatasetPackageSources', () => {
         afterOpen: async () => await rename(replacementPath, packagePath)
       })
     ).resolves.toEqual(initialBytes)
+  })
+
+  it('refuses a final symlink planted after folder discovery without exposing its target', async () => {
+    const packagePath = join(testDir, 'post-discovery-source.zip')
+    const targetPath = join(testDir, 'private-symlink-target.zip')
+    await writeFile(packagePath, 'discovered before replacement')
+    await writeFile(targetPath, 'symlink target')
+    await unlink(packagePath)
+    await symlink(targetPath, packagePath)
+
+    await expect(readInventoryPackageSnapshot(packagePath)).rejects.toThrow()
+
+    const inventory = await inventoryDatasetPackageSources(
+      [{ kind: 'zip', sourcePath: packagePath }],
+      localInspection
+    )
+    expect(inventory).toMatchObject({
+      inspectedPackageCount: 1,
+      readablePackageCount: 0,
+      unreadablePackageCount: 1,
+      decodeFailureCount: 1
+    })
+    const serialized = JSON.stringify(inventory)
+    expect(serialized).not.toContain(packagePath)
+    expect(serialized).not.toContain(targetPath)
   })
 
   it.each(['sng', 'zip', 'rb3con'] as const)(

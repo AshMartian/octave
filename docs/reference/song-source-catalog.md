@@ -203,12 +203,19 @@ The inventory accepts only the package group selected through OCTAVE's trusted
 dialog. Folder discovery is an incremental, cancellable directory walk with
 package and directory limits; it does not open package contents. Each selected
 SNG, ZIP, or RB3CON is then inspected in a dedicated worker with a hard timeout.
-The worker itself opens one descriptor, validates a 256 MiB cap, reads a stable
-bounded snapshot, hashes that snapshot, and parses only those bytes. This means
-a path replacement after folder discovery cannot cause an oversized or different
-container to be parsed. ZIP and RB3CON inspection reads chart metadata only; it
-does not decrypt audio, transcode charts, materialize a catalog, or change
-rights, consent, selection, or catalog eligibility.
+The worker itself opens one descriptor with no-follow and non-blocking guards,
+fstats it as a regular file, validates a 256 MiB cap, reads a stable bounded
+snapshot, hashes that snapshot, and parses only those bytes. Stable identity
+starts at worker open: a path may change after discovery but final symlinks,
+devices, and oversized containers fail closed, and later replacement cannot
+change the opened snapshot. ZIP and RB3CON inspection reads chart metadata
+only; it does not decrypt audio, transcode charts, materialize a catalog, or
+change rights, consent, selection, or catalog eligibility.
+
+ZIP inspection also caps both chart candidates and their aggregate decompressed
+`notes.mid` bytes. The worker parses that bounded data and returns only
+normalized chart validity, Vocal availability, and internal content-dedup
+signals to the main process; raw MIDI buffers never cross the worker boundary.
 
 Inventory counts are completed-result counts. `inspected`, `readable`, chart,
 identity, and duplicate totals advance only after a worker result; a completed
