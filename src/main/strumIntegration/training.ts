@@ -3,14 +3,15 @@ import { execFile, spawn, type ChildProcess } from 'child_process'
 import { createHash, randomUUID } from 'crypto'
 import { createReadStream, existsSync, type Dirent } from 'fs'
 import { mkdir, readFile, readdir, realpath, stat, unlink, writeFile } from 'fs/promises'
-import { join } from 'path'
+import { isAbsolute, join, relative } from 'path'
 import type {
   StrumCheckpointCandidateInputContract,
   StrumCheckpointCandidateOutputContract,
   StrumCheckpointCandidateTargetContract,
   StrumCheckpointOutputCandidate,
   StrumCheckpointOutputContracts,
-  StrumPromotionJobDescriptor
+  StrumPromotionJobDescriptor,
+  StrumPromotionJobResult
 } from '../../shared/strumTrainingContracts'
 import { resolvePythonCommand, type PythonCommand } from './runner'
 import { sanitizeTrainingSchemaValues } from './trainingSchema'
@@ -57,6 +58,11 @@ export type TrainingPipeline = {
  * declared private request fields.
  */
 export type TrainingPromotionJob = StrumPromotionJobDescriptor
+
+export type TrainingPromotionResult = StrumPromotionJobResult & {
+  /** Opaque OCTAVE identity for chaining private evidence between jobs. */
+  promotionId: string
+}
 
 export type TrainingRuntime = {
   runtimeId: string
@@ -190,7 +196,7 @@ export type TrainingJobEvent = {
     | 'cancelled'
   code?: string
   message: string
-  result?: Record<string, unknown>
+  result?: Record<string, unknown> | TrainingPromotionResult
 }
 
 type RuntimeSettings = {
@@ -226,20 +232,30 @@ type WorkerInvocation = {
   cwd?: string
 }
 
+type CandidateBinding = {
+  artifactId: string
+  bundleRoot: string
+  taskView: string
+  catalogRoot: string
+}
+
+type StoredTrainingRun = TrainingRun & {
+  outputRoot: string
+  /** Main-process-only promotion binding. Never expose these paths through IPC. */
+  candidateBinding?: CandidateBinding
+}
+
+type StoredPromotion = TrainingPromotionResult & {
+  candidateArtifactId: string
+  kind: TrainingPromotionJob['kind']
+  /** Main-process-only worker output location. */
+  outputRoot: string
+}
+
 type TrainingRegistry = {
   tasks: Array<TrainingTask & { taskRoot: string; catalogRoot: string }>
-  runs: Array<
-    TrainingRun & {
-      outputRoot: string
-      /** Main-process-only promotion binding. Never expose these paths through IPC. */
-      candidateBinding?: {
-        artifactId: string
-        bundleRoot: string
-        taskView: string
-        catalogRoot: string
-      }
-    }
-  >
+  runs: StoredTrainingRun[]
+  promotions?: StoredPromotion[]
   profiles?: StoredAutoChartProfile[]
   defaultProfileId?: string
 }
@@ -315,11 +331,12 @@ async function readRegistry(): Promise<TrainingRegistry> {
       tasks: Array.isArray(registry.tasks) ? registry.tasks : [],
       runs: Array.isArray(registry.runs) ? registry.runs : [],
       profiles: Array.isArray(registry.profiles) ? registry.profiles : [],
+      promotions: Array.isArray(registry.promotions) ? registry.promotions : [],
       defaultProfileId:
         typeof registry.defaultProfileId === 'string' ? registry.defaultProfileId : undefined
     }
   } catch {
-    return { tasks: [], runs: [], profiles: [] }
+    return { tasks: [], runs: [], profiles: [], promotions: [] }
   }
 }
 
@@ -1372,6 +1389,251 @@ async function resolveTrainingPipeline(pipelineId: string): Promise<TrainingPipe
   return pipeline
 }
 
+function normalizePromotionResult(
+  value: unknown,
+  pipelineId: string,
+  job: TrainingPromotionJob,
+  promotionId: string
+): TrainingPromotionResult | null {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, [
+      'schema_version',
+      'format',
+      'status',
+      'pipeline_id',
+      'job_id',
+      'output_kind',
+      'deployment_scope',
+      'result'
+    ]) ||
+    value.schema_version !== 1 ||
+    value.format !== 'strum-post-train-job-result/v1' ||
+    value.status !== 'completed' ||
+    value.pipeline_id !== pipelineId ||
+    value.job_id !== job.id ||
+    value.output_kind !== job.output_kind ||
+    value.deployment_scope !== job.deployment_scope
+  ) {
+    return null
+  }
+  const result = normalizeMetadataRecord(value.result)
+  if (!result) return null
+  return {
+    schema_version: 1,
+    format: 'strum-post-train-job-result/v1',
+    status: 'completed',
+    pipeline_id: pipelineId,
+    job_id: job.id,
+    output_kind: job.output_kind,
+    deployment_scope: job.deployment_scope,
+    result,
+    promotionId
+  }
+}
+
+async function resolveCandidateBinding(
+  artifactId: string
+): Promise<{ run: StoredTrainingRun; binding: CandidateBinding }> {
+  if (!isArtifactId(artifactId)) throw new Error('Select a trained STRUM candidate first.')
+  const registry = await readRegistry()
+  const run = registry.runs.find(
+    (entry) => entry.artifactId === artifactId && entry.candidateBinding?.artifactId === artifactId
+  )
+  if (!run?.candidateBinding) throw new Error('That trained STRUM candidate is not available.')
+  const binding = run.candidateBinding
+  try {
+    const [bundleRoot, taskView, catalogRoot] = await Promise.all([
+      realpath(binding.bundleRoot),
+      realpath(binding.taskView),
+      realpath(binding.catalogRoot)
+    ])
+    const inspection = normalizeDiscoveredCheckpoint(
+      await runWorkerJson(['checkpoint', 'inspect', '--model-root', bundleRoot, '--json'])
+    )
+    if (
+      !inspection ||
+      inspection.artifactId !== artifactId ||
+      inspection.manifestSha256 !== run.checkpointManifestHash
+    ) {
+      throw new Error('candidate no longer matches its registered checkpoint.')
+    }
+    return {
+      run,
+      binding: { artifactId, bundleRoot, taskView, catalogRoot }
+    }
+  } catch {
+    throw new Error('That trained STRUM candidate is no longer available.')
+  }
+}
+
+function promotionOutputPath(jobId: string, job: TrainingPromotionJob): string {
+  const name = job.kind === 'evaluation' ? 'result.json' : 'bundle'
+  return join(trainingRoot(), 'promotions', jobId, name)
+}
+
+const SUPPORTED_PROMOTION_PRIVATE_FIELDS = new Set([
+  'bundle_root',
+  'experiment',
+  'experiment_root',
+  'task_view',
+  'dataset_manifest',
+  'catalog_root',
+  'output',
+  'evaluation'
+])
+
+function supportsPromotionPrivateFields(job: TrainingPromotionJob): boolean {
+  return [...job.private_request_fields, ...job.optional_private_request_fields].every((field) =>
+    SUPPORTED_PROMOTION_PRIVATE_FIELDS.has(field)
+  )
+}
+
+async function resolvePromotionRequest(
+  candidateArtifactId: string,
+  job: TrainingPromotionJob,
+  options: Record<string, unknown>,
+  jobId: string
+): Promise<{ request: Record<string, unknown>; outputRoot: string }> {
+  const { run, binding } = await resolveCandidateBinding(candidateArtifactId)
+  const outputRoot = promotionOutputPath(jobId, job)
+  await mkdir(join(trainingRoot(), 'promotions', jobId), { recursive: true })
+  const request: Record<string, unknown> = {
+    pipeline_id: run.pipelineId,
+    job_id: job.id,
+    options: sanitizeTrainingSchemaValues(job.options_schema, options, 'post-training job')
+  }
+  const registry = await readRegistry()
+  const latestEvaluation = [...(registry.promotions ?? [])]
+    .reverse()
+    .find(
+      (entry) =>
+        entry.candidateArtifactId === candidateArtifactId &&
+        entry.pipeline_id === run.pipelineId &&
+        entry.status === 'completed' &&
+        entry.kind === 'evaluation'
+    )
+  let evaluationRoot: string | undefined
+  if (latestEvaluation) {
+    try {
+      const [promotionRoot, resolvedEvaluation] = await Promise.all([
+        realpath(join(trainingRoot(), 'promotions')),
+        realpath(latestEvaluation.outputRoot)
+      ])
+      const pathWithinPromotionRoot = relative(promotionRoot, resolvedEvaluation)
+      if (
+        pathWithinPromotionRoot === '' ||
+        isAbsolute(pathWithinPromotionRoot) ||
+        pathWithinPromotionRoot.startsWith('..') ||
+        pathWithinPromotionRoot.includes('..\\')
+      ) {
+        throw new Error('evaluation escaped private root')
+      }
+      evaluationRoot = resolvedEvaluation
+    } catch {
+      throw new Error('Required post-training evaluation evidence is unavailable.')
+    }
+  }
+  const values: Record<string, string | undefined> = {
+    bundle_root: binding.bundleRoot,
+    experiment: binding.bundleRoot,
+    experiment_root: binding.bundleRoot,
+    task_view: binding.taskView,
+    dataset_manifest: binding.taskView,
+    catalog_root: binding.catalogRoot,
+    output: outputRoot,
+    evaluation: evaluationRoot
+  }
+  for (const field of job.private_request_fields) {
+    const value = values[field]
+    if (!value)
+      throw new Error('This post-training job is not available for the selected candidate.')
+    request[field] = value
+  }
+  for (const field of job.optional_private_request_fields) {
+    const value = values[field]
+    if (value) request[field] = value
+  }
+  return { request, outputRoot }
+}
+
+/** List only descriptor-advertised, currently available post-training actions. */
+export async function listPromotionJobs(
+  candidateArtifactId: string
+): Promise<TrainingPromotionJob[]> {
+  const runtime = await probeTrainingRuntime()
+  if (
+    !runtime.capabilities.includes('post_train_job_discovery') ||
+    !runtime.capabilities.includes('post_train_job_start')
+  ) {
+    return []
+  }
+  const { run } = await resolveCandidateBinding(candidateArtifactId)
+  const pipeline = await resolveTrainingPipeline(run.pipelineId)
+  const registry = await readRegistry()
+  const hasEvaluation = (registry.promotions ?? []).some(
+    (entry) =>
+      entry.candidateArtifactId === candidateArtifactId &&
+      entry.pipeline_id === run.pipelineId &&
+      entry.kind === 'evaluation' &&
+      entry.status === 'completed' &&
+      existsSync(entry.outputRoot)
+  )
+  return pipeline.promotion_jobs.filter(
+    (job) =>
+      job.status === 'available' &&
+      supportsPromotionPrivateFields(job) &&
+      (!job.private_request_fields.includes('evaluation') || hasEvaluation)
+  )
+}
+
+export async function startPromotionJob(options: {
+  candidateArtifactId: string
+  jobId: string
+  options: Record<string, unknown>
+}): Promise<{ jobId: string }> {
+  if (!isArtifactId(options.candidateArtifactId) || !isSafeContractName(options.jobId)) {
+    throw new Error('Select a valid post-training job first.')
+  }
+  const runtime = await probeTrainingRuntime()
+  if (!runtime.capabilities.includes('post_train_job_start')) {
+    throw new Error('The selected STRUM runtime cannot run post-training jobs.')
+  }
+  const { run } = await resolveCandidateBinding(options.candidateArtifactId)
+  const pipeline = await resolveTrainingPipeline(run.pipelineId)
+  const job = pipeline.promotion_jobs.find(
+    (candidate) => candidate.id === options.jobId && candidate.status === 'available'
+  )
+  if (!job || !supportsPromotionPrivateFields(job)) {
+    throw new Error('That post-training job is not available for the selected candidate.')
+  }
+  const jobId = randomUUID()
+  const { request, outputRoot } = await resolvePromotionRequest(
+    options.candidateArtifactId,
+    job,
+    options.options,
+    jobId
+  )
+  await startJsonEventJob(jobId, ['promotion', 'start'], request, async (result) => {
+    const normalized = normalizePromotionResult(result, run.pipelineId, job, `promotion-${jobId}`)
+    if (!normalized) throw new Error('STRUM returned an invalid post-training result.')
+    const registry = await readRegistry()
+    const stored: StoredPromotion = {
+      ...normalized,
+      candidateArtifactId: options.candidateArtifactId,
+      kind: job.kind,
+      outputRoot
+    }
+    registry.promotions = [
+      ...(registry.promotions ?? []).filter((entry) => entry.promotionId !== stored.promotionId),
+      stored
+    ]
+    await writeRegistry(registry)
+    return normalized
+  })
+  return { jobId }
+}
+
 export async function inspectTrainingCatalog(
   catalogRoot: string,
   pipelineId: string,
@@ -1418,7 +1680,11 @@ export async function inspectTrainingCatalog(
   const eligibleCount = normalizeNonNegativeCount(payload.eligible_count)
   const estimatedStorageBytes = normalizeNonNegativeCount(payload.estimated_storage_bytes)
   if (
-    !hasOnlyKeys(payload, expectedKeys) ||
+    !hasOnlyKeys(
+      payload,
+      expectedKeys,
+      expectedKeys.filter((key) => key !== 'eligibility_selection')
+    ) ||
     payload.status !== 'ready' ||
     !isSafeContractToken(payload.catalog_id) ||
     payload.pipeline_id !== pipelineId ||
@@ -1433,7 +1699,12 @@ export async function inspectTrainingCatalog(
   }
   const excluded = normalizeExclusionReasonCounts(payload.exclusion_reason_counts)
   const audioPolicy = normalizeMetadataRecord(payload.audio_policy)
-  if (!excluded || !audioPolicy || !normalizeMetadataRecord(payload.eligibility_selection)) {
+  if (
+    !excluded ||
+    !audioPolicy ||
+    (payload.eligibility_selection !== undefined &&
+      !normalizeMetadataRecord(payload.eligibility_selection))
+  ) {
     throw new Error('STRUM returned an invalid catalog inspection result.')
   }
   return {
@@ -2179,7 +2450,9 @@ async function startJsonEventJob(
   jobId: string,
   args: string[],
   request: Record<string, unknown>,
-  onSucceeded: (result: Record<string, unknown>) => Promise<Record<string, unknown>>,
+  onSucceeded: (
+    result: Record<string, unknown>
+  ) => Promise<Record<string, unknown> | TrainingPromotionResult>,
   runId?: string
 ): Promise<void> {
   const worker = await resolveWorkerInvocation(jobId)
@@ -2282,13 +2555,8 @@ async function startJsonEventJob(
           continue
         }
         terminal = true
-        if (
-          !job.cancelling &&
-          normalizedState === 'succeeded' &&
-          event.result &&
-          typeof event.result === 'object'
-        ) {
-          void onSucceeded(event.result as Record<string, unknown>)
+        if (!job.cancelling && normalizedState === 'succeeded' && isRecord(event.result)) {
+          void onSucceeded(event.result)
             .then((result) => {
               broadcast({
                 jobId,

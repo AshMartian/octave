@@ -31,6 +31,22 @@ export interface StrumPromotionJobDescriptor {
   checkpoint_selection_policy?: Record<string, unknown>
 }
 
+/**
+ * The path-free terminal result emitted by STRUM's post-training job protocol.
+ * OCTAVE may add its own opaque `promotionId` when it records this result, but
+ * it must not add or expose any worker request locations.
+ */
+export interface StrumPromotionJobResult {
+  schema_version: 1
+  format: 'strum-post-train-job-result/v1'
+  status: 'completed'
+  pipeline_id: string
+  job_id: string
+  output_kind: string
+  deployment_scope: string
+  result: Record<string, unknown>
+}
+
 export interface StrumCheckpointOutputCandidate {
   component_outputs: string[]
   model_outputs: string[]

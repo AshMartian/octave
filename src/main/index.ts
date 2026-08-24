@@ -22,10 +22,12 @@ import {
   inspectTrainingCatalog,
   killAllTrainingJobs,
   listTrainingArtifacts,
+  listPromotionJobs,
   listTrainingPipelines,
   probeTrainingRuntime,
   runDefaultAutoChartProfile,
   saveDiscoveredAutoChartProfile,
+  startPromotionJob,
   startTrainingPrepare,
   startTrainingRun
 } from './strumIntegration/training'
@@ -1100,6 +1102,16 @@ ipcMain.handle('training:pipelines', async () => {
 
 ipcMain.handle('training:artifacts', async () => await listTrainingArtifacts())
 
+ipcMain.handle('training:promotionJobs', async (_event, candidateArtifactId: unknown) => {
+  if (typeof candidateArtifactId !== 'string')
+    throw new Error('Select a trained STRUM candidate first.')
+  try {
+    return await listPromotionJobs(candidateArtifactId)
+  } catch {
+    throw new Error('STRUM could not list post-training jobs for this candidate.')
+  }
+})
+
 ipcMain.handle('training:chooseCheckpointFolder', async () => {
   try {
     return await chooseCheckpointFolder()
@@ -1212,6 +1224,31 @@ ipcMain.handle(
     }
   }
 )
+
+ipcMain.handle('training:startPromotionJob', async (_event, options: unknown) => {
+  if (!options || typeof options !== 'object' || Array.isArray(options)) {
+    throw new Error('Select a post-training job first.')
+  }
+  const value = options as Record<string, unknown>
+  if (
+    typeof value.candidateArtifactId !== 'string' ||
+    typeof value.jobId !== 'string' ||
+    !value.options ||
+    typeof value.options !== 'object' ||
+    Array.isArray(value.options)
+  ) {
+    throw new Error('Select a post-training job first.')
+  }
+  try {
+    return await startPromotionJob({
+      candidateArtifactId: value.candidateArtifactId,
+      jobId: value.jobId,
+      options: value.options as Record<string, unknown>
+    })
+  } catch {
+    throw new Error('STRUM could not start this post-training job.')
+  }
+})
 
 ipcMain.handle('training:cancel', async (_event, jobId: string) => await cancelTrainingJob(jobId))
 
