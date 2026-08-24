@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import AdmZip from 'adm-zip'
@@ -231,6 +231,84 @@ describe('dataset package inventory IPC lifecycle', () => {
     ) as { import: { container_sha256: string }; chart: { instruments: Record<string, unknown> } }
     expect(record.import.container_sha256).toBe(containerSha256)
     expect(record.chart.instruments).toHaveProperty('vocals')
+  })
+
+  it('enriches a catalog only through an opaque approved reviewed candidate', async () => {
+    const choose = handlers.get('dataset:choosePackageFolder')
+    const inspect = handlers.get('dataset:inspectPackageGroup')
+    const approve = handlers.get('dataset:setPackageApproved')
+    const chooseParent = handlers.get('dataset:chooseCatalogParent')
+    const enrich = handlers.get('dataset:enrichCatalogAudio')
+    expect(choose).toBeTypeOf('function')
+    expect(inspect).toBeTypeOf('function')
+    expect(approve).toBeTypeOf('function')
+    expect(chooseParent).toBeTypeOf('function')
+    expect(enrich).toBeTypeOf('function')
+    const { buildSongSourceCatalog } = await import('./import/sngTrainingExporter')
+    const midi = vocalMidi()
+    const librarySong = join(scratch, 'ipc-enrichment-library-song')
+    await mkdir(librarySong, { recursive: true })
+    await writeFile(join(librarySong, 'notes.mid'), midi)
+    await writeFile(join(librarySong, 'song.ogg'), Buffer.from('OggS original IPC mix'))
+    await writeFile(join(librarySong, 'song.ini'), '[song]\ndataset_opt_in = true\n')
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: librarySong }],
+      parentDir: scratch,
+      catalogName: 'ipc-enrichment-base',
+      catalogId: 'ipc-enrichment-base',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    const packagePath = join(scratch, 'private-ipc-enrichment.zip')
+    const archive = new AdmZip()
+    archive.addFile('notes.mid', midi)
+    archive.addFile('song.ogg', Buffer.from('OggS alternate IPC mix'))
+    archive.writeZip(packagePath)
+    const containerSha256 = createHash('sha256')
+      .update(await readFile(packagePath))
+      .digest('hex')
+    const midiSha256 = createHash('sha256').update(midi).digest('hex')
+    const entryId = packageEntryIdentity('zip', containerSha256, '', midiSha256)
+    const sender = new FakeSender()
+    const group = (await choose!({ sender } as unknown)) as { groupId: string }
+    getReviewEntries.mockReturnValueOnce([
+      {
+        source: { kind: 'zip', sourcePath: packagePath },
+        containerSha256,
+        midiSha256,
+        entryLocator: '',
+        entryId,
+        exactExpertPartVocals: true,
+        duplicateMidi: true
+      }
+    ])
+    runSession.mockResolvedValueOnce({ ...inventoryResult(), cancelled: false })
+    const inspection = (await inspect!({ sender } as unknown, group.groupId)) as {
+      reviewCandidates: Array<{ candidateId: string }>
+    }
+    const candidateId = inspection.reviewCandidates[0]?.candidateId
+    expect(candidateId).toEqual(expect.any(String))
+    expect(approve!({ sender } as unknown, candidateId, true) as boolean).toBe(true)
+    const parent = (await chooseParent!({ sender } as unknown)) as { parentId: string }
+    const response = await enrich!({ sender } as unknown, {
+      candidateId,
+      parentId: parent.parentId,
+      catalogName: 'ipc-enrichment-revision',
+      catalogId: 'ipc-enrichment-revision',
+      sourceCatalogName: 'ipc-enrichment-base'
+    })
+    expect(response).toMatchObject({ recordCount: 1, skipped: [] })
+    const serialized = JSON.stringify(response)
+    for (const privateValue of [packagePath, containerSha256, midiSha256, entryId]) {
+      expect(serialized).not.toContain(privateValue)
+    }
+    const revision = await readFile(
+      join(scratch, 'ipc-enrichment-revision', 'records.jsonl'),
+      'utf8'
+    )
+    expect(revision).not.toContain(packagePath)
+    expect(revision).not.toContain(containerSha256)
   })
 
   it('aborts and revokes an active inventory when its group is removed', async () => {

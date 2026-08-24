@@ -248,6 +248,25 @@ export interface SongSourceCatalogProgress {
   total: number
 }
 
+/**
+ * A narrow, clone-only revision operation. It binds one already-reviewed
+ * package chart to an existing materialized chart by MIDI hash, then changes
+ * only same-named audio roles. Source locations and review evidence remain
+ * main-process-only in `source`.
+ */
+export interface SongSourceCatalogAudioEnrichmentOptions {
+  source: DatasetCatalogSource
+  parentDir: string
+  /** New revision directory name. It must not exist. */
+  catalogName: string
+  /** New revision catalog ID. */
+  catalogId: string
+  /** Existing catalog to clone. */
+  sourceCatalogName: string
+  octaveVersion: string
+  onProgress?: (progress: SongSourceCatalogProgress) => void
+}
+
 function slug(value: string): string {
   const normalized = value
     .normalize('NFKD')
@@ -384,8 +403,58 @@ function catalogAudioInput(
   return [role, { bytes, extension, mediaType }]
 }
 
+function addCatalogAudioInput(
+  audio: Partial<Record<CatalogAudioRole, CatalogAudioInput>>,
+  input: [CatalogAudioRole, CatalogAudioInput]
+): void {
+  const [role, value] = input
+  // The catalog has one asset per role. Retaining the first matching filename
+  // makes a package's entry order part of training provenance; it is unsafe
+  // for alternate mix/vocal inputs in particular.
+  if (audio[role]) throw new Error(`Package contains multiple ${role} audio assets.`)
+  audio[role] = value
+}
+
+function isValidCatalogAudioBytes(input: CatalogAudioInput): boolean {
+  const { bytes, extension } = input
+  if (!bytes.length) return false
+  if (extension === 'ogg' || extension === 'opus') {
+    return bytes.subarray(0, 4).equals(Buffer.from('OggS'))
+  }
+  if (extension === 'wav') {
+    return (
+      bytes.length >= 12 &&
+      bytes.subarray(0, 4).equals(Buffer.from('RIFF')) &&
+      bytes.subarray(8, 12).equals(Buffer.from('WAVE'))
+    )
+  }
+  if (extension === 'flac') return bytes.subarray(0, 4).equals(Buffer.from('fLaC'))
+  // An MP3 may have an ID3 tag or begin directly with a valid MPEG frame.
+  return (
+    bytes.subarray(0, 3).equals(Buffer.from('ID3')) ||
+    (bytes.length >= 2 && bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0)
+  )
+}
+
+function assertSafeAlternateAudio(
+  audio: Partial<Record<CatalogAudioRole, CatalogAudioInput>>
+): void {
+  const entries = Object.entries(audio) as Array<[CatalogAudioRole, CatalogAudioInput]>
+  if (!entries.length) throw new Error('Selected chart has no supported alternate audio assets.')
+  for (const [, input] of entries) {
+    if (!isValidCatalogAudioBytes(input))
+      throw new Error('Selected chart has invalid alternate audio.')
+  }
+  const mix = audio.mix
+  const vocals = audio.vocals
+  if (mix && vocals && sha256Buffer(mix.bytes) === sha256Buffer(vocals.bytes)) {
+    throw new Error('Selected chart reuses one audio asset for mix and vocals.')
+  }
+}
+
 async function readCatalogAudioFromFolder(
-  sourcePath: string
+  sourcePath: string,
+  rejectDuplicateRoles = false
 ): Promise<Partial<Record<CatalogAudioRole, CatalogAudioInput>>> {
   const audio: Partial<Record<CatalogAudioRole, CatalogAudioInput>> = {}
   const entries = await readdir(sourcePath, { withFileTypes: true })
@@ -394,14 +463,15 @@ async function readCatalogAudioFromFolder(
     .sort((a, b) => a.name.localeCompare(b.name))) {
     const bytes = await readFile(path.join(sourcePath, entry.name))
     const input = catalogAudioInput(entry.name, bytes)
-    if (input && !audio[input[0]]) audio[input[0]] = input[1]
+    if (input && (rejectDuplicateRoles || !audio[input[0]])) addCatalogAudioInput(audio, input)
   }
   return audio
 }
 
 async function extractSngNotesMidi(
   sngSource: string | Buffer,
-  includeAudio = true
+  includeAudio = true,
+  rejectDuplicateRoles = false
 ): Promise<{
   midi: Buffer
   entryLocator: string
@@ -455,7 +525,8 @@ async function extractSngNotesMidi(
             chunks.push(Buffer.from(chunk))
           }
           const input = catalogAudioInput(fileName, Buffer.concat(chunks))
-          if (input && !audio[input[0]]) audio[input[0]] = input[1]
+          if (input && (rejectDuplicateRoles || !audio[input[0]]))
+            addCatalogAudioInput(audio, input)
         } else {
           await drain(fileStream as ReadableStream<Uint8Array>)
         }
@@ -501,23 +572,38 @@ function findConMidi(
 function findConMogg(
   entries: Record<string, Buffer>,
   shortname: string,
-  allowGlobalFallback: boolean
+  allowGlobalFallback: boolean,
+  requireUnique = false
 ): Buffer | null {
   const short = shortname.toLowerCase()
+  const exactMatches: Buffer[] = []
   for (const [entryPath, value] of Object.entries(entries)) {
     const normalized = entryPath.toLowerCase().replace(/\\/g, '/')
-    if (normalized === `${short}.mogg` || normalized.endsWith(`/${short}.mogg`)) return value
+    if (normalized === `${short}.mogg` || normalized.endsWith(`/${short}.mogg`)) {
+      exactMatches.push(value)
+    }
+  }
+  if (exactMatches.length) {
+    if (requireUnique && exactMatches.length !== 1) {
+      throw new Error('RB3CON contains ambiguous audio assets.')
+    }
+    return exactMatches[0]
   }
   if (!allowGlobalFallback) return null
+  const fallbackMatches: Buffer[] = []
   for (const [entryPath, value] of Object.entries(entries)) {
-    if (entryPath.toLowerCase().endsWith('.mogg')) return value
+    if (entryPath.toLowerCase().endsWith('.mogg')) fallbackMatches.push(value)
   }
-  return null
+  if (requireUnique && fallbackMatches.length > 1) {
+    throw new Error('RB3CON contains ambiguous audio assets.')
+  }
+  return fallbackMatches[0] ?? null
 }
 
 async function extractConNotesMidi(
   conSource: string | Buffer,
-  includeAudio = true
+  includeAudio = true,
+  rejectDuplicateRoles = false
 ): Promise<
   Array<{
     midi: Buffer
@@ -540,7 +626,7 @@ async function extractConNotesMidi(
   return songs.flatMap((song) => {
     const midi = findConMidi(entries, song.shortname, isSingleSongPack)
     if (!midi) return []
-    const mogg = findConMogg(entries, song.shortname, isSingleSongPack)
+    const mogg = findConMogg(entries, song.shortname, isSingleSongPack, rejectDuplicateRoles)
     let audio: Partial<Record<CatalogAudioRole, CatalogAudioInput>> = {}
     if (mogg && includeAudio) {
       try {
@@ -660,7 +746,8 @@ function safeZipEntryName(entryName: string): string | null {
 
 function extractZipNotesMidi(
   source: string | Buffer,
-  includeAudio = true
+  includeAudio = true,
+  rejectDuplicateRoles = false
 ): Array<{
   midi: Buffer
   entryLocator: string
@@ -678,7 +765,12 @@ function extractZipNotesMidi(
     if (!Number.isSafeInteger(entry.header.size) || entry.header.size > MAX_ZIP_ENTRY_BYTES) {
       throw new Error('ZIP archive entry is too large.')
     }
-    files.set(name.toLowerCase(), entry)
+    const normalizedName = name.toLowerCase()
+    // ZIP names are case-sensitive, but catalog role selection is not. A
+    // collision would otherwise overwrite one input before role validation
+    // observes it (for example song.ogg and SONG.ogg).
+    if (files.has(normalizedName)) throw new Error('ZIP archive has ambiguous entry names.')
+    files.set(normalizedName, entry)
   }
 
   const candidates: Array<{
@@ -704,7 +796,7 @@ function extractZipNotesMidi(
         if (!/\.(ogg|mp3|opus|wav|flac)$/i.test(childName)) continue
         const bytes = audioEntry.getData()
         const input = catalogAudioInput(childName, bytes)
-        if (input && !audio[input[0]]) audio[input[0]] = input[1]
+        if (input && (rejectDuplicateRoles || !audio[input[0]])) addCatalogAudioInput(audio, input)
       }
     }
     candidates.push({
@@ -720,7 +812,8 @@ function extractZipNotesMidi(
 
 async function inspectDatasetSource(
   source: DatasetCatalogSource,
-  includeAudio = true
+  includeAudio = true,
+  rejectDuplicateRoles = false
 ): Promise<CatalogCandidate[]> {
   const reviewedBytes = source.packageReview
     ? await readInventoryPackageSnapshot(source.sourcePath)
@@ -732,7 +825,11 @@ async function inspectDatasetSource(
     throw new Error('Reviewed package changed or is unavailable.')
   }
   if (source.kind === 'sng') {
-    const extracted = await extractSngNotesMidi(reviewedBytes ?? source.sourcePath, includeAudio)
+    const extracted = await extractSngNotesMidi(
+      reviewedBytes ?? source.sourcePath,
+      includeAudio,
+      rejectDuplicateRoles
+    )
     if (!extracted) return []
     const candidates = [
       {
@@ -753,7 +850,11 @@ async function inspectDatasetSource(
     const containerSha256 =
       source.packageReview?.containerSha256 ?? (await sha256File(source.sourcePath))
     const candidates = (
-      await extractConNotesMidi(reviewedBytes ?? source.sourcePath, includeAudio)
+      await extractConNotesMidi(
+        reviewedBytes ?? source.sourcePath,
+        includeAudio,
+        rejectDuplicateRoles
+      )
     ).map((candidate) => ({
       kind: source.kind,
       midi: candidate.midi,
@@ -769,18 +870,20 @@ async function inspectDatasetSource(
   if (source.kind === 'zip') {
     const containerSha256 =
       source.packageReview?.containerSha256 ?? (await sha256File(source.sourcePath))
-    const candidates = extractZipNotesMidi(reviewedBytes ?? source.sourcePath, includeAudio).map(
-      (candidate) => ({
-        kind: source.kind,
-        midi: candidate.midi,
-        entryLocator: candidate.entryLocator,
-        metadata: redactMetadata(candidate.metadata),
-        audio: candidate.audio,
-        isStrumGenerated: candidate.isStrumGenerated,
-        containerSha256,
-        requiresOptIn: false
-      })
-    )
+    const candidates = extractZipNotesMidi(
+      reviewedBytes ?? source.sourcePath,
+      includeAudio,
+      rejectDuplicateRoles
+    ).map((candidate) => ({
+      kind: source.kind,
+      midi: candidate.midi,
+      entryLocator: candidate.entryLocator,
+      metadata: redactMetadata(candidate.metadata),
+      audio: candidate.audio,
+      isStrumGenerated: candidate.isStrumGenerated,
+      containerSha256,
+      requiresOptIn: false
+    }))
     return selectedReviewedCatalogEntries(candidates, source)
   }
   const metadata = parseIniFile(await readFile(path.join(source.sourcePath, 'song.ini'), 'utf8'))
@@ -790,7 +893,9 @@ async function inspectDatasetSource(
       midi: await readFile(path.join(source.sourcePath, NOTES_MIDI)),
       entryLocator: NOTES_MIDI,
       metadata: redactMetadata(sanitizeMetadata(metadata)),
-      audio: includeAudio ? await readCatalogAudioFromFolder(source.sourcePath) : {},
+      audio: includeAudio
+        ? await readCatalogAudioFromFolder(source.sourcePath, rejectDuplicateRoles)
+        : {},
       isStrumGenerated: isStrumGenerated(metadata),
       requiresOptIn: !isDatasetOptedIn(metadata.dataset_opt_in)
     }
@@ -2402,6 +2507,188 @@ export async function buildSongSourceCatalog(options: {
     catalogPath,
     recordCount: records.length,
     skipped
+  }
+}
+
+function recordNotesAsset(record: Record<string, unknown>): CatalogAsset {
+  return (record.chart as { notes_midi: CatalogAsset }).notes_midi
+}
+
+function recordAudioAssets(
+  record: Record<string, unknown>
+): Partial<Record<CatalogAudioRole, CatalogAsset>> {
+  return { ...((record.audio ?? {}) as Partial<Record<CatalogAudioRole, CatalogAsset>>) }
+}
+
+function assertNoSharedMixAndVocals(audio: Partial<Record<CatalogAudioRole, CatalogAsset>>): void {
+  if (audio.mix && audio.vocals && audio.mix.sha256 === audio.vocals.sha256) {
+    throw new Error('Catalog revision would reuse one audio asset for mix and vocals.')
+  }
+}
+
+/**
+ * Clone a catalog into a new revision and enrich precisely one pre-existing
+ * chart with alternate audio. Unlike an ordinary clone, this operation never
+ * adds records, changes a chart asset, rewrites record rights, or falls back
+ * to an unreviewed/ambiguous package entry.
+ */
+export async function buildSongSourceCatalogAudioEnrichmentRevision(
+  options: SongSourceCatalogAudioEnrichmentOptions
+): Promise<SongSourceCatalogResult> {
+  const { source } = options
+  if (
+    source.kind === 'octave-library' ||
+    !source.entryId ||
+    !source.packageReview ||
+    !/^[a-f0-9]{64}$/.test(source.entryId)
+  ) {
+    throw new Error('Select one explicitly reviewed package chart for audio enrichment.')
+  }
+  const catalogName = validateCatalogName(options.catalogName)
+  const catalogId = redactLocationText(options.catalogId, 'octave-catalog').slice(0, 128)
+  const sourceCatalogName = validateCatalogName(options.sourceCatalogName)
+  const parentDir = path.resolve(options.parentDir)
+  const catalogPath = path.join(parentDir, catalogName)
+  const sourceCatalogPath = path.join(parentDir, sourceCatalogName)
+  if (catalogPath === sourceCatalogPath) {
+    throw new Error('Audio enrichment must publish a new catalog revision.')
+  }
+  const reservationPath = path.join(parentDir, `.${catalogName}.catalog-reservation`)
+  let reservation: Awaited<ReturnType<typeof open>>
+  try {
+    reservation = await open(reservationPath, 'wx')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+      throw new Error('A catalog build with that name is already in progress.')
+    }
+    throw error
+  }
+
+  const stagingPath = path.join(parentDir, `.${catalogName}.staging-${randomUUID()}`)
+  try {
+    try {
+      await stat(sourceCatalogPath)
+      await validateStagedCatalog(sourceCatalogPath)
+    } catch {
+      throw new Error('The selected catalog is unavailable or invalid.')
+    }
+    try {
+      await stat(catalogPath)
+      throw new Error('A catalog with that name already exists.')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+
+    options.onProgress?.({ phase: 'normalizing', completed: 0, total: 1 })
+    // `inspectDatasetSource` reads a no-follow, capped descriptor snapshot
+    // and checks the inventory container hash, locator, entry ID, and MIDI
+    // hash together. It therefore fails closed if the reviewed source changed.
+    let candidates: CatalogCandidate[]
+    try {
+      candidates = await inspectDatasetSource(source, true, true)
+    } catch {
+      // Adapter errors can include a package-controlled name or a private
+      // location. This operation exposes only a stable review failure.
+      throw new Error('Reviewed package changed or selected chart is unavailable.')
+    }
+    if (candidates.length !== 1 || !isValidMidi(candidates[0].midi)) {
+      throw new Error('Reviewed package changed or selected chart is unavailable.')
+    }
+    const candidate = candidates[0]
+    const notesSha256 = sha256Buffer(candidate.midi)
+    assertSafeAlternateAudio(candidate.audio)
+
+    await cp(sourceCatalogPath, stagingPath, {
+      recursive: true,
+      errorOnExist: true,
+      verbatimSymlinks: true
+    })
+    const stagingRoot = await realpath(stagingPath)
+    const records = await readCatalogRecords(stagingRoot)
+    const matchingRecords = records.filter(
+      (record) => recordNotesAsset(record).sha256 === notesSha256
+    )
+    if (matchingRecords.length !== 1) {
+      throw new Error('Selected chart is not a unique MIDI match in the target catalog.')
+    }
+
+    const record = matchingRecords[0]
+    const audio = recordAudioAssets(record)
+    for (const [role, input] of Object.entries(candidate.audio) as Array<
+      [CatalogAudioRole, CatalogAudioInput]
+    >) {
+      const nextAsset = await materializeCatalogAsset(
+        stagingRoot,
+        input.bytes,
+        `${role}.${input.extension}`,
+        input.mediaType
+      )
+      // A same-role, byte-identical asset is a no-op, not an enrichment. Do
+      // not silently accept it because callers could mistake it for a revised
+      // training input.
+      if (audio[role]?.sha256 === nextAsset.sha256) {
+        throw new Error('Selected chart provides duplicate audio already present in the catalog.')
+      }
+      audio[role] = nextAsset
+    }
+    assertNoSharedMixAndVocals(audio)
+    // Only audio changes. The JSON record retains its original import,
+    // metadata, chart hash, source ID, and record-level rights/provenance.
+    record.audio = audio
+    validateCatalogRecord(record)
+
+    options.onProgress?.({ phase: 'materializing', completed: 1, total: 1 })
+    await writeFile(
+      path.join(stagingRoot, 'records.jsonl'),
+      records.map((entry) => JSON.stringify(entry)).join('\n') + '\n',
+      'utf8'
+    )
+    const sourceManifest = JSON.parse(
+      await readFile(path.join(stagingRoot, 'catalog.json'), 'utf8')
+    ) as Record<string, unknown>
+    const sourceCuration = sourceManifest.curation as CatalogCuration | undefined
+    const legacyRecordRights = records[0].rights as CatalogCuration
+    const catalog = {
+      schema_version: 1,
+      format: 'octave-song-source-catalog/v1',
+      catalog_id: catalogId,
+      records: 'records.jsonl',
+      // Record-level rights remain untouched above. The manifest makes the
+      // derived nature of the revision explicit without leaking its source.
+      curation: {
+        provenance: 'Audio enrichment revision in OCTAVE',
+        license:
+          sourceCuration?.license ??
+          legacyRecordRights.license ??
+          'Permission recorded by catalog owner'
+      },
+      created_by: {
+        product: 'octave',
+        version: options.octaveVersion,
+        source_revision: 'audio-enrichment'
+      }
+    }
+    await writeFile(
+      path.join(stagingRoot, 'catalog.json'),
+      JSON.stringify(catalog, null, 2) + '\n',
+      'utf8'
+    )
+    options.onProgress?.({ phase: 'validating', completed: 1, total: 1 })
+    await validateStagedCatalog(stagingRoot)
+    try {
+      await stat(catalogPath)
+      throw new Error('A catalog with that name already exists.')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+    await rename(stagingRoot, catalogPath)
+    return { catalogPath, recordCount: records.length, skipped: [] }
+  } catch (error) {
+    await rm(stagingPath, { recursive: true, force: true })
+    throw error
+  } finally {
+    await reservation.close()
+    await unlink(reservationPath)
   }
 }
 

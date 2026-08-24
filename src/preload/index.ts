@@ -279,6 +279,22 @@ const api = {
     skipped: Array<{ reason: string }>
   }> => ipcRenderer.invoke('dataset:export', options),
 
+  /**
+   * Creates a new catalog revision from one already-reviewed package chart.
+   * The candidate ID is opaque; the renderer never receives package paths,
+   * hashes, entry locators, or asset bytes.
+   */
+  enrichSongSourceCatalogAudio: (options: {
+    candidateId: string
+    parentId: string
+    catalogName: string
+    catalogId: string
+    sourceCatalogName: string
+  }): Promise<{
+    recordCount: number
+    skipped: Array<{ reason: string }>
+  }> => ipcRenderer.invoke('dataset:enrichCatalogAudio', options),
+
   getTrainingRuntime: (): Promise<{
     runtimeId: string
     displayName: string

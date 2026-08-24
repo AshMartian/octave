@@ -536,6 +536,8 @@ export function TrainingModal({
   const [existingCatalogs, setExistingCatalogs] = useState<ExistingCatalog[]>([])
   const [selectedCatalog, setSelectedCatalog] = useState<ExistingCatalog | null>(null)
   const [saveMode, setSaveMode] = useState<CatalogSaveMode>('create')
+  /** Opaque reviewed-package capability used only for one audio revision. */
+  const [audioEnrichmentCandidateId, setAudioEnrichmentCandidateId] = useState<string | null>(null)
   const [activeStep, setActiveStep] = useState<TrainingStep>('learn')
   const [hasSeenLearn, setHasSeenLearn] = useState(
     () => localStorage.getItem(TRAINING_LEARN_SEEN_STORAGE_KEY) === 'true'
@@ -1006,6 +1008,10 @@ export function TrainingModal({
     () => packageGroups.flatMap((group) => group.candidates),
     [packageGroups]
   )
+  const selectedPackageCandidates = useMemo(
+    () => packageCandidates.filter((candidate) => selectedPackages.has(candidate.candidateId)),
+    [packageCandidates, selectedPackages]
+  )
   const allLibrarySongsSelected =
     selectableLibrarySongs.length > 0 &&
     selectableLibrarySongs.every((song) => song.trainingUse === 'allowed')
@@ -1192,6 +1198,7 @@ export function TrainingModal({
   const chooseExistingCatalog = (catalog: ExistingCatalog): void => {
     setSelectedCatalog(catalog)
     setSaveMode('update')
+    setAudioEnrichmentCandidateId(null)
     setCatalogName(catalog.catalogName)
     setCatalogId(catalog.catalogId)
     setProvenance(catalog.provenance)
@@ -1201,13 +1208,71 @@ export function TrainingModal({
   const startNewCatalog = (): void => {
     setSelectedCatalog(null)
     setSaveMode('create')
+    setAudioEnrichmentCandidateId(null)
   }
 
   const cloneCatalogRevision = (): void => {
     if (!selectedCatalog) return
     setSaveMode('clone')
+    setAudioEnrichmentCandidateId(null)
     setCatalogName(`${selectedCatalog.catalogName}-revision`)
     setCatalogId(`${selectedCatalog.catalogId}-revision`)
+  }
+
+  const beginAudioEnrichmentRevision = (): void => {
+    if (!selectedCatalog || selectedPackageCandidates.length !== 1) {
+      setError('Select exactly one reviewed package chart to create an audio-enriched revision.')
+      return
+    }
+    setError(null)
+    setSaveMode('clone')
+    setAudioEnrichmentCandidateId(selectedPackageCandidates[0].candidateId)
+    setCatalogName(`${selectedCatalog.catalogName}-audio-revision`)
+    setCatalogId(`${selectedCatalog.catalogId}-audio-revision`)
+  }
+
+  const buildAudioEnrichmentRevision = async (): Promise<void> => {
+    if (!catalogParent || !selectedCatalog || !audioEnrichmentCandidateId) {
+      setError('Select a catalog and one reviewed package chart before audio enrichment.')
+      return
+    }
+    const effectiveCatalogName = catalogName.trim()
+    const effectiveCatalogId = catalogId.trim()
+    if (!effectiveCatalogName || !effectiveCatalogId) {
+      setError('Catalog ID and revision name are required.')
+      return
+    }
+    setExporting(true)
+    setSaveProgress({ phase: 'checking', completed: 0, total: 1 })
+    setError(null)
+    setResult(null)
+    try {
+      const response = await window.api.enrichSongSourceCatalogAudio({
+        candidateId: audioEnrichmentCandidateId,
+        parentId: catalogParent.parentId,
+        catalogName: effectiveCatalogName,
+        catalogId: effectiveCatalogId,
+        sourceCatalogName: selectedCatalog.catalogName
+      })
+      const refreshedCatalogs = await window.api.listDatasetCatalogs(catalogParent.parentId)
+      setExistingCatalogs(refreshedCatalogs)
+      const savedCatalog = refreshedCatalogs.find(
+        (catalog) => catalog.catalogName === effectiveCatalogName
+      )
+      if (!savedCatalog) throw new Error('Audio revision was not published.')
+      setResult({ records: response.recordCount, skipped: response.skipped.length })
+      setSelectedCatalog(savedCatalog)
+      setAudioEnrichmentCandidateId(null)
+      setSaveMode('update')
+      setActiveStep('prepare')
+    } catch {
+      setError(
+        'Audio revision was not published. The selected chart may have changed, not match this catalog, or have unsupported audio.'
+      )
+    } finally {
+      setExporting(false)
+      setSaveProgress(null)
+    }
   }
 
   const buildCatalog = async (catalogToUpdate?: ExistingCatalog): Promise<void> => {
@@ -1721,14 +1786,35 @@ export function TrainingModal({
                       </button>
                     )}
                     {saveMode === 'clone' && (
-                      <button onClick={() => void buildCatalog()} disabled={exporting}>
-                        <span aria-hidden="true">⎇</span> Create revision
-                      </button>
+                      <>
+                        {!audioEnrichmentCandidateId && (
+                          <button onClick={() => void buildCatalog()} disabled={exporting}>
+                            <span aria-hidden="true">⎇</span> Create revision
+                          </button>
+                        )}
+                        {audioEnrichmentCandidateId && (
+                          <button
+                            onClick={() => void buildAudioEnrichmentRevision()}
+                            disabled={exporting}
+                          >
+                            <span aria-hidden="true">♫</span> Create audio revision
+                          </button>
+                        )}
+                      </>
                     )}
                     {selectedCatalog && (
-                      <button onClick={cloneCatalogRevision} disabled={exporting}>
-                        <span aria-hidden="true">⎇</span> Clone as revision
-                      </button>
+                      <>
+                        <button onClick={cloneCatalogRevision} disabled={exporting}>
+                          <span aria-hidden="true">⎇</span> Clone as revision
+                        </button>
+                        <button
+                          onClick={beginAudioEnrichmentRevision}
+                          disabled={exporting || selectedPackageCandidates.length !== 1}
+                          title="Select exactly one reviewed package chart, then create a new revision with only its matching audio roles."
+                        >
+                          <span aria-hidden="true">♫</span> Audio-enrich revision
+                        </button>
+                      </>
                     )}
                   </div>
                   {existingCatalogs.map((catalog) => {
@@ -1768,6 +1854,13 @@ export function TrainingModal({
                     This catalog contains {selectedCatalog.externalRecordCount} package-backed
                     records. Updates retain them; removing them requires a separate confirmed
                     action.
+                  </p>
+                ) : null}
+                {audioEnrichmentCandidateId ? (
+                  <p className="dataset-message">
+                    This creates a new revision only. OCTAVE verifies the reviewed chart’s MIDI hash
+                    and snapshot, then replaces or adds matching audio roles without changing the
+                    chart, source ID, or record-level rights.
                   </p>
                 ) : null}
                 <div className="dataset-editor-fields">

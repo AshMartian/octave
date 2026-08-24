@@ -188,6 +188,32 @@ their assets, roles, provenance, source IDs, and current control hash validate
 again. OCTAVE rejects a selected Harmony file whose content hash equals the
 record's `mix` or shared `vocals` asset; it never performs separation, labels
 an unproven source as isolated, or falls back to shared vocals/mix.
+### Audio-enrichment revisions
+
+Audio enrichment is a separate, clone-only curation action for a reviewed
+package chart whose `notes.mid` already exists in a selected catalog. It is not
+an ordinary catalog update and cannot add a second record for the duplicate
+MIDI. The renderer submits one opaque reviewed candidate ID; OCTAVE's main
+process reopens a capped, no-follow package snapshot and verifies its container
+hash, selected entry locator, entry ID, and MIDI hash before any catalog work.
+
+OCTAVE then clones the selected catalog to a new destination on the same
+volume, finds exactly one record with that MIDI asset hash, and changes only
+the audio roles supplied by the reviewed candidate. The existing chart asset,
+source ID, import data, metadata, and record-level rights/provenance/license
+are preserved as values; only the matching record's audio role map is changed.
+The new manifest identifies itself as an `Audio enrichment revision in OCTAVE`
+while retaining the existing catalog license basis.
+
+Every alternate audio asset must have a supported extension and container
+signature, is materialized by content hash, and is revalidated before publish.
+Duplicate role filenames, an already-present same-role asset, an absent or
+invalid alternate asset, an ambiguous MIDI match, source replacement, and a
+mix/vocal pair that refers to the same bytes all fail the whole operation.
+Failures remove the staging revision and leave both the original catalog and
+the requested destination unchanged. STRUM still receives only the published
+catalog revision; it does not receive a package location or an enrichment API.
+
 ### Preparation inventory
 
 Before selecting package-backed songs, Dataset Curation can run a bounded,

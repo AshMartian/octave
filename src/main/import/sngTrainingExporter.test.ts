@@ -19,6 +19,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { packRb3con } from '../conPacker'
 import { packSng } from '../sngPacker'
 import {
+  buildSongSourceCatalogAudioEnrichmentRevision,
   buildSongSourceCatalog,
   exportSngTrainingMidi,
   listCatalogHarmonyTargets,
@@ -34,6 +35,7 @@ import {
   getDatasetPackageInventorySessionReviewEntries,
   runDatasetPackageInventorySession
 } from './packageSourceInventory'
+import { packageEntryIdentity } from './packageSourceIdentity'
 
 describe('exportSngTrainingMidi', () => {
   const testDir = join(__dirname, '../../../out/sng_training_exporter_test_temp')
@@ -683,6 +685,270 @@ describe('exportSngTrainingMidi', () => {
       })
     ).rejects.toThrow('No valid source records')
     expect(await readdir(parentDir)).toEqual([])
+  })
+
+  it('creates a path-free audio-enrichment revision for a reviewed duplicate MIDI', async () => {
+    const parentDir = join(testDir, 'audio-enrichment-parent')
+    const catalogSong = join(testDir, 'audio-enrichment-catalog-song')
+    const packagePath = join(testDir, 'private-audio-enrichment-source.zip')
+    await mkdir(parentDir, { recursive: true })
+    await mkdir(catalogSong, { recursive: true })
+    const midi = guitarMidi()
+    await writeFile(join(catalogSong, 'notes.mid'), midi)
+    await writeFile(join(catalogSong, 'song.ogg'), Buffer.from('OggS original catalog mix'))
+    await writeFile(join(catalogSong, 'song.ini'), '[song]\ndataset_opt_in = true\n')
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: catalogSong }],
+      parentDir,
+      catalogName: 'base-catalog',
+      catalogId: 'base-catalog',
+      provenance: 'Original curator',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    const archive = new AdmZip()
+    archive.addFile('notes.mid', midi)
+    archive.addFile('song.ogg', Buffer.from('OggS alternate reviewed mix'))
+    archive.writeZip(packagePath)
+    const packageBytes = await readFile(packagePath)
+    const containerSha256 = createHash('sha256').update(packageBytes).digest('hex')
+    const midiSha256 = createHash('sha256').update(midi).digest('hex')
+    const source = {
+      kind: 'zip' as const,
+      sourcePath: packagePath,
+      entryId: packageEntryIdentity('zip', containerSha256, '', midiSha256),
+      packageReview: { containerSha256, midiSha256, entryLocator: '' }
+    }
+
+    const baseRecord = JSON.parse(
+      await readFile(join(parentDir, 'base-catalog', 'records.jsonl'), 'utf8')
+    ) as Record<string, unknown>
+    const result = await buildSongSourceCatalogAudioEnrichmentRevision({
+      source,
+      parentDir,
+      catalogName: 'base-catalog-audio-revision',
+      catalogId: 'base-catalog-audio-revision',
+      sourceCatalogName: 'base-catalog',
+      octaveVersion: 'test'
+    })
+    expect(result).toMatchObject({ recordCount: 1, skipped: [] })
+    const revisionPath = join(parentDir, 'base-catalog-audio-revision')
+    const revisionRecord = JSON.parse(
+      await readFile(join(revisionPath, 'records.jsonl'), 'utf8')
+    ) as Record<string, unknown>
+    const baseChart = baseRecord.chart as { notes_midi: { sha256: string } }
+    const revisionChart = revisionRecord.chart as { notes_midi: { sha256: string } }
+    const baseRights = baseRecord.rights
+    expect(revisionChart.notes_midi.sha256).toBe(baseChart.notes_midi.sha256)
+    expect(revisionRecord.rights).toEqual(baseRights)
+    expect(revisionRecord.source_id).toBe(baseRecord.source_id)
+    expect(revisionRecord.audio).not.toEqual(baseRecord.audio)
+    const baseMix = (baseRecord.audio as { mix: { relative_path: string } }).mix
+    expect(await readFile(join(parentDir, 'base-catalog', baseMix.relative_path), 'utf8')).toBe(
+      'OggS original catalog mix'
+    )
+    const serializedRevision = await readFile(join(revisionPath, 'records.jsonl'), 'utf8')
+    expect(serializedRevision).not.toContain(packagePath)
+    expect(serializedRevision).not.toContain(containerSha256)
+    expect(serializedRevision).not.toContain('private-audio-enrichment-source')
+    expect(JSON.parse(await readFile(join(revisionPath, 'catalog.json'), 'utf8'))).toMatchObject({
+      curation: { provenance: 'Audio enrichment revision in OCTAVE', license: 'test-only' }
+    })
+    await expect(
+      buildSongSourceCatalogAudioEnrichmentRevision({
+        source,
+        parentDir,
+        catalogName: 'duplicate-audio-revision',
+        catalogId: 'duplicate-audio-revision',
+        sourceCatalogName: 'base-catalog-audio-revision',
+        octaveVersion: 'test'
+      })
+    ).rejects.toThrow('duplicate audio already present')
+    expect(existsSync(join(parentDir, 'duplicate-audio-revision'))).toBe(false)
+  })
+
+  it('keeps an ordinary clone audio-identical when duplicate MIDI is skipped', async () => {
+    const parentDir = join(testDir, 'ordinary-clone-parent')
+    const songDir = join(testDir, 'ordinary-clone-song')
+    await mkdir(parentDir, { recursive: true })
+    await mkdir(songDir, { recursive: true })
+    await writeFile(join(songDir, 'notes.mid'), guitarMidi())
+    await writeFile(join(songDir, 'song.ogg'), Buffer.from('OggS unchanged base mix'))
+    await writeFile(join(songDir, 'song.ini'), '[song]\ndataset_opt_in = true\n')
+    const source = { kind: 'octave-library' as const, sourcePath: songDir }
+    await buildSongSourceCatalog({
+      sources: [source],
+      parentDir,
+      catalogName: 'ordinary-base',
+      catalogId: 'ordinary-base',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    await buildSongSourceCatalog({
+      sources: [source],
+      parentDir,
+      catalogName: 'ordinary-clone',
+      catalogId: 'ordinary-clone',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test',
+      mode: 'clone',
+      sourceCatalogName: 'ordinary-base'
+    })
+    const base = JSON.parse(
+      await readFile(join(parentDir, 'ordinary-base', 'records.jsonl'), 'utf8')
+    ) as { audio: unknown; chart: unknown }
+    const clone = JSON.parse(
+      await readFile(join(parentDir, 'ordinary-clone', 'records.jsonl'), 'utf8')
+    ) as { audio: unknown; chart: unknown }
+    expect(clone.audio).toEqual(base.audio)
+    expect(clone.chart).toEqual(base.chart)
+  })
+
+  it('fails closed for reviewed-source replacement, invalid alternate audio, and staged revision rollback', async () => {
+    const parentDir = join(testDir, 'audio-enrichment-rollback-parent')
+    const catalogSong = join(testDir, 'audio-enrichment-rollback-song')
+    const packagePath = join(testDir, 'audio-enrichment-rollback-source.zip')
+    await mkdir(parentDir, { recursive: true })
+    await mkdir(catalogSong, { recursive: true })
+    const midi = guitarMidi()
+    await writeFile(join(catalogSong, 'notes.mid'), midi)
+    await writeFile(join(catalogSong, 'song.ogg'), Buffer.from('OggS protected base mix'))
+    await writeFile(join(catalogSong, 'song.ini'), '[song]\ndataset_opt_in = true\n')
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: catalogSong }],
+      parentDir,
+      catalogName: 'rollback-base',
+      catalogId: 'rollback-base',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    const archive = new AdmZip()
+    archive.addFile('notes.mid', midi)
+    archive.addFile('song.ogg', Buffer.from('not a valid audio container'))
+    archive.writeZip(packagePath)
+    const packageBytes = await readFile(packagePath)
+    const containerSha256 = createHash('sha256').update(packageBytes).digest('hex')
+    const midiSha256 = createHash('sha256').update(midi).digest('hex')
+    const source = {
+      kind: 'zip' as const,
+      sourcePath: packagePath,
+      entryId: packageEntryIdentity('zip', containerSha256, '', midiSha256),
+      packageReview: { containerSha256, midiSha256, entryLocator: '' }
+    }
+    await expect(
+      buildSongSourceCatalogAudioEnrichmentRevision({
+        source,
+        parentDir,
+        catalogName: 'invalid-audio-revision',
+        catalogId: 'invalid-audio-revision',
+        sourceCatalogName: 'rollback-base',
+        octaveVersion: 'test'
+      })
+    ).rejects.toThrow('invalid alternate audio')
+    expect(existsSync(join(parentDir, 'invalid-audio-revision'))).toBe(false)
+    expect((await readdir(parentDir)).some((entry) => entry.includes('.staging-'))).toBe(false)
+
+    const replacement = new AdmZip()
+    replacement.addFile('notes.mid', guitarMidi('PART BASS'))
+    replacement.addFile('song.ogg', Buffer.from('OggS replacement'))
+    replacement.writeZip(packagePath)
+    await expect(
+      buildSongSourceCatalogAudioEnrichmentRevision({
+        source,
+        parentDir,
+        catalogName: 'replaced-source-revision',
+        catalogId: 'replaced-source-revision',
+        sourceCatalogName: 'rollback-base',
+        octaveVersion: 'test'
+      })
+    ).rejects.toThrow('Reviewed package changed')
+    expect(existsSync(join(parentDir, 'replaced-source-revision'))).toBe(false)
+    const rollbackRecord = JSON.parse(
+      await readFile(join(parentDir, 'rollback-base', 'records.jsonl'), 'utf8')
+    ) as { audio: { mix: { relative_path: string } } }
+    expect(
+      await readFile(
+        join(parentDir, 'rollback-base', rollbackRecord.audio.mix.relative_path),
+        'utf8'
+      )
+    ).toBe('OggS protected base mix')
+  })
+
+  it('rejects one reviewed alternate asset reused as both mix and vocals', async () => {
+    const parentDir = join(testDir, 'audio-enrichment-role-parent')
+    const catalogSong = join(testDir, 'audio-enrichment-role-song')
+    const packagePath = join(testDir, 'audio-enrichment-role-source.zip')
+    await mkdir(parentDir, { recursive: true })
+    await mkdir(catalogSong, { recursive: true })
+    const midi = guitarMidi()
+    await writeFile(join(catalogSong, 'notes.mid'), midi)
+    await writeFile(join(catalogSong, 'song.ini'), '[song]\ndataset_opt_in = true\n')
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: catalogSong }],
+      parentDir,
+      catalogName: 'role-base',
+      catalogId: 'role-base',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    const sharedAudio = Buffer.from('OggS shared role bytes')
+    const archive = new AdmZip()
+    archive.addFile('notes.mid', midi)
+    archive.addFile('song.ogg', sharedAudio)
+    archive.addFile('vocals.ogg', sharedAudio)
+    archive.writeZip(packagePath)
+    const packageBytes = await readFile(packagePath)
+    const containerSha256 = createHash('sha256').update(packageBytes).digest('hex')
+    const midiSha256 = createHash('sha256').update(midi).digest('hex')
+    await expect(
+      buildSongSourceCatalogAudioEnrichmentRevision({
+        source: {
+          kind: 'zip',
+          sourcePath: packagePath,
+          entryId: packageEntryIdentity('zip', containerSha256, '', midiSha256),
+          packageReview: { containerSha256, midiSha256, entryLocator: '' }
+        },
+        parentDir,
+        catalogName: 'role-revision',
+        catalogId: 'role-revision',
+        sourceCatalogName: 'role-base',
+        octaveVersion: 'test'
+      })
+    ).rejects.toThrow('reuses one audio asset for mix and vocals')
+    expect(existsSync(join(parentDir, 'role-revision'))).toBe(false)
+
+    const caseCollisionPath = join(testDir, 'audio-enrichment-case-collision.zip')
+    const caseCollision = new AdmZip()
+    caseCollision.addFile('notes.mid', midi)
+    caseCollision.addFile('song.ogg', Buffer.from('OggS lower-case mix'))
+    caseCollision.addFile('SONG.ogg', Buffer.from('OggS upper-case mix'))
+    caseCollision.writeZip(caseCollisionPath)
+    const caseCollisionBytes = await readFile(caseCollisionPath)
+    const caseCollisionHash = createHash('sha256').update(caseCollisionBytes).digest('hex')
+    await expect(
+      buildSongSourceCatalogAudioEnrichmentRevision({
+        source: {
+          kind: 'zip',
+          sourcePath: caseCollisionPath,
+          entryId: packageEntryIdentity('zip', caseCollisionHash, '', midiSha256),
+          packageReview: {
+            containerSha256: caseCollisionHash,
+            midiSha256,
+            entryLocator: ''
+          }
+        },
+        parentDir,
+        catalogName: 'case-collision-revision',
+        catalogId: 'case-collision-revision',
+        sourceCatalogName: 'role-base',
+        octaveVersion: 'test'
+      })
+    ).rejects.toThrow('Reviewed package changed')
+    expect(existsSync(join(parentDir, 'case-collision-revision'))).toBe(false)
   })
 
   it('refuses an existing empty catalog destination', async () => {

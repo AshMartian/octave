@@ -58,6 +58,7 @@ import { packRb3con } from './conPacker'
 import { importSng } from './import/sngImporter'
 import { importCon } from './import/conImporter'
 import {
+  buildSongSourceCatalogAudioEnrichmentRevision,
   buildSongSourceCatalog,
   listCatalogHarmonyTargets,
   listDatasetLibrarySongs,
@@ -1371,6 +1372,43 @@ ipcMain.handle(
       recordCount: result.recordCount,
       skipped: result.skipped
     }
+  }
+)
+
+ipcMain.handle(
+  'dataset:enrichCatalogAudio',
+  async (
+    event,
+    options: {
+      candidateId: string
+      parentId: string
+      catalogName: string
+      catalogId: string
+      sourceCatalogName: string
+    }
+  ) => {
+    const parentDir = datasetCatalogParents.get(options.parentId)
+    const source = datasetSources.get(options.candidateId)
+    if (!parentDir) throw new Error('Choose a catalog parent directory through Dataset Curation.')
+    if (
+      !source ||
+      source.kind === 'octave-library' ||
+      !source.packageReview ||
+      !approvedDatasetPackageIds.has(options.candidateId)
+    ) {
+      throw new Error('Review and explicitly approve one package chart before audio enrichment.')
+    }
+    event.sender.send('dataset:saveProgress', { phase: 'checking', completed: 0, total: 1 })
+    const result = await buildSongSourceCatalogAudioEnrichmentRevision({
+      source,
+      parentDir,
+      catalogName: options.catalogName,
+      catalogId: options.catalogId,
+      sourceCatalogName: options.sourceCatalogName,
+      octaveVersion: app.getVersion(),
+      onProgress: (progress) => event.sender.send('dataset:saveProgress', progress)
+    })
+    return { recordCount: result.recordCount, skipped: result.skipped }
   }
 )
 

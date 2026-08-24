@@ -202,6 +202,17 @@ interface ChartEditorAPI {
     recordCount: number
     skipped: Array<{ reason: string }>
   }>
+  /** Opaque reviewed package candidate only; source details remain in main. */
+  enrichSongSourceCatalogAudio: (options: {
+    candidateId: string
+    parentId: string
+    catalogName: string
+    catalogId: string
+    sourceCatalogName: string
+  }) => Promise<{
+    recordCount: number
+    skipped: Array<{ reason: string }>
+  }>
   getTrainingRuntime: () => Promise<{
     runtimeId: string
     displayName: string
