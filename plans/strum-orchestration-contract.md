@@ -257,8 +257,10 @@ atomically published `octave-smb-approved-vocal-expansion-20260824` revision
 therefore remains at 212 allowed records and adds zero records; no source data
 was overwritten. All four Vocal pipelines inspect and prepare successfully
 with the same 18 eligible records and a 13 / 3 / 2 Train / Validation / Test
-partition. The current limitation is now verified coverage and audio/difficulty
-quality—not catalog import mechanics. New approved source material with enough
-Expert Vocal coverage is required to reach the 40 / 10 / 10 Lead-Vocal gate.
+partition. Lead admission confirms that every per-label count minimum passes;
+only the 40 / 10 / 10 source coverage gate fails. The current limitation is
+therefore verified coverage and audio/difficulty quality—not catalog import
+mechanics. New approved source material with enough Expert Vocal coverage is
+required to reach the Lead-Vocal gate.
 
 Every delivery needs shared protocol fixtures and a real-catalog smoke test. Integration tests must prove that no original source path crosses into a task view, experiment/checkpoint manifest, renderer payload, progress event, log, or user-visible error.
