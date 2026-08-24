@@ -860,7 +860,14 @@ function normalizePromotionJob(value: unknown): TrainingPromotionJob | null {
   const optionsSchema = normalizeMetadataRecord(value.options_schema)
   const privateFields = normalizeContractTokenList(value.private_request_fields)
   const optionalPrivateFields = normalizeContractTokenList(value.optional_private_request_fields)
-  if (!optionsSchema || !privateFields || !optionalPrivateFields) return null
+  if (
+    !optionsSchema ||
+    !privateFields ||
+    !optionalPrivateFields ||
+    (value.kind === 'package' && hasPromotionPolicyOverride(optionsSchema))
+  ) {
+    return null
+  }
   if (privateFields.some((field) => optionalPrivateFields.includes(field))) return null
   const policies = ['quality_policy', 'calibration_policy', 'checkpoint_selection_policy'] as const
   const normalizedPolicies = Object.fromEntries(
@@ -890,6 +897,12 @@ function normalizePromotionJob(value: unknown): TrainingPromotionJob | null {
       ? { checkpoint_selection_policy: normalizedPolicies.checkpoint_selection_policy }
       : {})
   }
+}
+
+function hasPromotionPolicyOverride(schema: Record<string, unknown>): boolean {
+  const properties = schema.properties
+  if (!isRecord(properties)) return false
+  return Object.keys(properties).some((key) => /(?:threshold|minimum|policy)/i.test(key))
 }
 
 function normalizeContractStrings(
