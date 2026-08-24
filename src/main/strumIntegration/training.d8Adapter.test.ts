@@ -481,6 +481,7 @@ describe('STRUM d8 training adapter', () => {
     )
     expect(completed?.result).toMatchObject({
       promotionId: expect.stringMatching(/^promotion-/),
+      candidateArtifactId: artifactId,
       result: { quality_gate_status: 'passed' }
     })
 
