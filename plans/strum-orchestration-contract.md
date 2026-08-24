@@ -202,4 +202,31 @@ Before deployment, STRUM must state for each checkpoint: the inference stage it 
 
 **Lead-Vocal correction:** `strum-owned-lead-catalog-task-admission-resolver/v1` is implemented. It revalidates all four task views and rejects the current catalog from actual source and label counts; catalog expansion needs approved data, not a future resolver.
 
+**2026-08-24 approved-catalog correction:** The local-only user-approved SMB catalog
+`octave-smb-approved-local-20260823` now contains 212 `allowed` records. STRUM's
+Lead-Vocal preparation requires an exact mido-readable `PART VOCALS` track and a
+complete libsndfile stream decode of its declared preferred/fallback audio before
+publishing a task view; the current shared-seed activity view admits 18 records.
+All four Lead-Vocal views now share that corpus and its source partition is 10
+Train / 4 Validation / 4 Test, below the STRUM-owned 40 / 10 / 10 minimum for
+lead-chart composition or promotion.
+Catalog inspection reports three audio-policy/full-decode exclusions and three
+MIDI exclusions as aggregate-only readiness reasons, never paths or source
+identifiers. The task view separately records its additional decoder rejection
+after initial role selection; both operations select the same 18 records. A
+bounded CUDA activity smoke created the raw `vocals.frame_activity_pitch`
+experiment bundle with no profile or deployment capability. Its one-epoch
+metric is only an execution smoke, not quality or promotion evidence.
+
+**Current descriptor-readiness snapshot:** On that catalog, STRUM resolves
+Guitar 145, Bass 133, Keys 28, Drums 199, Vocal component/generic paths 18,
+Pro Guitar 8, Pro Bass 8, Pro Keys 2, Guitar/Bass mapper 145/133, and
+Guitar/Bass section 145/133 eligible records. All are catalog-ready task or
+experiment paths; zero eligible `vocals.harmony-source-policy/v1` records is
+expected until OCTAVE materializes explicitly approved isolated Harmony assets
+and its sidecar. These counts are readiness evidence, not deployment-quality
+claims.
+For the learned Expert-to-Hard transform, the explicit Guitar/Bass/Keys/Drums
+selections resolve 138 / 139 / 21 / 199 catalog chart pairs respectively.
+
 Every delivery needs shared protocol fixtures and a real-catalog smoke test. Integration tests must prove that no original source path crosses into a task view, experiment/checkpoint manifest, renderer payload, progress event, log, or user-visible error.
