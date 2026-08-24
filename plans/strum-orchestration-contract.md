@@ -240,4 +240,14 @@ Chart-only packages are not Vocal-label candidates under the current
 MIDI-first contract. The next catalog expansion pass must use only reviewed,
 MIDI-backed sources and preserve the existing rights/consent boundary.
 
+**2026-08-24 resumed source-inventory completion:** The same process followed
+the inventory's opaque cursor to completion: all 280 packages settled, with
+270 completed inspections (268 readable/header-valid, two rejected), 200
+MIDI-backed charts, 66 chart-only packages, and 143 exact canonical
+`PART VOCALS` sources. Ten bounded package decodes timed out and two failed;
+there were no duplicate MIDI/container identities, unavailable identities, or
+inventory-limit hits. This identifies a sufficient *review pool* for a
+consent-controlled, MIDI-only Vocal catalog expansion. It remains inventory
+evidence—not automatic approval, materialization, training, or deployment.
+
 Every delivery needs shared protocol fixtures and a real-catalog smoke test. Integration tests must prove that no original source path crosses into a task view, experiment/checkpoint manifest, renderer payload, progress event, log, or user-visible error.
