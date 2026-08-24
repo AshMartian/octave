@@ -44,6 +44,8 @@ const api = {
     groupId: string
     groupName: string
     strumGeneratedCount: number
+    packageLimitReached: boolean
+    directoryLimitReached: boolean
     candidates: Array<{
       candidateId: string
       groupId: string
@@ -61,6 +63,9 @@ const api = {
     }>
   } | null> => ipcRenderer.invoke('dataset:choosePackageFolder'),
 
+  cancelDatasetPackageDiscovery: (): Promise<boolean> =>
+    ipcRenderer.invoke('dataset:cancelPackageDiscovery'),
+
   removeDatasetPackageGroup: (candidateIds: string[], groupId?: string): Promise<void> =>
     ipcRenderer.invoke('dataset:removePackageGroup', candidateIds, groupId),
 
@@ -70,6 +75,7 @@ const api = {
     selectedPackageCount: number
     inspectedPackageCount: number
     packageLimitReachedCount: number
+    cancelled: boolean
     readablePackageCount: number
     readableHeaderCount: number
     unreadablePackageCount: number
@@ -84,6 +90,9 @@ const api = {
     decodeTimeoutCount: number
     decodeFailureCount: number
   } | null> => ipcRenderer.invoke('dataset:inspectPackageGroup', groupId),
+
+  cancelDatasetPackageInventory: (groupId: string): Promise<boolean> =>
+    ipcRenderer.invoke('dataset:cancelPackageInventory', groupId),
 
   onDatasetScanProgress: (
     callback: (progress: {

@@ -1,7 +1,9 @@
 import { createHash } from 'crypto'
 import { createReadStream } from 'fs'
 import { open, stat } from 'fs/promises'
+import { join } from 'path'
 import { Readable } from 'stream'
+import { Worker } from 'worker_threads'
 import { Midi } from '@tonejs/midi'
 import AdmZip from 'adm-zip'
 import { SngStream, type SngHeader } from 'parse-sng'
@@ -17,6 +19,12 @@ const MAX_ZIP_ENTRIES = 2_000
 const MAX_ZIP_ENTRY_BYTES = 64 * 1024 * 1024
 const MAX_PACKAGE_COUNT = 1_000
 const PACKAGE_TIMEOUT_MS = 15_000
+/**
+ * Inventory deliberately has a much lower cap than catalog materialization.
+ * STFS parsing expands directory entries and used to buffer every embedded
+ * asset; accepting a two-gigabyte package here is neither useful nor safe.
+ */
+const MAX_INVENTORY_PACKAGE_BYTES = 256 * 1024 * 1024
 
 export interface DatasetPackageSourceInventory {
   /** Packages requested by the opaque selection, before the bounded work limit. */
@@ -24,6 +32,8 @@ export interface DatasetPackageSourceInventory {
   /** Packages actually inspected; further selections are reported but not opened. */
   inspectedPackageCount: number
   packageLimitReachedCount: number
+  /** The caller explicitly stopped inspection; counts cover completed work only. */
+  cancelled: boolean
   /** A package file could be opened and was within the bounded input limit. */
   readablePackageCount: number
   /** The container parser reached its package/header representation. */
@@ -47,15 +57,30 @@ export interface DatasetPackageSourceInventory {
   decodeFailureCount: number
 }
 
-interface InventoryChart {
+export interface InventoryChart {
   midi: Buffer | null
   midiCount: number
   hasChart: boolean
 }
 
-interface PackageInspection {
+export interface PackageInspection {
   headerReadable: boolean
   charts: InventoryChart[]
+}
+
+export interface IsolatedPackageInspection {
+  containerHash: string | null
+  inspection: PackageInspection
+}
+
+export interface DatasetPackageInventoryOptions {
+  /** Ends queued/current work without exposing source-specific failure detail. */
+  signal?: AbortSignal
+  /** Test and integration hook; production uses the worker isolation below. */
+  inspectInIsolation?: (
+    source: DatasetCatalogSource,
+    signal: AbortSignal
+  ) => Promise<IsolatedPackageInspection>
 }
 
 function emptyInventory(selectedPackageCount: number): DatasetPackageSourceInventory {
@@ -63,6 +88,7 @@ function emptyInventory(selectedPackageCount: number): DatasetPackageSourceInven
     selectedPackageCount,
     inspectedPackageCount: 0,
     packageLimitReachedCount: 0,
+    cancelled: false,
     readablePackageCount: 0,
     readableHeaderCount: 0,
     unreadablePackageCount: 0,
@@ -404,14 +430,18 @@ async function inspectCon(sourcePath: string): Promise<PackageInspection> {
   }
 }
 
-async function inspectPackage(source: DatasetCatalogSource): Promise<PackageInspection> {
+/** Runs only in the isolated inventory worker, never on Electron's main thread. */
+export async function inspectPackageInWorker(
+  source: DatasetCatalogSource
+): Promise<PackageInspection> {
   if (source.kind === 'sng') return await inspectSng(source.sourcePath)
   if (source.kind === 'zip') return inspectZip(source.sourcePath)
   if (source.kind === 'rb3con') return await inspectCon(source.sourcePath)
   throw new Error('Only externally selected package sources may be inventoried.')
 }
 
-async function hashContainer(sourcePath: string): Promise<string | null> {
+/** Runs only in the isolated inventory worker, never on Electron's main thread. */
+export async function hashContainerInWorker(sourcePath: string): Promise<string | null> {
   const info = await stat(sourcePath)
   if (info.size > MAX_PACKAGE_BYTES) return null
   const digest = createHash('sha256')
@@ -433,6 +463,68 @@ async function hashContainer(sourcePath: string): Promise<string | null> {
   return digest.digest('hex')
 }
 
+function inventoryAbortError(): Error {
+  return new Error('Package inventory cancelled.')
+}
+
+function isAbort(error: unknown): boolean {
+  return error instanceof Error && /cancelled/i.test(error.message)
+}
+
+function inspectInWorker(
+  source: DatasetCatalogSource,
+  signal: AbortSignal
+): Promise<IsolatedPackageInspection> {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    // `packageSourceInventory.ts` is code-split into out/main/chunks while the
+    // dedicated worker is an explicit main entry at out/main. Keep this
+    // relative to the compiled chunk, rather than relying on a source `.ts`
+    // URL that would be absent in packaged Electron builds.
+    const worker = new Worker(join(__dirname, '..', 'packageSourceInventoryWorker.js'), {
+      workerData: { source }
+    })
+    const finish = (callback: () => void): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      signal.removeEventListener('abort', abort)
+      void worker.terminate().catch(() => undefined)
+      callback()
+    }
+    const abort = (): void => finish(() => reject(inventoryAbortError()))
+    const timeout = setTimeout(
+      () => finish(() => reject(new Error('Package decode timed out.'))),
+      PACKAGE_TIMEOUT_MS
+    )
+    if (signal.aborted) {
+      abort()
+      return
+    }
+    signal.addEventListener('abort', abort, { once: true })
+    worker.once('message', (result: unknown) => {
+      if (
+        !result ||
+        typeof result !== 'object' ||
+        !('ok' in result) ||
+        (result as { ok?: unknown }).ok !== true
+      ) {
+        finish(() => reject(new Error('Package inspection failed.')))
+        return
+      }
+      const value = result as unknown as {
+        containerHash: string | null
+        inspection: PackageInspection
+      }
+      finish(() => resolve(value))
+    })
+    worker.once('error', () => finish(() => reject(new Error('Package inspection failed.'))))
+    worker.once('exit', (code) => {
+      if (code !== 0) finish(() => reject(new Error('Package inspection failed.')))
+    })
+  })
+}
+
 function isTimeout(error: unknown): boolean {
   return error instanceof Error && /timed out/i.test(error.message)
 }
@@ -443,32 +535,41 @@ function isTimeout(error: unknown): boolean {
  * hashes, errors, or opaque IDs are present in this renderer-safe result.
  */
 export async function inventoryDatasetPackageSources(
-  sources: readonly DatasetCatalogSource[]
+  sources: readonly DatasetCatalogSource[],
+  options: DatasetPackageInventoryOptions = {}
 ): Promise<DatasetPackageSourceInventory> {
   const inventory = emptyInventory(sources.length)
   const midiHashes = new Set<string>()
   const containerHashes = new Set<string>()
   const boundedSources = sources.slice(0, MAX_PACKAGE_COUNT)
   inventory.packageLimitReachedCount = sources.length - boundedSources.length
+  const controller = new AbortController()
+  const abort = (): void => controller.abort()
+  if (options.signal?.aborted) controller.abort()
+  else options.signal?.addEventListener('abort', abort, { once: true })
   for (const source of boundedSources) {
+    if (controller.signal.aborted) {
+      inventory.cancelled = true
+      break
+    }
     inventory.inspectedPackageCount += 1
     try {
       const info = await stat(source.sourcePath)
-      if (!info.isFile() || info.size > MAX_PACKAGE_BYTES)
+      if (!info.isFile() || info.size > MAX_INVENTORY_PACKAGE_BYTES)
         throw new Error('Package is unavailable or too large.')
       inventory.readablePackageCount += 1
-      let containerHash: string | null = null
-      try {
-        containerHash = await hashContainer(source.sourcePath)
-      } catch (error) {
-        if (isTimeout(error)) inventory.decodeTimeoutCount += 1
-        else inventory.containerIdentityUnavailableCount += 1
-      }
+      const isolated = await (options.inspectInIsolation ?? inspectInWorker)(
+        source,
+        controller.signal
+      )
+      const containerHash = isolated.containerHash
+      // A failed/unavailable identity contributes exactly once. It is not a
+      // decode failure and must not be double-counted after the worker returns.
       if (containerHash === null) inventory.containerIdentityUnavailableCount += 1
       else if (containerHashes.has(containerHash)) inventory.duplicateContainerCount += 1
       else containerHashes.add(containerHash)
 
-      const inspected = await inspectPackage(source)
+      const inspected = isolated.inspection
       if (inspected.headerReadable) inventory.readableHeaderCount += 1
       for (const chart of inspected.charts) {
         inventory.inspectedChartCount += 1
@@ -487,8 +588,10 @@ export async function inventoryDatasetPackageSources(
     } catch (error) {
       inventory.unreadablePackageCount += 1
       if (isTimeout(error)) inventory.decodeTimeoutCount += 1
-      else inventory.decodeFailureCount += 1
+      else if (!isAbort(error)) inventory.decodeFailureCount += 1
     }
   }
+  if (controller.signal.aborted) inventory.cancelled = true
+  options.signal?.removeEventListener('abort', abort)
   return inventory
 }

@@ -1,11 +1,22 @@
-import { mkdir, rm } from 'fs/promises'
+import { mkdir, rm, truncate, writeFile } from 'fs/promises'
 import { join } from 'path'
 import AdmZip from 'adm-zip'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { inventoryDatasetPackageSources } from './packageSourceInventory'
+import {
+  hashContainerInWorker,
+  inspectPackageInWorker,
+  inventoryDatasetPackageSources,
+  type DatasetPackageInventoryOptions
+} from './packageSourceInventory'
 
 describe('inventoryDatasetPackageSources', () => {
   const testDir = join(__dirname, '../../../out/package_source_inventory_test_temp')
+  const localInspection: DatasetPackageInventoryOptions = {
+    inspectInIsolation: async (source) => ({
+      containerHash: await hashContainerInWorker(source.sourcePath),
+      inspection: await inspectPackageInWorker(source)
+    })
+  }
 
   function midiWithTrack(trackName: string, note = 60): Buffer {
     const name = Buffer.from(trackName)
@@ -41,11 +52,14 @@ describe('inventoryDatasetPackageSources', () => {
     const packagePath = join(testDir, 'private-collection.zip')
     archive.writeZip(packagePath)
 
-    const inventory = await inventoryDatasetPackageSources([
-      { kind: 'zip', sourcePath: packagePath },
-      { kind: 'zip', sourcePath: packagePath },
-      { kind: 'sng', sourcePath: join(testDir, 'missing-private-source.sng') }
-    ])
+    const inventory = await inventoryDatasetPackageSources(
+      [
+        { kind: 'zip', sourcePath: packagePath },
+        { kind: 'zip', sourcePath: packagePath },
+        { kind: 'sng', sourcePath: join(testDir, 'missing-private-source.sng') }
+      ],
+      localInspection
+    )
 
     expect(inventory).toMatchObject({
       selectedPackageCount: 3,
@@ -76,7 +90,7 @@ describe('inventoryDatasetPackageSources', () => {
     archive.writeZip(packagePath)
 
     await expect(
-      inventoryDatasetPackageSources([{ kind: 'zip', sourcePath: packagePath }])
+      inventoryDatasetPackageSources([{ kind: 'zip', sourcePath: packagePath }], localInspection)
     ).resolves.toMatchObject({
       validNotesMidiCount: 1,
       exactExpertPartVocalsCount: 0
@@ -94,11 +108,104 @@ describe('inventoryDatasetPackageSources', () => {
     archive.writeZip(packagePath)
 
     await expect(
-      inventoryDatasetPackageSources([{ kind: 'zip', sourcePath: packagePath }])
+      inventoryDatasetPackageSources([{ kind: 'zip', sourcePath: packagePath }], localInspection)
     ).resolves.toMatchObject({
       validNotesMidiCount: 0,
       invalidOrMissingNotesMidiCount: 1,
       exactExpertPartVocalsCount: 0
+    })
+  })
+
+  it.each(['sng', 'zip', 'rb3con'] as const)(
+    'records a bounded timeout without parsing %s on the main process',
+    async (kind) => {
+      const packagePath = join(testDir, `timeout-${kind}.${kind === 'rb3con' ? 'rb3con' : kind}`)
+      await writeFile(packagePath, 'fixture')
+      const inventory = await inventoryDatasetPackageSources([{ kind, sourcePath: packagePath }], {
+        inspectInIsolation: async () => {
+          throw new Error('Package decode timed out.')
+        }
+      })
+      expect(inventory).toMatchObject({
+        inspectedPackageCount: 1,
+        unreadablePackageCount: 1,
+        decodeTimeoutCount: 1,
+        decodeFailureCount: 0,
+        cancelled: false
+      })
+    }
+  )
+
+  it.each(['sng', 'zip', 'rb3con'] as const)(
+    'cancels isolated %s inspection without counting it as a decode failure',
+    async (kind) => {
+      const packagePath = join(testDir, `cancel-${kind}.${kind === 'rb3con' ? 'rb3con' : kind}`)
+      await writeFile(packagePath, 'fixture')
+      const controller = new AbortController()
+      const inventoryPromise = inventoryDatasetPackageSources([{ kind, sourcePath: packagePath }], {
+        signal: controller.signal,
+        inspectInIsolation: async (_source, signal) =>
+          await new Promise((_, reject) => {
+            signal.addEventListener(
+              'abort',
+              () => reject(new Error('Package inventory cancelled.')),
+              { once: true }
+            )
+            setTimeout(() => controller.abort(), 0)
+          })
+      })
+      await expect(inventoryPromise).resolves.toMatchObject({
+        inspectedPackageCount: 1,
+        unreadablePackageCount: 1,
+        decodeTimeoutCount: 0,
+        decodeFailureCount: 0,
+        cancelled: true
+      })
+    }
+  )
+
+  it('applies the safe input limit to SNG, ZIP, and RB3CON before inspection', async () => {
+    const sources = await Promise.all(
+      (['sng', 'zip', 'rb3con'] as const).map(async (kind) => {
+        const packagePath = join(testDir, `oversize-${kind}.${kind === 'rb3con' ? 'rb3con' : kind}`)
+        await writeFile(packagePath, '')
+        await truncate(packagePath, 256 * 1024 * 1024 + 1)
+        return { kind, sourcePath: packagePath }
+      })
+    )
+    let isolationCalls = 0
+    const inventory = await inventoryDatasetPackageSources(sources, {
+      inspectInIsolation: async () => {
+        isolationCalls += 1
+        throw new Error('must not inspect oversized package')
+      }
+    })
+    expect(isolationCalls).toBe(0)
+    expect(inventory).toMatchObject({
+      inspectedPackageCount: 3,
+      readablePackageCount: 0,
+      unreadablePackageCount: 3,
+      decodeFailureCount: 3
+    })
+  })
+
+  it('counts an unavailable container identity exactly once', async () => {
+    const packagePath = join(testDir, 'identity-unavailable.zip')
+    await writeFile(packagePath, 'fixture')
+    const inventory = await inventoryDatasetPackageSources(
+      [{ kind: 'zip', sourcePath: packagePath }],
+      {
+        inspectInIsolation: async () => ({
+          containerHash: null,
+          inspection: { headerReadable: true, charts: [] }
+        })
+      }
+    )
+    expect(inventory).toMatchObject({
+      readablePackageCount: 1,
+      readableHeaderCount: 1,
+      containerIdentityUnavailableCount: 1,
+      decodeFailureCount: 0
     })
   })
 })

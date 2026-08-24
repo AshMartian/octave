@@ -31,6 +31,8 @@ interface ChartEditorAPI {
     groupId: string
     groupName: string
     strumGeneratedCount: number
+    packageLimitReached: boolean
+    directoryLimitReached: boolean
     candidates: Array<{
       candidateId: string
       groupId: string
@@ -47,11 +49,13 @@ interface ChartEditorAPI {
       isStrumGenerated: boolean
     }>
   } | null>
+  cancelDatasetPackageDiscovery: () => Promise<boolean>
   removeDatasetPackageGroup: (candidateIds: string[], groupId?: string) => Promise<void>
   inspectDatasetPackageGroup: (groupId: string) => Promise<{
     selectedPackageCount: number
     inspectedPackageCount: number
     packageLimitReachedCount: number
+    cancelled: boolean
     readablePackageCount: number
     readableHeaderCount: number
     unreadablePackageCount: number
@@ -66,6 +70,7 @@ interface ChartEditorAPI {
     decodeTimeoutCount: number
     decodeFailureCount: number
   } | null>
+  cancelDatasetPackageInventory: (groupId: string) => Promise<boolean>
   onDatasetScanProgress: (
     callback: (progress: {
       phase: 'discovering' | 'inspecting'

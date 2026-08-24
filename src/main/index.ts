@@ -64,12 +64,12 @@ import {
   listSongSourceCatalogs,
   materializeCatalogHarmonySource,
   summarizeDatasetSource,
-  summarizeDatasetSourceEntries,
   type DatasetCatalogSource,
   type DatasetSourceSummary,
   type SongSourceCatalogWriteMode
 } from './import/sngTrainingExporter'
 import { inventoryDatasetPackageSources } from './import/packageSourceInventory'
+import { discoverDatasetPackageSources } from './import/packageSourceDiscovery'
 import {
   ImportCancelledError,
   PartialImportError,
@@ -136,6 +136,10 @@ const datasetHarmonyAudioSources = new Map<string, { sourcePath: string }>()
 // Source locations remain private to main. A renderer holds only this opaque
 // group ID and can request an aggregate preparation inventory for it.
 const datasetPackageGroups = new Map<string, DatasetCatalogSource[]>()
+const datasetPackageCandidateGroups = new Map<string, string>()
+const completedDatasetPackageInventories = new Set<string>()
+const datasetPackageDiscoveryControllers = new Map<number, AbortController>()
+const datasetPackageInventoryControllers = new Map<string, AbortController>()
 const datasetCatalogParents = new Map<string, string>()
 const approvedDatasetPackageIds = new Set<string>()
 const DATASET_CATALOG_PARENT_KEY = 'dataset-catalog-parent.json'
@@ -851,39 +855,6 @@ ipcMain.handle('dialog:openOutputFolder', async () => {
   return result.filePaths[0]
 })
 
-async function findDatasetPackages(
-  folderPath: string,
-  onDirectoryScanned: (directoryCount: number) => void
-): Promise<string[]> {
-  const packages: string[] = []
-  const pending = [resolve(folderPath)]
-  let directoryCount = 0
-  while (pending.length > 0) {
-    const current = pending.pop()!
-    const entries = await readdir(current, { withFileTypes: true })
-    directoryCount += 1
-    onDirectoryScanned(directoryCount)
-    await new Promise<void>((resolve) => setImmediate(resolve))
-    for (const entry of entries) {
-      const entryPath = join(current, entry.name)
-      if (entry.isDirectory()) {
-        pending.push(entryPath)
-        continue
-      }
-      if (!entry.isFile()) continue
-      const extension = pathExtname(entry.name)
-      if (
-        extension === '.sng' ||
-        extension === '.con' ||
-        extension === '.rb3con' ||
-        extension === '.zip'
-      )
-        packages.push(entryPath)
-    }
-  }
-  return packages.sort((left, right) => left.localeCompare(right))
-}
-
 function pathExtname(fileName: string): string {
   const index = fileName.lastIndexOf('.')
   return index === -1 ? '' : fileName.slice(index).toLowerCase()
@@ -895,23 +866,29 @@ ipcMain.handle('dataset:choosePackageFolder', async (event) => {
     title: 'Select Folder of .sng / .rb3con / .zip Packages'
   })
   if (result.canceled || result.filePaths.length === 0) return null
+  const controller = new AbortController()
+  datasetPackageDiscoveryControllers.set(event.sender.id, controller)
+  const abort = (): void => controller.abort()
+  event.sender.once('destroyed', abort)
   try {
-    const packagePaths = await findDatasetPackages(result.filePaths[0], (directoryCount) => {
-      event.sender.send('dataset:scanProgress', {
-        phase: 'discovering',
-        completed: directoryCount,
-        total: 0
-      })
+    const discovery = await discoverDatasetPackageSources(result.filePaths[0], {
+      signal: controller.signal,
+      onDirectoryScanned: (directoryCount) => {
+        event.sender.send('dataset:scanProgress', {
+          phase: 'discovering',
+          completed: directoryCount,
+          total: 0
+        })
+      }
     })
     const groupId = randomUUID()
     const groupSources: DatasetCatalogSource[] = []
     const candidates: Array<{ candidateId: string; groupId: string } & DatasetSourceSummary> = []
-    let strumGeneratedCount = 0
-    for (const [index, packagePath] of packagePaths.entries()) {
+    for (const [index, packagePath] of discovery.packagePaths.entries()) {
       event.sender.send('dataset:scanProgress', {
         phase: 'inspecting',
         completed: index,
-        total: packagePaths.length
+        total: discovery.packagePaths.length
       })
       const source: DatasetCatalogSource = {
         kind:
@@ -923,30 +900,53 @@ ipcMain.handle('dataset:choosePackageFolder', async (event) => {
         sourcePath: resolve(packagePath)
       }
       groupSources.push(source)
-      const summaries = await summarizeDatasetSourceEntries(source)
-      for (const summary of summaries) {
-        const candidateId = randomUUID()
-        datasetSources.set(candidateId, { ...source, entryId: summary.entryId })
-        candidates.push({ candidateId, groupId, ...summary })
-        if (summary.isStrumGenerated) strumGeneratedCount += 1
-      }
+      // Selecting a folder is deliberately stat-only discovery. Do not parse
+      // an arbitrary ZIP/SNG/STFS package merely to render a group. This
+      // opaque package candidate may be inventoried before the user opts in.
+      const candidateId = randomUUID()
+      datasetSources.set(candidateId, source)
+      datasetPackageCandidateGroups.set(candidateId, groupId)
+      candidates.push({
+        candidateId,
+        groupId,
+        kind: source.kind,
+        songCount: 0,
+        metadata: {},
+        midiValid: false,
+        instruments: {},
+        trainingUse: 'review_required',
+        warnings: [{ code: 'source_inventory_required' }],
+        isStrumGenerated: false
+      })
     }
     event.sender.send('dataset:scanProgress', {
       phase: 'inspecting',
-      completed: packagePaths.length,
-      total: packagePaths.length
+      completed: discovery.packagePaths.length,
+      total: discovery.packagePaths.length
     })
     datasetPackageGroups.set(groupId, groupSources)
     return {
       groupId,
       groupName: basename(resolve(result.filePaths[0])),
       candidates,
-      strumGeneratedCount
+      strumGeneratedCount: 0,
+      packageLimitReached: discovery.packageLimitReached,
+      directoryLimitReached: discovery.directoryLimitReached
     }
   } catch {
     console.error('Dataset package scan failed.')
     return null
+  } finally {
+    event.sender.removeListener('destroyed', abort)
+    datasetPackageDiscoveryControllers.delete(event.sender.id)
   }
+})
+
+ipcMain.handle('dataset:cancelPackageDiscovery', (event) => {
+  const controller = datasetPackageDiscoveryControllers.get(event.sender.id)
+  if (!controller) return false
+  controller.abort()
+  return true
 })
 
 ipcMain.handle(
@@ -955,9 +955,11 @@ ipcMain.handle(
     for (const candidateId of groupCandidateIds) {
       datasetSources.delete(candidateId)
       approvedDatasetPackageIds.delete(candidateId)
+      datasetPackageCandidateGroups.delete(candidateId)
     }
     if (groupId) {
       datasetPackageGroups.delete(groupId)
+      completedDatasetPackageInventories.delete(groupId)
       return
     }
     // Compatibility path for callers from an older preload: only forget a
@@ -977,13 +979,26 @@ ipcMain.handle(
 ipcMain.handle('dataset:inspectPackageGroup', async (_event, groupId: string) => {
   const sources = datasetPackageGroups.get(groupId)
   if (!sources) return null
+  const controller = new AbortController()
+  datasetPackageInventoryControllers.set(groupId, controller)
   try {
-    return await inventoryDatasetPackageSources(sources)
+    const inventory = await inventoryDatasetPackageSources(sources, { signal: controller.signal })
+    if (!inventory.cancelled) completedDatasetPackageInventories.add(groupId)
+    return inventory
   } catch {
     // The service is already aggregate-only. Keep IPC failures generic so a
     // renderer never receives source paths or parser error details.
     return null
+  } finally {
+    datasetPackageInventoryControllers.delete(groupId)
   }
+})
+
+ipcMain.handle('dataset:cancelPackageInventory', (_event, groupId: string) => {
+  const controller = datasetPackageInventoryControllers.get(groupId)
+  if (!controller) return false
+  controller.abort()
+  return true
 })
 
 ipcMain.handle('dataset:chooseCatalogParent', async () => {
@@ -1130,6 +1145,8 @@ ipcMain.handle('dataset:setSongOptIn', async (_event, candidateId: string, opted
 ipcMain.handle('dataset:setPackageApproved', (_event, candidateId: string, approved: boolean) => {
   const source = datasetSources.get(candidateId)
   if (!source || source.kind === 'octave-library') return false
+  const groupId = datasetPackageCandidateGroups.get(candidateId)
+  if (!groupId || !completedDatasetPackageInventories.has(groupId)) return false
   if (approved) approvedDatasetPackageIds.add(candidateId)
   else approvedDatasetPackageIds.delete(candidateId)
   return true

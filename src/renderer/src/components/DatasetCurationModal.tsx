@@ -54,6 +54,7 @@ type PackageInventory = {
   selectedPackageCount: number
   inspectedPackageCount: number
   packageLimitReachedCount: number
+  cancelled: boolean
   readablePackageCount: number
   readableHeaderCount: number
   unreadablePackageCount: number
@@ -73,6 +74,8 @@ type PackageGroup = {
   groupId: string
   groupName: string
   strumGeneratedCount: number
+  packageLimitReached: boolean
+  directoryLimitReached: boolean
   candidates: PackageCandidate[]
   inventory?: PackageInventory
 }
@@ -1050,6 +1053,10 @@ export function TrainingModal({
     }
   }
 
+  const cancelPackageFolderScan = async (): Promise<void> => {
+    await window.api.cancelDatasetPackageDiscovery()
+  }
+
   const removePackageGroup = async (group: PackageGroup): Promise<void> => {
     await window.api.removeDatasetPackageGroup(
       group.candidates.map((candidate) => candidate.candidateId),
@@ -1077,6 +1084,10 @@ export function TrainingModal({
     } finally {
       setInventoryingGroupId(null)
     }
+  }
+
+  const cancelPackageInventory = async (groupId: string): Promise<void> => {
+    await window.api.cancelDatasetPackageInventory(groupId)
   }
 
   const togglePackage = async (candidate: SourceCandidate): Promise<void> => {
@@ -1430,47 +1441,63 @@ export function TrainingModal({
     }
   }
 
-  const renderCandidate = (candidate: SourceCandidate, selectable: boolean): React.JSX.Element => (
-    <label className={!candidate.midiValid ? 'disabled' : ''} key={candidate.candidateId}>
-      <input
-        type="checkbox"
-        checked={
-          selectable
-            ? selectedPackages.has(candidate.candidateId)
-            : candidate.trainingUse === 'allowed'
-        }
-        disabled={!candidate.midiValid || exporting}
-        onChange={() => {
-          if (selectable) {
-            void togglePackage(candidate)
-          } else {
-            void toggleSong(candidate)
+  const renderCandidate = (candidate: SourceCandidate, selectable: boolean): React.JSX.Element => {
+    const packageCandidate = candidate as Partial<PackageCandidate>
+    const packageInventory = packageCandidate.groupId
+      ? packageGroups.find((group) => group.groupId === packageCandidate.groupId)?.inventory
+      : undefined
+    const packageReady = Boolean(packageInventory && !packageInventory.cancelled)
+    const disabled = selectable ? !packageReady : !candidate.midiValid
+    return (
+      <label className={disabled ? 'disabled' : ''} key={candidate.candidateId}>
+        <input
+          type="checkbox"
+          checked={
+            selectable
+              ? selectedPackages.has(candidate.candidateId)
+              : candidate.trainingUse === 'allowed'
           }
-        }}
-      />
-      {!selectable && (
-        <DatasetArtwork candidateId={candidate.candidateId} label={candidateLabel(candidate)} />
-      )}
-      <span>
-        <strong>{candidateLabel(candidate)}</strong>
-        <small>
-          {candidate.kind} · {candidate.midiValid ? 'valid MIDI' : 'invalid MIDI'} ·{' '}
-          {selectable
-            ? candidate.isStrumGenerated
-              ? 'STRUM charted · select to explicitly include'
-              : 'available for review'
-            : candidate.trainingUse.replace('_', ' ')}
-          {!selectable && candidate.isStrumGenerated ? ' · STRUM generated' : ''}
-          {Object.entries(candidate.instruments)
-            .map(([instrument, coverage]) => `${instrument}: ${coverage.difficulties.join('/')}`)
-            .join(', ')}
-          {candidate.warnings.length
-            ? ` · ${candidate.warnings.map((warning) => warning.code).join(', ')}`
-            : ''}
-        </small>
-      </span>
-    </label>
-  )
+          disabled={disabled || exporting}
+          onChange={() => {
+            if (selectable) {
+              void togglePackage(candidate)
+            } else {
+              void toggleSong(candidate)
+            }
+          }}
+        />
+        {!selectable && (
+          <DatasetArtwork candidateId={candidate.candidateId} label={candidateLabel(candidate)} />
+        )}
+        <span>
+          <strong>{candidateLabel(candidate)}</strong>
+          <small>
+            {candidate.kind} ·{' '}
+            {selectable
+              ? packageReady
+                ? 'inventory complete'
+                : 'inventory required'
+              : candidate.midiValid
+                ? 'valid MIDI'
+                : 'invalid MIDI'}{' '}
+            ·{' '}
+            {selectable
+              ? candidate.isStrumGenerated
+                ? 'STRUM charted · select to explicitly include'
+                : 'available for review'
+              : candidate.trainingUse.replace('_', ' ')}
+            {!selectable && candidate.isStrumGenerated ? ' · STRUM generated' : ''}
+            {Object.entries(candidate.instruments)
+              .map(([instrument, coverage]) => `${instrument}: ${coverage.difficulties.join('/')}`)
+              .join(', ')}
+            {candidate.warnings.length
+              ? ` · ${candidate.warnings.map((warning) => warning.code).join(', ')}`
+              : ''}
+          </small>
+        </span>
+      </label>
+    )
+  }
 
   return (
     <div className="dataset-curation-overlay" onClick={onClose}>
@@ -1935,14 +1962,18 @@ export function TrainingModal({
                     </p>
                   </div>
                   <button
-                    aria-label={scanningPackages ? 'Scanning package folder' : 'Add package folder'}
+                    aria-label={
+                      scanningPackages ? 'Cancel package folder scan' : 'Add package folder'
+                    }
                     className="dataset-icon-button"
-                    onClick={() => void addPackageFolder()}
-                    disabled={exporting || scanningPackages}
-                    title={scanningPackages ? 'Scanning package folder' : 'Add package folder'}
+                    onClick={() =>
+                      void (scanningPackages ? cancelPackageFolderScan() : addPackageFolder())
+                    }
+                    disabled={exporting}
+                    title={scanningPackages ? 'Cancel package folder scan' : 'Add package folder'}
                   >
                     <span className={scanningPackages ? 'dataset-spin' : ''} aria-hidden="true">
-                      {scanningPackages ? '↻' : '＋'}
+                      {scanningPackages ? '×' : '＋'}
                     </span>
                   </button>
                 </div>
@@ -1953,19 +1984,34 @@ export function TrainingModal({
                         <div>
                           <strong>{group.groupName}</strong>
                           <small>
-                            {group.candidates.length} songs
+                            {group.candidates.length} package sources · inventory before approval
                             {group.strumGeneratedCount
                               ? ` · ${group.strumGeneratedCount} STRUM-charted; select individually to include`
+                              : ''}
+                            {group.packageLimitReached ? ' · package discovery limit reached' : ''}
+                            {group.directoryLimitReached
+                              ? ' · directory discovery limit reached'
                               : ''}
                           </small>
                         </div>
                         <div className="dataset-package-actions">
                           <button
                             className="dataset-secondary"
-                            onClick={() => void inventoryPackageGroup(group)}
-                            disabled={exporting || scanningPackages || inventoryingGroupId !== null}
+                            onClick={() =>
+                              void (inventoryingGroupId === group.groupId
+                                ? cancelPackageInventory(group.groupId)
+                                : inventoryPackageGroup(group))
+                            }
+                            disabled={
+                              exporting ||
+                              scanningPackages ||
+                              (inventoryingGroupId !== null &&
+                                inventoryingGroupId !== group.groupId)
+                            }
                           >
-                            {inventoryingGroupId === group.groupId ? 'Inventorying…' : 'Inventory'}
+                            {inventoryingGroupId === group.groupId
+                              ? 'Cancel inventory'
+                              : 'Inventory'}
                           </button>
                           <button
                             onClick={() => void removePackageGroup(group)}
@@ -1985,6 +2031,7 @@ export function TrainingModal({
                           {group.inventory.exactExpertPartVocalsCount} exact Expert Vocals ·{' '}
                           {group.inventory.duplicateMidiCount} duplicate MIDI ·{' '}
                           {group.inventory.duplicateContainerCount} duplicate containers
+                          {group.inventory.cancelled ? ' · cancelled' : ''}
                           {group.inventory.decodeTimeoutCount || group.inventory.decodeFailureCount
                             ? ` · ${group.inventory.decodeTimeoutCount} timed out · ${group.inventory.decodeFailureCount} failed`
                             : ''}
