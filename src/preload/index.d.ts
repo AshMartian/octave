@@ -1,7 +1,8 @@
 import { ElectronAPI } from '@electron-toolkit/preload'
 import type {
   StrumCheckpointOutputContracts,
-  StrumPromotionJobDescriptor
+  StrumPromotionJobDescriptor,
+  StrumPromotionJobResult
 } from '../shared/strumTrainingContracts'
 import type {
   MetadataArtwork,
@@ -202,6 +203,7 @@ interface ChartEditorAPI {
       isDefault: boolean
     }>
   }>
+  listTrainingPromotionJobs: (candidateArtifactId: string) => Promise<StrumPromotionJobDescriptor[]>
   chooseTrainingCheckpointFolder: () => Promise<{
     candidateCount: number
     profileCount: number
@@ -296,6 +298,11 @@ interface ChartEditorAPI {
     pipelineId: string
     train: Record<string, unknown>
   }) => Promise<{ jobId: string; runId: string }>
+  startTrainingPromotionJob: (options: {
+    candidateArtifactId: string
+    jobId: string
+    options: Record<string, unknown>
+  }) => Promise<{ jobId: string }>
   cancelTrainingJob: (jobId: string) => Promise<boolean>
   onTrainingProgress: (
     callback: (event: {
@@ -314,7 +321,7 @@ interface ChartEditorAPI {
         | 'cancelled'
       code?: string
       message: string
-      result?: Record<string, unknown>
+      result?: Record<string, unknown> | (StrumPromotionJobResult & { promotionId: string })
     }) => void
   ) => () => void
   openLyricsFileDialog: () => Promise<{ filePath: string; content: string } | null>

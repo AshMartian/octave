@@ -2,7 +2,8 @@ import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
 import type {
   StrumCheckpointOutputContracts,
-  StrumPromotionJobDescriptor
+  StrumPromotionJobDescriptor,
+  StrumPromotionJobResult
 } from '../shared/strumTrainingContracts'
 import type {
   MetadataArtwork,
@@ -262,6 +263,11 @@ const api = {
     }>
   }> => ipcRenderer.invoke('training:artifacts'),
 
+  listTrainingPromotionJobs: (
+    candidateArtifactId: string
+  ): Promise<StrumPromotionJobDescriptor[]> =>
+    ipcRenderer.invoke('training:promotionJobs', candidateArtifactId),
+
   chooseTrainingCheckpointFolder: (): Promise<{
     candidateCount: number
     profileCount: number
@@ -368,6 +374,12 @@ const api = {
     train: Record<string, unknown>
   }): Promise<{ jobId: string; runId: string }> => ipcRenderer.invoke('training:start', options),
 
+  startTrainingPromotionJob: (options: {
+    candidateArtifactId: string
+    jobId: string
+    options: Record<string, unknown>
+  }): Promise<{ jobId: string }> => ipcRenderer.invoke('training:startPromotionJob', options),
+
   cancelTrainingJob: (jobId: string): Promise<boolean> =>
     ipcRenderer.invoke('training:cancel', jobId),
 
@@ -388,7 +400,7 @@ const api = {
         | 'cancelled'
       code?: string
       message: string
-      result?: Record<string, unknown>
+      result?: Record<string, unknown> | (StrumPromotionJobResult & { promotionId: string })
     }) => void
   ): (() => void) => {
     const listener = (
@@ -409,7 +421,7 @@ const api = {
           | 'cancelled'
         code?: string
         message: string
-        result?: Record<string, unknown>
+        result?: Record<string, unknown> | (StrumPromotionJobResult & { promotionId: string })
       }
     ): void => callback(progress)
     ipcRenderer.on('training:progress', listener)
