@@ -591,6 +591,19 @@
   margin-top: 2px;
   color: var(--text-secondary);
 }
+.dataset-package-actions {
+  display: flex;
+  gap: 8px;
+}
+.dataset-package-inventory {
+  padding: 7px 11px;
+  margin: 0;
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--bg-secondary) 68%, var(--bg-tertiary));
+  border-bottom: 1px solid var(--border-color);
+  font-size: 11px;
+  line-height: 1.45;
+}
 .dataset-song-list label.disabled {
   opacity: 0.55;
   cursor: not-allowed;

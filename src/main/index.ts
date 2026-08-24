@@ -69,6 +69,7 @@ import {
   type DatasetSourceSummary,
   type SongSourceCatalogWriteMode
 } from './import/sngTrainingExporter'
+import { inventoryDatasetPackageSources } from './import/packageSourceInventory'
 import {
   ImportCancelledError,
   PartialImportError,
@@ -132,6 +133,9 @@ app.on('before-quit', () => {
 let allowedProjectPath: string | null = null
 const datasetSources = new Map<string, DatasetCatalogSource>()
 const datasetHarmonyAudioSources = new Map<string, { sourcePath: string }>()
+// Source locations remain private to main. A renderer holds only this opaque
+// group ID and can request an aggregate preparation inventory for it.
+const datasetPackageGroups = new Map<string, DatasetCatalogSource[]>()
 const datasetCatalogParents = new Map<string, string>()
 const approvedDatasetPackageIds = new Set<string>()
 const DATASET_CATALOG_PARENT_KEY = 'dataset-catalog-parent.json'
@@ -900,6 +904,7 @@ ipcMain.handle('dataset:choosePackageFolder', async (event) => {
       })
     })
     const groupId = randomUUID()
+    const groupSources: DatasetCatalogSource[] = []
     const candidates: Array<{ candidateId: string; groupId: string } & DatasetSourceSummary> = []
     let strumGeneratedCount = 0
     for (const [index, packagePath] of packagePaths.entries()) {
@@ -917,6 +922,7 @@ ipcMain.handle('dataset:choosePackageFolder', async (event) => {
               : 'rb3con',
         sourcePath: resolve(packagePath)
       }
+      groupSources.push(source)
       const summaries = await summarizeDatasetSourceEntries(source)
       for (const summary of summaries) {
         const candidateId = randomUUID()
@@ -930,6 +936,7 @@ ipcMain.handle('dataset:choosePackageFolder', async (event) => {
       completed: packagePaths.length,
       total: packagePaths.length
     })
+    datasetPackageGroups.set(groupId, groupSources)
     return {
       groupId,
       groupName: basename(resolve(result.filePaths[0])),
@@ -942,10 +949,40 @@ ipcMain.handle('dataset:choosePackageFolder', async (event) => {
   }
 })
 
-ipcMain.handle('dataset:removePackageGroup', (_event, groupCandidateIds: string[]) => {
-  for (const candidateId of groupCandidateIds) {
-    datasetSources.delete(candidateId)
-    approvedDatasetPackageIds.delete(candidateId)
+ipcMain.handle(
+  'dataset:removePackageGroup',
+  (_event, groupCandidateIds: string[], groupId?: string) => {
+    for (const candidateId of groupCandidateIds) {
+      datasetSources.delete(candidateId)
+      approvedDatasetPackageIds.delete(candidateId)
+    }
+    if (groupId) {
+      datasetPackageGroups.delete(groupId)
+      return
+    }
+    // Compatibility path for callers from an older preload: only forget a
+    // group when every one of its sources has lost all candidate references.
+    for (const [knownGroupId, sources] of datasetPackageGroups) {
+      const stillReferenced = sources.some((source) =>
+        [...datasetSources.values()].some(
+          (candidate) =>
+            candidate.sourcePath === source.sourcePath && candidate.kind === source.kind
+        )
+      )
+      if (!stillReferenced) datasetPackageGroups.delete(knownGroupId)
+    }
+  }
+)
+
+ipcMain.handle('dataset:inspectPackageGroup', async (_event, groupId: string) => {
+  const sources = datasetPackageGroups.get(groupId)
+  if (!sources) return null
+  try {
+    return await inventoryDatasetPackageSources(sources)
+  } catch {
+    // The service is already aggregate-only. Keep IPC failures generic so a
+    // renderer never receives source paths or parser error details.
+    return null
   }
 })
 

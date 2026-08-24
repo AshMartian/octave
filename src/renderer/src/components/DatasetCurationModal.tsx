@@ -50,11 +50,31 @@ type ExistingCatalog = {
 
 type PackageCandidate = SourceCandidate & { groupId: string }
 
+type PackageInventory = {
+  selectedPackageCount: number
+  inspectedPackageCount: number
+  packageLimitReachedCount: number
+  readablePackageCount: number
+  readableHeaderCount: number
+  unreadablePackageCount: number
+  inspectedChartCount: number
+  validNotesMidiCount: number
+  invalidOrMissingNotesMidiCount: number
+  chartOnlyCount: number
+  exactExpertPartVocalsCount: number
+  duplicateMidiCount: number
+  duplicateContainerCount: number
+  containerIdentityUnavailableCount: number
+  decodeTimeoutCount: number
+  decodeFailureCount: number
+}
+
 type PackageGroup = {
   groupId: string
   groupName: string
   strumGeneratedCount: number
   candidates: PackageCandidate[]
+  inventory?: PackageInventory
 }
 
 type TrainingRuntime = {
@@ -559,6 +579,7 @@ export function TrainingModal({
   const [discoveringCheckpoints, setDiscoveringCheckpoints] = useState(false)
   const [savingAutoChartProfile, setSavingAutoChartProfile] = useState(false)
   const [trainingJob, setTrainingJob] = useState<TrainingJob | null>(null)
+  const [inventoryingGroupId, setInventoryingGroupId] = useState<string | null>(null)
   const [prepareConfig, setPrepareConfig] = useState<Record<string, TrainingControlValue>>({})
   const [trainConfig, setTrainConfig] = useState<Record<string, TrainingControlValue>>({})
   const [promotionArtifactId, setPromotionArtifactId] = useState('')
@@ -1031,7 +1052,8 @@ export function TrainingModal({
 
   const removePackageGroup = async (group: PackageGroup): Promise<void> => {
     await window.api.removeDatasetPackageGroup(
-      group.candidates.map((candidate) => candidate.candidateId)
+      group.candidates.map((candidate) => candidate.candidateId),
+      group.groupId
     )
     setPackageGroups((current) => current.filter((entry) => entry.groupId !== group.groupId))
     setSelectedPackages((current) => {
@@ -1039,6 +1061,22 @@ export function TrainingModal({
       for (const candidate of group.candidates) next.delete(candidate.candidateId)
       return next
     })
+  }
+
+  const inventoryPackageGroup = async (group: PackageGroup): Promise<void> => {
+    setInventoryingGroupId(group.groupId)
+    setError(null)
+    try {
+      const inventory = await window.api.inspectDatasetPackageGroup(group.groupId)
+      if (!inventory) throw new Error('Package inventory unavailable')
+      setPackageGroups((current) =>
+        current.map((entry) => (entry.groupId === group.groupId ? { ...entry, inventory } : entry))
+      )
+    } catch {
+      setError('Could not inventory the selected package sources.')
+    } finally {
+      setInventoryingGroupId(null)
+    }
   }
 
   const togglePackage = async (candidate: SourceCandidate): Promise<void> => {
@@ -1921,13 +1959,37 @@ export function TrainingModal({
                               : ''}
                           </small>
                         </div>
-                        <button
-                          onClick={() => void removePackageGroup(group)}
-                          disabled={exporting || scanningPackages}
-                        >
-                          Remove
-                        </button>
+                        <div className="dataset-package-actions">
+                          <button
+                            className="dataset-secondary"
+                            onClick={() => void inventoryPackageGroup(group)}
+                            disabled={exporting || scanningPackages || inventoryingGroupId !== null}
+                          >
+                            {inventoryingGroupId === group.groupId ? 'Inventorying…' : 'Inventory'}
+                          </button>
+                          <button
+                            onClick={() => void removePackageGroup(group)}
+                            disabled={
+                              exporting || scanningPackages || inventoryingGroupId === group.groupId
+                            }
+                          >
+                            Remove
+                          </button>
+                        </div>
                       </header>
+                      {group.inventory && (
+                        <p className="dataset-package-inventory" aria-live="polite">
+                          {group.inventory.validNotesMidiCount} valid MIDI ·{' '}
+                          {group.inventory.chartOnlyCount} chart-only ·{' '}
+                          {group.inventory.invalidOrMissingNotesMidiCount} invalid/missing MIDI ·{' '}
+                          {group.inventory.exactExpertPartVocalsCount} exact Expert Vocals ·{' '}
+                          {group.inventory.duplicateMidiCount} duplicate MIDI ·{' '}
+                          {group.inventory.duplicateContainerCount} duplicate containers
+                          {group.inventory.decodeTimeoutCount || group.inventory.decodeFailureCount
+                            ? ` · ${group.inventory.decodeTimeoutCount} timed out · ${group.inventory.decodeFailureCount} failed`
+                            : ''}
+                        </p>
+                      )}
                       {group.candidates.map((entry) => renderCandidate(entry, true))}
                     </section>
                   ))}

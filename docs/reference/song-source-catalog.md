@@ -188,6 +188,25 @@ their assets, roles, provenance, source IDs, and current control hash validate
 again. OCTAVE rejects a selected Harmony file whose content hash equals the
 record's `mix` or shared `vocals` asset; it never performs separation, labels
 an unproven source as isolated, or falls back to shared vocals/mix.
+### Preparation inventory
+
+Before selecting package-backed songs, Dataset Curation can run a bounded,
+main-process-only package inventory for the opaque folder selection. This is a
+preparation aid, not a converter or a curation decision. It returns aggregate
+counts only: readable package/header containers, valid and invalid/missing
+`notes.mid`, `notes.chart`-only inputs, exact canonical Expert Vocal lead
+availability, duplicate MIDI/container identities when a bounded hash was
+available, and timeout/failure totals. It never returns source locations,
+package entry names, metadata, hashes, parser errors, or candidate IDs.
+
+The inventory accepts only the package group selected through OCTAVE's trusted
+dialog. It has bounded package count, package/entry byte limits, and a
+cancellable SNG decode timeout. ZIP and RB3CON inspection reads chart metadata
+only; it does not decrypt audio, transcode charts, materialize a catalog, or
+change rights, consent, selection, or catalog eligibility. “Exact Expert
+Vocals” means one literal `PART VOCALS` track with observed Vocal note labels;
+Vocal tracks do not use the five-lane difficulty bands, but catalog coverage
+records a present Vocal part as Expert.
 
 STRUM rejects a catalog without both root files, with a staging marker, or with
 any asset/hash validation failure. It never tries to repair an incomplete

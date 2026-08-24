@@ -61,8 +61,29 @@ const api = {
     }>
   } | null> => ipcRenderer.invoke('dataset:choosePackageFolder'),
 
-  removeDatasetPackageGroup: (candidateIds: string[]): Promise<void> =>
-    ipcRenderer.invoke('dataset:removePackageGroup', candidateIds),
+  removeDatasetPackageGroup: (candidateIds: string[], groupId?: string): Promise<void> =>
+    ipcRenderer.invoke('dataset:removePackageGroup', candidateIds, groupId),
+
+  inspectDatasetPackageGroup: (
+    groupId: string
+  ): Promise<{
+    selectedPackageCount: number
+    inspectedPackageCount: number
+    packageLimitReachedCount: number
+    readablePackageCount: number
+    readableHeaderCount: number
+    unreadablePackageCount: number
+    inspectedChartCount: number
+    validNotesMidiCount: number
+    invalidOrMissingNotesMidiCount: number
+    chartOnlyCount: number
+    exactExpertPartVocalsCount: number
+    duplicateMidiCount: number
+    duplicateContainerCount: number
+    containerIdentityUnavailableCount: number
+    decodeTimeoutCount: number
+    decodeFailureCount: number
+  } | null> => ipcRenderer.invoke('dataset:inspectPackageGroup', groupId),
 
   onDatasetScanProgress: (
     callback: (progress: {
