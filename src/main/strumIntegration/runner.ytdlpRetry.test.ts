@@ -96,7 +96,7 @@ vi.mock('child_process', () => ({
   }
 }))
 
-import { runAutoChart } from './runner'
+import { cancelProfileUrlMaterialization, materializeProfileUrlAudio, runAutoChart } from './runner'
 
 const YT_403 =
   'yt-dlp 2026.03.17 could not download https://youtu.be/x: ERROR: unable to download video data: HTTP Error 403: Forbidden'
@@ -122,6 +122,25 @@ afterEach(() => {
 })
 
 describe('runAutoChart yt-dlp refresh + retry', () => {
+  it('does not spawn yt-dlp when cancellation wins during its managed refresh', async () => {
+    let releaseRefresh: (() => void) | undefined
+    refreshMock.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseRefresh = resolve
+        })
+    )
+
+    const materialization = materializeProfileUrlAudio('materialize-cancel', 'https://youtu.be/x')
+    await vi.waitFor(() => expect(refreshMock).toHaveBeenCalledTimes(1))
+
+    await expect(cancelProfileUrlMaterialization('materialize-cancel')).resolves.toBe(true)
+    releaseRefresh?.()
+
+    await expect(materialization).rejects.toThrow(/cancelled/)
+    expect(spawnCalls).toHaveLength(0)
+  })
+
   it('refreshes before a URL run, and retries once after a 403 when the refresh produced a newer build', async () => {
     refreshMock
       // proactive (throttled) check before the run

@@ -13,9 +13,15 @@ import type {
   StrumPromotionJobDescriptor,
   StrumPromotionJobResult
 } from '../../shared/strumTrainingContracts'
-import { resolvePythonCommand, type PythonCommand } from './runner'
+import {
+  cancelProfileUrlMaterialization,
+  materializeProfileUrlAudio,
+  resolvePythonCommand,
+  type MaterializedProfileAudio,
+  type PythonCommand
+} from './runner'
 import { sanitizeTrainingSchemaValues } from './trainingSchema'
-import type { AutoChartRunOptions, AutoChartRunResult } from './types'
+import type { AutoChartRunOptions, AutoChartRunResult, TypedChartArtifacts } from './types'
 
 const PROTOCOL_MAJOR = 1
 const TRAINING_ROOT_NAME = 'strum-training'
@@ -35,7 +41,8 @@ const SAFE_RUNTIME_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const SAFE_STRUM_RUNTIME_FALLBACK_ID = /^strum-\d+\.\d+\.\d+\+git\.[a-f0-9]{7,64}$/
 const SAFE_PROTOCOL_VERSION = /^(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*)){0,2}$/
 const SAFE_RUNTIME_CAPABILITY = /^[a-z][a-z0-9_]{0,63}$/
-const SAFE_RUNTIME_PIPELINE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}(?:\/[A-Za-z0-9][A-Za-z0-9._-]{0,63}){0,3}$/
+const SAFE_RUNTIME_PIPELINE_ID =
+  /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}(?:\/[A-Za-z0-9][A-Za-z0-9._-]{0,63}){0,3}$/
 const SAFE_RUNTIME_DEVICE = /^[a-z][a-z0-9_]{0,31}$/
 const SAFE_SOURCE_REVISION = /^[a-f0-9]{7,64}$/
 
@@ -292,7 +299,7 @@ type RunningTrainingJob = {
 }
 
 type RunningProfiledAutoChart = {
-  process: ChildProcess
+  process?: ChildProcess
   requestPaths: string[]
   cancelling: boolean
 }
@@ -653,7 +660,8 @@ function normalizeRuntime(
     capabilities: [
       ...new Set([
         ...rawCapabilities,
-        ...(rawCapabilities.includes('dataset_prepare') && rawCapabilities.includes('training_start')
+        ...(rawCapabilities.includes('dataset_prepare') &&
+        rawCapabilities.includes('training_start')
           ? ['training']
           : [])
       ])
@@ -699,10 +707,7 @@ async function runWorkerJsonWithInvocation(
 async function runWorkerJson(args: string[]): Promise<Record<string, unknown>> {
   for (;;) {
     const resolved = await resolveWorkerInvocation('training-probe')
-    if (
-      resolved.runtimeSelectionEpoch !== runtimeSelectionEpoch ||
-      runtimeSelectionActivation
-    ) {
+    if (resolved.runtimeSelectionEpoch !== runtimeSelectionEpoch || runtimeSelectionActivation) {
       continue
     }
     return await runWorkerJsonWithInvocation(resolved.invocation, args)
@@ -712,10 +717,7 @@ async function runWorkerJson(args: string[]): Promise<Record<string, unknown>> {
 export async function probeTrainingRuntime(): Promise<TrainingRuntime> {
   for (;;) {
     const resolved = await resolveWorkerInvocation('training-probe')
-    if (
-      resolved.runtimeSelectionEpoch !== runtimeSelectionEpoch ||
-      runtimeSelectionActivation
-    ) {
+    if (resolved.runtimeSelectionEpoch !== runtimeSelectionEpoch || runtimeSelectionActivation) {
       continue
     }
     return normalizeRuntime(
@@ -2534,25 +2536,44 @@ function profiledChartDevice(runtime: TrainingRuntime): 'cuda' | 'mps' | 'cpu' {
   return 'cpu'
 }
 
-function resolveProfiledAudioInput(options: Omit<AutoChartRunOptions, 'cacheDir'>): string {
+type ProfiledAudioInput = { kind: 'local'; audioPath: string } | { kind: 'url'; url: string }
+
+function isAbsoluteLocalAudioPath(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    isAbsolute(value) &&
+    !/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(value)
+  )
+}
+
+function resolveProfiledAudioInput(
+  options: Omit<AutoChartRunOptions, 'cacheDir'>
+): ProfiledAudioInput {
   const files = Array.isArray(options.files) ? options.files : []
   const folders = Array.isArray(options.folders) ? options.folders : []
   const stemFolders = Array.isArray(options.stemFolders) ? options.stemFolders : []
   const stemSongs = Array.isArray(options.stemSongs) ? options.stemSongs : []
   const urls = Array.isArray(options.urls) ? options.urls : []
-  if (
-    files.length !== 1 ||
-    !files.every((file) => typeof file === 'string' && file.length > 0) ||
-    folders.length > 0 ||
-    stemFolders.length > 0 ||
-    stemSongs.length > 0 ||
-    urls.length > 0
-  ) {
+  if (folders.length > 0 || stemFolders.length > 0 || stemSongs.length > 0) {
     throw new Error(
-      'The selected STRUM profile accepts exactly one local audio file. Folder, stem, and URL inputs are not supported by this profile.'
+      'The selected STRUM profile accepts one local audio file or one HTTPS URL. Folder and stem inputs are not supported by this profile.'
     )
   }
-  return files[0]
+  if (files.length === 1 && urls.length === 0 && isAbsoluteLocalAudioPath(files[0])) {
+    return { kind: 'local', audioPath: files[0] }
+  }
+  if (
+    files.length === 0 &&
+    urls.length === 1 &&
+    typeof urls[0] === 'string' &&
+    /^https:\/\//i.test(urls[0])
+  ) {
+    return { kind: 'url', url: urls[0] }
+  }
+  throw new Error(
+    'The selected STRUM profile accepts exactly one absolute local audio file or one HTTPS URL.'
+  )
 }
 
 function validateProfiledChartPreflight(
@@ -2568,6 +2589,7 @@ function validateProfiledChartPreflight(
     raw.status !== 'ready' ||
     raw.execution !== 'available' ||
     raw.profile_id !== requestedProfileId ||
+    raw.manifest_sha256 !== profile.manifestSha256 ||
     raw.difficulty_policy !== requestedPolicy ||
     raw.device !== device ||
     !Array.isArray(rawInstruments) ||
@@ -2578,16 +2600,82 @@ function validateProfiledChartPreflight(
   }
 }
 
-function safeProfiledAutoChartResult(
+async function fingerprintChartArtifact(path: string): Promise<string> {
+  return await new Promise((resolve, reject) => {
+    const hash = createHash('sha256')
+    const stream = createReadStream(path)
+    stream.on('data', (chunk: string | Buffer) => hash.update(chunk))
+    stream.once('error', () => reject(new Error('chart artifact unavailable')))
+    stream.once('end', () => resolve(hash.digest('hex')))
+  })
+}
+
+async function inspectTypedChartArtifacts(
+  outputDir: string,
+  profile: ResolvedAutoChartProfile
+): Promise<TypedChartArtifacts> {
+  const manifestSha256 = profile.manifestSha256
+  if (!manifestSha256) {
+    throw new Error('The validated STRUM profile has no saved bundle identity.')
+  }
+  let manifest: Record<string, unknown>
+  try {
+    const raw = JSON.parse(await readFile(join(outputDir, 'run.json'), 'utf8')) as unknown
+    if (!isRecord(raw)) throw new Error('invalid manifest')
+    manifest = raw
+  } catch {
+    throw new Error('The validated STRUM profile did not produce an inspectable chart artifact.')
+  }
+  const notes = isRecord(manifest.artifacts) ? manifest.artifacts.notes_midi : null
+  if (
+    manifest.format !== STRUM_CHART_RUN_FORMAT ||
+    manifest.status !== 'completed' ||
+    manifest.profile_id !== (profile.strumProfileId ?? profile.profileId) ||
+    manifest.capability !== profile.pipelineId ||
+    manifest.manifest_sha256 !== manifestSha256 ||
+    !isRecord(notes) ||
+    notes.name !== 'notes.mid' ||
+    typeof notes.sha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(notes.sha256)
+  ) {
+    throw new Error('The validated STRUM profile produced an invalid chart artifact.')
+  }
+  let notesHash: string
+  let runHash: string
+  try {
+    ;[notesHash, runHash] = await Promise.all([
+      fingerprintChartArtifact(join(outputDir, 'notes.mid')),
+      fingerprintChartArtifact(join(outputDir, 'run.json'))
+    ])
+  } catch {
+    throw new Error('The validated STRUM profile did not produce complete chart artifacts.')
+  }
+  if (notesHash !== notes.sha256) {
+    throw new Error('The validated STRUM profile produced an invalid chart artifact.')
+  }
+  return {
+    format: 'strum-typed-chart-artifacts/v1',
+    profileId: profile.strumProfileId ?? profile.profileId,
+    capability: profile.pipelineId,
+    manifestSha256,
+    artifacts: [
+      { id: 'notes_midi', name: 'notes.mid', sha256: notesHash },
+      { id: 'run_manifest', name: 'run.json', sha256: runHash }
+    ]
+  }
+}
+
+async function safeProfiledAutoChartResult(
   raw: Record<string, unknown>,
   outputDir: string,
   profile: ResolvedAutoChartProfile
-): AutoChartRunResult {
+): Promise<AutoChartRunResult> {
   const requestedProfileId = profile.strumProfileId ?? profile.profileId
   if (
     raw.format !== STRUM_CHART_RUN_FORMAT ||
     raw.status !== 'completed' ||
     raw.profile_id !== requestedProfileId ||
+    raw.manifest_sha256 !== profile.manifestSha256 ||
     raw.run_manifest_name !== 'run.json' ||
     raw.output_name !== 'notes.mid'
   ) {
@@ -2596,26 +2684,39 @@ function safeProfiledAutoChartResult(
   // A direct STRUM profile produces chart artifacts, not a legacy song-package
   // folder. Keep the output location user-selected and do not invent a package
   // that OCTAVE has not received from the worker.
-  return { success: true, outputDir, songFolders: [], errors: [] }
+  return {
+    success: true,
+    outputDir,
+    songFolders: [],
+    errors: [],
+    typedArtifacts: await inspectTypedChartArtifacts(outputDir, profile)
+  }
 }
 
-async function runProfiledChartCommand(
+async function runProfiledWorkerJsonCommand(
   worker: WorkerInvocation,
   runId: string,
-  requestPaths: string[]
+  requestPaths: string[],
+  args: string[],
+  cleanupRequests: boolean
 ): Promise<Record<string, unknown>> {
   return await new Promise((resolve, reject) => {
-    const child = spawn(
-      worker.command,
-      [...worker.baseArgs, 'chart', 'run', '--request', requestPaths[1], '--json'],
-      {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: worker.env,
-        cwd: worker.cwd,
-        detached: process.platform !== 'win32'
-      }
-    )
-    runningProfiledAutoCharts.set(runId, { process: child, requestPaths, cancelling: false })
+    if (runningProfiledAutoCharts.get(runId)?.cancelling) {
+      reject(new Error('The validated STRUM profile chart run was cancelled.'))
+      return
+    }
+    const child = spawn(worker.command, [...worker.baseArgs, ...args], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: worker.env,
+      cwd: worker.cwd,
+      detached: process.platform !== 'win32'
+    })
+    const running = runningProfiledAutoCharts.get(runId)
+    runningProfiledAutoCharts.set(runId, {
+      process: child,
+      requestPaths,
+      cancelling: running?.cancelling === true
+    })
     let stdout = ''
     child.stdout?.on('data', (chunk: Buffer) => {
       stdout += chunk.toString('utf8')
@@ -2624,8 +2725,17 @@ async function runProfiledChartCommand(
       // Worker stderr may contain private host details; never forward it.
     })
     const clean = async (): Promise<void> => {
-      runningProfiledAutoCharts.delete(runId)
-      await Promise.all(requestPaths.map(async (path) => await unlink(path).catch(() => undefined)))
+      if (cleanupRequests) {
+        runningProfiledAutoCharts.delete(runId)
+        await Promise.all(
+          requestPaths.map(async (path) => await unlink(path).catch(() => undefined))
+        )
+      } else {
+        const tracked = runningProfiledAutoCharts.get(runId)
+        if (tracked?.process === child) {
+          runningProfiledAutoCharts.set(runId, { ...tracked, process: undefined })
+        }
+      }
     }
     child.once('error', () => {
       void clean().then(() =>
@@ -2663,42 +2773,57 @@ async function runResolvedAutoChartProfile(
   let worker: WorkerInvocation
   for (;;) {
     const resolved = await resolveWorkerInvocation(options.runId)
-    if (resolved.runtimeSelectionEpoch !== runtimeSelectionEpoch || runtimeSelectionActivation) continue
+    if (resolved.runtimeSelectionEpoch !== runtimeSelectionEpoch || runtimeSelectionActivation)
+      continue
     worker = resolved.invocation
     break
   }
-  const audioPath = resolveProfiledAudioInput(options)
+  const input = resolveProfiledAudioInput(options)
+  let materialized: MaterializedProfileAudio | null = null
   const runtime = await probeTrainingRuntime()
   const device = profiledChartDevice(runtime)
   const requestPrefix = `octave-profile-chart-${options.runId}-${randomUUID()}`
   const preflightRequestPath = join(app.getPath('temp'), `${requestPrefix}-preflight.json`)
   const runRequestPath = join(app.getPath('temp'), `${requestPrefix}-run.json`)
   const requestPaths = [preflightRequestPath, runRequestPath]
-  await writeFile(
-    preflightRequestPath,
-    JSON.stringify({
-      model_root: profile.checkpointRoot,
-      profile_id: profile.strumProfileId ?? profile.profileId,
-      difficulty_policy: profile.difficultyPolicy ?? 'expert_only',
-      instruments: profile.instruments,
-      device
-    }),
-    'utf8'
-  )
-  broadcastAutoChartProgress({
-    runId: options.runId,
-    stage: 'bootstrap',
-    percent: 5,
-    message: 'Preflighting the validated STRUM profile locally.'
-  })
   try {
-    const preflight = await runWorkerJsonWithInvocation(worker, [
-      'chart',
-      'preflight',
-      '--request',
+    if (runningProfiledAutoCharts.get(options.runId)?.cancelling) {
+      throw new Error('The validated STRUM profile chart run was cancelled.')
+    }
+    const audioPath =
+      input.kind === 'local'
+        ? input.audioPath
+        : (materialized = await materializeProfileUrlAudio(options.runId, input.url)).audioPath
+    if (runningProfiledAutoCharts.get(options.runId)?.cancelling) {
+      throw new Error('The validated STRUM profile chart run was cancelled.')
+    }
+    await writeFile(
       preflightRequestPath,
-      '--json'
-    ])
+      JSON.stringify({
+        model_root: profile.checkpointRoot,
+        profile_id: profile.strumProfileId ?? profile.profileId,
+        difficulty_policy: profile.difficultyPolicy ?? 'expert_only',
+        instruments: profile.instruments,
+        device
+      }),
+      'utf8'
+    )
+    broadcastAutoChartProgress({
+      runId: options.runId,
+      stage: 'bootstrap',
+      percent: 5,
+      message: 'Preflighting the validated STRUM profile locally.'
+    })
+    const preflight = await runProfiledWorkerJsonCommand(
+      worker,
+      options.runId,
+      requestPaths,
+      ['chart', 'preflight', '--request', preflightRequestPath, '--json'],
+      false
+    )
+    if (runningProfiledAutoCharts.get(options.runId)?.cancelling) {
+      throw new Error('The validated STRUM profile chart run was cancelled.')
+    }
     validateProfiledChartPreflight(preflight, profile, device)
     await writeFile(
       runRequestPath,
@@ -2715,33 +2840,58 @@ async function runResolvedAutoChartProfile(
       percent: 25,
       message: 'Running the validated STRUM profile locally.'
     })
-    return safeProfiledAutoChartResult(
-      await runProfiledChartCommand(worker, options.runId, requestPaths),
+    return await safeProfiledAutoChartResult(
+      await runProfiledWorkerJsonCommand(
+        worker,
+        options.runId,
+        requestPaths,
+        ['chart', 'run', '--request', runRequestPath, '--json'],
+        true
+      ),
       options.outputDir,
       profile
     )
   } catch (error) {
     await Promise.all(requestPaths.map(async (path) => await unlink(path).catch(() => undefined)))
     throw error
+  } finally {
+    await materialized?.cleanup()
   }
 }
 
 export async function runDefaultAutoChartProfile(
   options: Omit<AutoChartRunOptions, 'cacheDir'>
 ): Promise<AutoChartRunResult | null> {
-  const profile = await resolveDefaultAutoChartProfile()
-  return profile ? await runResolvedAutoChartProfile(profile, options) : null
+  runningProfiledAutoCharts.set(options.runId, { requestPaths: [], cancelling: false })
+  try {
+    const profile = await resolveDefaultAutoChartProfile()
+    if (!profile) {
+      if (runningProfiledAutoCharts.get(options.runId)?.cancelling) {
+        throw new Error('The validated STRUM profile chart run was cancelled.')
+      }
+      return null
+    }
+    if (runningProfiledAutoCharts.get(options.runId)?.cancelling) {
+      throw new Error('The validated STRUM profile chart run was cancelled.')
+    }
+    return await runResolvedAutoChartProfile(profile, options)
+  } finally {
+    runningProfiledAutoCharts.delete(options.runId)
+  }
 }
 
 export async function cancelDefaultAutoChartProfile(runId: string): Promise<boolean> {
   const job = runningProfiledAutoCharts.get(runId)
   if (!job) return false
   job.cancelling = true
-  try {
-    if (process.platform !== 'win32' && job.process.pid) process.kill(-job.process.pid, 'SIGTERM')
-    else job.process.kill('SIGTERM')
-  } catch {
-    return false
+  const materializationCancelled = await cancelProfileUrlMaterialization(runId)
+  if (job.process) {
+    try {
+      if (process.platform !== 'win32' && job.process.pid) process.kill(-job.process.pid, 'SIGTERM')
+      else job.process.kill('SIGTERM')
+    } catch {
+      return materializationCancelled
+    }
   }
   await Promise.all(job.requestPaths.map(async (path) => await unlink(path).catch(() => undefined)))
   return true
@@ -2761,10 +2911,7 @@ async function startJsonEventJob(
   let worker: WorkerInvocation
   for (;;) {
     const resolved = await resolveWorkerInvocation(jobId)
-    if (
-      resolved.runtimeSelectionEpoch !== runtimeSelectionEpoch ||
-      runtimeSelectionActivation
-    ) {
+    if (resolved.runtimeSelectionEpoch !== runtimeSelectionEpoch || runtimeSelectionActivation) {
       continue
     }
     worker = resolved.invocation

@@ -27,6 +27,11 @@ type AutoChartProgressState = {
   outputDir: string
   error: string | null
   warnings: string[]
+  typedArtifacts?: {
+    profileId: string
+    capability: string
+    artifacts: Array<{ id: 'notes_midi' | 'run_manifest'; name: string; sha256: string }>
+  }
 }
 
 const EMPTY_AUTO_CHART_URL = ''
@@ -461,21 +466,30 @@ export function Toolbar(): React.JSX.Element {
           percent: 100,
           stage: 'complete',
           message: event.success
-            ? 'Auto-chart complete.'
+            ? event.typedArtifacts
+              ? 'Validated STRUM chart artifacts are ready for review.'
+              : 'Auto-chart complete.'
             : 'Auto-chart finished with no successful songs.',
-          warnings: event.errors
+          warnings: event.errors,
+          typedArtifacts: event.typedArtifacts
         }
       })
 
-      const newSongId = event.success && event.songFolders.length > 0
-        ? event.songFolders[0].split(/[\\/]/).pop()
-        : undefined
+      const newSongId =
+        event.success && event.songFolders.length > 0
+          ? event.songFolders[0].split(/[\\/]/).pop()
+          : undefined
 
-      if (event.outputDir) {
+      if (event.outputDir && !event.typedArtifacts) {
         updateSettings({ autoChartOutputDir: event.outputDir, lastOpenedFolder: event.outputDir })
         // Optionally pull the source video for any URL inputs into their
         // resulting song folders so it shows up in the timeline / in-game.
-        if (event.success && autoChartDownloadVideo && event.urlSongFolders && event.urlSongFolders.length > 0) {
+        if (
+          event.success &&
+          autoChartDownloadVideo &&
+          event.urlSongFolders &&
+          event.urlSongFolders.length > 0
+        ) {
           void Promise.allSettled(
             event.urlSongFolders.map((entry) =>
               window.api.downloadVideoUrl(entry.songFolder, entry.url).catch((err) => {
@@ -491,8 +505,10 @@ export function Toolbar(): React.JSX.Element {
         }
       }
 
-      if (event.success) {
+      if (event.success && !event.typedArtifacts) {
         setAutoChartCloseCountdown(5)
+      } else if (event.typedArtifacts) {
+        setAutoChartCloseCountdown(null)
       }
     })
   }, [autoChartDownloadVideo, loadProjectFolder, updateSettings])
@@ -2377,6 +2393,20 @@ export function Toolbar(): React.JSX.Element {
                       ))}
                     </div>
                   )}
+                  {autoChartProgress.typedArtifacts && (
+                    <div className="auto-chart-warning-list" data-testid="typed-strum-artifacts">
+                      <strong>Validated STRUM checkpoint output</strong>
+                      <div>
+                        {autoChartProgress.typedArtifacts.capability} · review the listed artifacts
+                        in your selected output folder before curating them.
+                      </div>
+                      {autoChartProgress.typedArtifacts.artifacts.map((artifact) => (
+                        <div key={artifact.id} className="auto-chart-warning-item">
+                          {artifact.name} · {artifact.sha256.slice(0, 12)}…
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </section>
             </div>
@@ -2401,7 +2431,8 @@ export function Toolbar(): React.JSX.Element {
                       isRunning: false,
                       outputDir: getPreferredAutoChartOutputDir(),
                       error: null,
-                      warnings: []
+                      warnings: [],
+                      typedArtifacts: undefined
                     })
                   }}
                 >
