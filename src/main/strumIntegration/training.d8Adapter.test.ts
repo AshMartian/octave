@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -44,6 +44,8 @@ let probePayload: Record<string, unknown> = {
     'post_train_job_start'
   ]
 }
+let trainingBundleRoot = ''
+let trainingBundleEscapesRun = false
 const originalStrumSourceDir = process.env.OCTAVE_STRUM_SOURCE_DIR
 const manifestSha = 'a'.repeat(64)
 const artifactId = `strum-model-bundle/${'b'.repeat(64)}`
@@ -197,6 +199,15 @@ vi.mock('child_process', () => ({
       return
     }
     if (args.includes('checkpoint') && args.includes('inspect')) {
+      const modelRoot = args[args.indexOf('--model-root') + 1]
+      if (
+        trainingBundleRoot &&
+        modelRoot.startsWith(join(scratch, 'strum-training', 'runs')) &&
+        modelRoot !== trainingBundleRoot
+      ) {
+        callback(null, `${JSON.stringify({ status: 'invalid', code: 'model_bundle_invalid' })}\n`)
+        return
+      }
       callback(null, `${JSON.stringify(candidate())}\n`)
       return
     }
@@ -241,8 +252,18 @@ vi.mock('child_process', () => ({
         mkdirSync(join(output, '..'), { recursive: true })
         writeFileSync(output, '{}\n')
       } else {
-        mkdirSync(output, { recursive: true })
-        writeFileSync(join(output, 'strum-model-bundle.json'), '{}\n')
+        const bundleRoot = args.includes('train') ? join(output, 'bundle') : output
+        if (args.includes('train')) trainingBundleRoot = bundleRoot
+        if (args.includes('train') && trainingBundleEscapesRun) {
+          const escapedBundle = join(scratch, 'escaped-bundle')
+          mkdirSync(escapedBundle, { recursive: true })
+          writeFileSync(join(escapedBundle, 'strum-model-bundle.json'), '{}\n')
+          mkdirSync(output, { recursive: true })
+          symlinkSync(escapedBundle, bundleRoot, 'dir')
+        } else {
+          mkdirSync(bundleRoot, { recursive: true })
+          writeFileSync(join(bundleRoot, 'strum-model-bundle.json'), '{}\n')
+        }
       }
       child.stdout.emit(
         'data',
@@ -278,7 +299,7 @@ vi.mock('child_process', () => ({
           : {
               status: 'completed',
               pipeline_id: pipeline.id,
-              bundle_name: 'run',
+              bundle_name: 'bundle',
               manifest_sha256: manifestSha,
               components: [{ id: 'chart_transform', sha256: 'c'.repeat(64), byte_length: 42 }]
             }
@@ -317,6 +338,7 @@ vi.mock('child_process', () => ({
 
 import {
   inspectTrainingCatalog,
+  inspectTrainingCheckpoint,
   listTrainingArtifacts,
   listPromotionJobs,
   chooseCheckpointFolder,
@@ -371,12 +393,16 @@ afterEach(() => {
       'post_train_job_start'
     ]
   }
+  trainingBundleRoot = ''
+  trainingBundleEscapesRun = false
   if (originalStrumSourceDir === undefined) {
     delete process.env.OCTAVE_STRUM_SOURCE_DIR
   } else {
     process.env.OCTAVE_STRUM_SOURCE_DIR = originalStrumSourceDir
   }
   rmSync(join(scratch, 'strum-training'), { recursive: true, force: true })
+  rmSync(join(scratch, 'escaped-bundle'), { recursive: true, force: true })
+  rmSync(join(scratch, 'post-registration-escaped-bundle'), { recursive: true, force: true })
 })
 
 describe('STRUM d8 training adapter', () => {
@@ -581,7 +607,7 @@ describe('STRUM d8 training adapter', () => {
     ).toMatchObject({ command: workerB })
   })
 
-  it('uses strict d8 request/result DTOs and keeps candidate roots private', async () => {
+  it('registers a nested raw training bundle and keeps candidate roots private', async () => {
     const catalogRoot = join(scratch, 'private-catalog')
     mkdirSync(catalogRoot, { recursive: true })
     const inspection = await inspectTrainingCatalog(catalogRoot, pipeline.id, {
@@ -637,6 +663,13 @@ describe('STRUM d8 training adapter', () => {
       expect.objectContaining({ artifactId, checkpointManifestHash: manifestSha })
     ])
     expect(JSON.stringify(artifacts)).not.toContain(scratch)
+    const trainingOutputRoot = String(requests[1].output)
+    expect(workerCommands).toContainEqual(
+      expect.arrayContaining(['checkpoint', 'inspect', '--model-root', join(trainingOutputRoot, 'bundle')])
+    )
+    expect(workerCommands).not.toContainEqual(
+      expect.arrayContaining(['checkpoint', 'inspect', '--model-root', trainingOutputRoot])
+    )
     expect(sends).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ state: 'running', code: 'started' }),
@@ -645,9 +678,84 @@ describe('STRUM d8 training adapter', () => {
     )
     expect(sends.filter((event) => event.state === 'succeeded')).toHaveLength(2)
     expect(existsSync(join(scratch, 'strum-training', 'registry.json'))).toBe(true)
-    const registry = readFileSync(join(scratch, 'strum-training', 'registry.json'), 'utf8')
-    expect(registry).toContain('candidateBinding')
-    expect(registry).toContain(catalogRoot)
+    const registry = JSON.parse(
+      readFileSync(join(scratch, 'strum-training', 'registry.json'), 'utf8')
+    ) as { runs: Array<{ candidateBinding?: { bundleRoot?: string; catalogRoot?: string } }> }
+    expect(registry.runs[0]?.candidateBinding).toMatchObject({
+      bundleRoot: join(trainingOutputRoot, 'bundle'),
+      catalogRoot
+    })
+    await expect(inspectTrainingCheckpoint(artifacts.runs[0].runId)).resolves.toMatchObject({
+      checkpointManifestHash: manifestSha,
+      deployable: false
+    })
+    expect(workerCommands).toContainEqual(
+      expect.arrayContaining([
+        'checkpoint',
+        'inspect',
+        '--model-root',
+        join(trainingOutputRoot, 'bundle')
+      ])
+    )
+  })
+
+  it('does not register a terminal bundle locator that escapes the run root', async () => {
+    const catalogRoot = join(scratch, 'symlink-catalog')
+    mkdirSync(catalogRoot, { recursive: true })
+    trainingBundleEscapesRun = true
+
+    const prepared = await startTrainingPrepare({
+      catalogRoot,
+      catalogId: 'catalog',
+      catalogName: 'Approved songs',
+      pipelineId: pipeline.id,
+      prepare: { instrument: 'guitar', target_difficulty: 'Hard' }
+    })
+    await settled()
+    await startTrainingRun({
+      taskViewId: prepared.taskViewId,
+      pipelineId: pipeline.id,
+      train: { model_id: 'five-lane-hard' }
+    })
+    await settled()
+
+    expect((await listTrainingArtifacts()).runs).toEqual([])
+    expect(
+      workerCommands.some(
+        (args) => args.includes('checkpoint') && args.includes('inspect') && args.includes('escaped-bundle')
+      )
+    ).toBe(false)
+  })
+
+  it('rejects a post-registration bundle symlink swap before worker inspection', async () => {
+    const catalogRoot = join(scratch, 'post-registration-symlink-catalog')
+    mkdirSync(catalogRoot, { recursive: true })
+    const prepared = await startTrainingPrepare({
+      catalogRoot,
+      catalogId: 'catalog',
+      catalogName: 'Approved songs',
+      pipelineId: pipeline.id,
+      prepare: { instrument: 'guitar', target_difficulty: 'Hard' }
+    })
+    await settled()
+    await startTrainingRun({
+      taskViewId: prepared.taskViewId,
+      pipelineId: pipeline.id,
+      train: { model_id: 'five-lane-hard' }
+    })
+    await settled()
+    const [run] = (await listTrainingArtifacts()).runs
+    const outputRoot = String(requests[1].output)
+    const bundleRoot = join(outputRoot, 'bundle')
+    const escapedBundle = join(scratch, 'post-registration-escaped-bundle')
+    rmSync(bundleRoot, { recursive: true, force: true })
+    mkdirSync(escapedBundle, { recursive: true })
+    writeFileSync(join(escapedBundle, 'strum-model-bundle.json'), '{}\n')
+    symlinkSync(escapedBundle, bundleRoot, 'dir')
+    const inspectionCount = workerCommands.length
+
+    await expect(inspectTrainingCheckpoint(run.runId)).rejects.toThrow('outside the training run')
+    expect(workerCommands.slice(inspectionCount)).toEqual([])
   })
 
   it('rejects malformed, wrong-pipeline, and path-bearing catalog summaries', async () => {
