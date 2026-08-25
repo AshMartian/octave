@@ -31,6 +31,13 @@ const MODEL_DISCOVERY_IGNORED_DIRECTORIES = new Set([
   '__pycache__',
   'node_modules'
 ])
+const SAFE_RUNTIME_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
+const SAFE_STRUM_RUNTIME_FALLBACK_ID = /^strum-\d+\.\d+\.\d+\+git\.[a-f0-9]{7,64}$/
+const SAFE_PROTOCOL_VERSION = /^(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*)){0,2}$/
+const SAFE_RUNTIME_CAPABILITY = /^[a-z][a-z0-9_]{0,63}$/
+const SAFE_RUNTIME_PIPELINE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}(?:\/[A-Za-z0-9][A-Za-z0-9._-]{0,63}){0,3}$/
+const SAFE_RUNTIME_DEVICE = /^[a-z][a-z0-9_]{0,31}$/
+const SAFE_SOURCE_REVISION = /^[a-f0-9]{7,64}$/
 
 export type TrainingPipeline = {
   id: string
@@ -236,6 +243,18 @@ type WorkerInvocation = {
   cwd?: string
 }
 
+/**
+ * The selected local runtime is part of OCTAVE's validated state, not merely
+ * an implementation detail of a worker invocation.  STRUM probes from older
+ * workers do not always repeat `runtime_kind`, so keep the lock-derived kind
+ * alongside the invocation until its public DTO is normalized.
+ */
+type ResolvedWorkerInvocation = {
+  invocation: WorkerInvocation
+  runtimeKind: TrainingRuntime['kind']
+  runtimeSelectionEpoch: number
+}
+
 type CandidateBinding = {
   artifactId: string
   bundleRoot: string
@@ -279,6 +298,9 @@ type RunningProfiledAutoChart = {
 
 const runningJobs = new Map<string, RunningTrainingJob>()
 const runningProfiledAutoCharts = new Map<string, RunningProfiledAutoChart>()
+/** A runtime selection is not visible to any worker action until its lock is durable. */
+let runtimeSelectionActivation: Promise<TrainingRuntime | null> | null = null
+let runtimeSelectionEpoch = 0
 /**
  * This deliberately lives only in the main process. Renderer clients receive
  * opaque artifact IDs and cannot ask OCTAVE to run an arbitrary local path.
@@ -518,18 +540,46 @@ async function verifyDeveloperRuntimeLock(settings: RuntimeSettings): Promise<Wo
   return invocation
 }
 
-async function resolveWorkerInvocation(purpose: string): Promise<WorkerInvocation> {
-  const settings = await readRuntimeSettings()
-  if (settings.installedWorkerPath) {
-    await verifyInstalledRuntimeLock(settings)
+async function resolveWorkerInvocation(purpose: string): Promise<ResolvedWorkerInvocation> {
+  for (;;) {
+    const selectionEpoch = runtimeSelectionEpoch
+    const activation = runtimeSelectionActivation
+    if (activation) {
+      await activation
+      continue
+    }
+    const settings = await readRuntimeSettings()
+    if (selectionEpoch !== runtimeSelectionEpoch || runtimeSelectionActivation) continue
+    if (settings.installedWorkerPath) {
+      await verifyInstalledRuntimeLock(settings)
+      if (selectionEpoch !== runtimeSelectionEpoch || runtimeSelectionActivation) continue
+      return {
+        runtimeSelectionEpoch: selectionEpoch,
+        runtimeKind: 'installed_runtime',
+        invocation: {
+          command: settings.installedWorkerPath,
+          baseArgs: [],
+          env: await workerEnvironment(settings)
+        }
+      }
+    }
+    if (settings.developerSourceRoot) {
+      const invocation = await verifyDeveloperRuntimeLock(settings)
+      if (selectionEpoch !== runtimeSelectionEpoch || runtimeSelectionActivation) continue
+      return {
+        runtimeSelectionEpoch: selectionEpoch,
+        runtimeKind: 'developer_override',
+        invocation
+      }
+    }
+    const invocation = await bundledAdapterInvocation(purpose, settings)
+    if (selectionEpoch !== runtimeSelectionEpoch || runtimeSelectionActivation) continue
     return {
-      command: settings.installedWorkerPath,
-      baseArgs: [],
-      env: await workerEnvironment(settings)
+      runtimeSelectionEpoch: selectionEpoch,
+      runtimeKind: 'bundled_inference',
+      invocation
     }
   }
-  if (settings.developerSourceRoot) return await verifyDeveloperRuntimeLock(settings)
-  return await bundledAdapterInvocation(purpose, settings)
 }
 
 function normalizeRuntime(
@@ -543,46 +593,75 @@ function normalizeRuntime(
     value.runtime && typeof value.runtime === 'object' && !Array.isArray(value.runtime)
       ? (value.runtime as Record<string, unknown>)
       : {}
-  const version = String(value.protocol_version ?? '')
+  const version =
+    typeof value.protocol_version === 'string'
+      ? value.protocol_version
+      : typeof value.protocol_version === 'number' &&
+          Number.isSafeInteger(value.protocol_version) &&
+          value.protocol_version > 0
+        ? String(value.protocol_version)
+        : ''
+  if (!SAFE_PROTOCOL_VERSION.test(version)) {
+    throw new Error('The selected STRUM runtime reported an invalid protocol version.')
+  }
   if (Number(version.split('.')[0]) !== PROTOCOL_MAJOR) {
     throw new Error('The selected STRUM runtime uses an unsupported protocol version.')
   }
-  const kind = String(value.runtime_kind ?? defaultKind)
+  const directRuntimeId = value.runtime_id
+  const fallbackRuntimeId = runtimeMetadata.id
+  const runtimeId =
+    typeof directRuntimeId === 'string'
+      ? directRuntimeId
+      : directRuntimeId === undefined || directRuntimeId === null
+        ? typeof fallbackRuntimeId === 'string'
+          ? fallbackRuntimeId
+          : 'unknown-runtime'
+        : ''
+  const validRuntimeId =
+    typeof directRuntimeId === 'string'
+      ? SAFE_RUNTIME_ID.test(runtimeId)
+      : runtimeId === 'unknown-runtime' || SAFE_STRUM_RUNTIME_FALLBACK_ID.test(runtimeId)
+  if (!validRuntimeId) {
+    throw new Error('The selected STRUM runtime reported an invalid runtime identity.')
+  }
+  const safeList = (candidate: unknown, pattern: RegExp, field: string): string[] => {
+    if (candidate === undefined) return []
+    if (
+      !Array.isArray(candidate) ||
+      !candidate.every((entry) => typeof entry === 'string' && pattern.test(entry))
+    ) {
+      throw new Error(`The selected STRUM runtime reported invalid ${field}.`)
+    }
+    return [...new Set(candidate)]
+  }
+  const rawCapabilities = safeList(value.capabilities, SAFE_RUNTIME_CAPABILITY, 'capabilities')
+  const rawPipelines = value.pipeline_ids ?? value.pipelines
+  const sourceRevision = value.source_revision ?? runtimeMetadata.source_revision
   if (
-    !['bundled_inference', 'developer_override', 'managed_checkout', 'installed_runtime'].includes(
-      kind
-    )
+    sourceRevision !== undefined &&
+    sourceRevision !== null &&
+    (typeof sourceRevision !== 'string' || !SAFE_SOURCE_REVISION.test(sourceRevision))
   ) {
-    throw new Error('The selected STRUM runtime reported an invalid runtime kind.')
+    throw new Error('The selected STRUM runtime reported an invalid source revision.')
   }
   return {
-    runtimeId: String(value.runtime_id ?? runtimeMetadata.id ?? 'unknown-runtime'),
-    displayName: String(value.display_name ?? 'STRUM runtime'),
-    kind: kind as TrainingRuntime['kind'],
+    runtimeId,
+    displayName: `STRUM ${defaultKind.replaceAll('_', ' ')} runtime`,
+    kind: defaultKind,
     protocolVersion: version,
     capabilities: [
       ...new Set([
-        ...(Array.isArray(value.capabilities) ? value.capabilities.map(String) : []),
-        ...(Array.isArray(value.capabilities) &&
-        value.capabilities.includes('dataset_prepare') &&
-        value.capabilities.includes('training_start')
+        ...rawCapabilities,
+        ...(rawCapabilities.includes('dataset_prepare') && rawCapabilities.includes('training_start')
           ? ['training']
           : [])
       ])
     ],
-    pipelineIds: Array.isArray(value.pipeline_ids)
-      ? value.pipeline_ids.map(String)
-      : Array.isArray(value.pipelines)
-        ? value.pipelines.map(String)
-        : [],
-    deviceSupport: Array.isArray(value.device_support) ? value.device_support.map(String) : [],
+    pipelineIds: safeList(rawPipelines, SAFE_RUNTIME_PIPELINE_ID, 'pipeline identifiers'),
+    deviceSupport: safeList(value.device_support, SAFE_RUNTIME_DEVICE, 'device support'),
     trainingSetupRequired: Boolean(value.training_setup_required),
     dirty: Boolean(value.dirty ?? runtimeMetadata.source_dirty),
-    sourceRevision: value.source_revision
-      ? String(value.source_revision)
-      : runtimeMetadata.source_revision
-        ? String(runtimeMetadata.source_revision)
-        : null
+    sourceRevision: sourceRevision ?? null
   }
 }
 
@@ -617,14 +696,35 @@ async function runWorkerJsonWithInvocation(
 }
 
 async function runWorkerJson(args: string[]): Promise<Record<string, unknown>> {
-  return await runWorkerJsonWithInvocation(await resolveWorkerInvocation('training-probe'), args)
+  for (;;) {
+    const resolved = await resolveWorkerInvocation('training-probe')
+    if (
+      resolved.runtimeSelectionEpoch !== runtimeSelectionEpoch ||
+      runtimeSelectionActivation
+    ) {
+      continue
+    }
+    return await runWorkerJsonWithInvocation(resolved.invocation, args)
+  }
 }
 
 export async function probeTrainingRuntime(): Promise<TrainingRuntime> {
-  return normalizeRuntime(await runWorkerJson(['probe', '--json']))
+  for (;;) {
+    const resolved = await resolveWorkerInvocation('training-probe')
+    if (
+      resolved.runtimeSelectionEpoch !== runtimeSelectionEpoch ||
+      runtimeSelectionActivation
+    ) {
+      continue
+    }
+    return normalizeRuntime(
+      await runWorkerJsonWithInvocation(resolved.invocation, ['probe', '--json']),
+      resolved.runtimeKind
+    )
+  }
 }
 
-export async function enableDetectedDeveloperTrainingRuntime(): Promise<TrainingRuntime | null> {
+async function enableDetectedDeveloperTrainingRuntimeOnce(): Promise<TrainingRuntime | null> {
   if (app.isPackaged) return null
   const detectedRoot = findDetectedDeveloperRoot()
   if (!detectedRoot) return null
@@ -662,7 +762,23 @@ export async function enableDetectedDeveloperTrainingRuntime(): Promise<Training
   return runtime
 }
 
-export async function chooseInstalledTrainingRuntime(): Promise<TrainingRuntime | null> {
+function beginRuntimeSelection(
+  operation: () => Promise<TrainingRuntime | null>
+): Promise<TrainingRuntime | null> {
+  if (runtimeSelectionActivation) return runtimeSelectionActivation
+  runtimeSelectionEpoch += 1
+  const activation = operation()
+  runtimeSelectionActivation = activation
+  return activation.finally(() => {
+    if (runtimeSelectionActivation === activation) runtimeSelectionActivation = null
+  })
+}
+
+export function enableDetectedDeveloperTrainingRuntime(): Promise<TrainingRuntime | null> {
+  return beginRuntimeSelection(enableDetectedDeveloperTrainingRuntimeOnce)
+}
+
+async function chooseInstalledTrainingRuntimeOnce(): Promise<TrainingRuntime | null> {
   const selection = await dialog.showOpenDialog({
     title: 'Select a compatible STRUM worker',
     properties: ['openFile'],
@@ -683,7 +799,8 @@ export async function chooseInstalledTrainingRuntime(): Promise<TrainingRuntime 
           env: await workerEnvironment({})
         },
         ['probe', '--json']
-      )
+      ),
+      'installed_runtime'
     )
     if (runtime.kind !== 'installed_runtime') {
       throw new Error('The selected worker is not an installed STRUM runtime.')
@@ -711,6 +828,10 @@ export async function chooseInstalledTrainingRuntime(): Promise<TrainingRuntime 
     await writeFile(runtimeSettingsPath(), JSON.stringify(previous, null, 2) + '\n', 'utf8')
     return null
   }
+}
+
+export function chooseInstalledTrainingRuntime(): Promise<TrainingRuntime | null> {
+  return beginRuntimeSelection(chooseInstalledTrainingRuntimeOnce)
 }
 
 const CHECKPOINT_OUTPUT_CONTRACTS_FORMAT = 'strum-candidate-checkpoint-output-contracts/v1'
@@ -2347,7 +2468,6 @@ async function runResolvedAutoChartProfile(
   profile: ResolvedAutoChartProfile,
   options: Omit<AutoChartRunOptions, 'cacheDir'>
 ): Promise<AutoChartRunResult> {
-  const worker = await resolveWorkerInvocation(options.runId)
   const requestPath = join(app.getPath('temp'), `octave-profile-chart-${options.runId}.json`)
   const request = {
     job_id: options.runId,
@@ -2374,6 +2494,18 @@ async function runResolvedAutoChartProfile(
     }
   }
   await writeFile(requestPath, JSON.stringify(request), 'utf8')
+  let worker: WorkerInvocation
+  for (;;) {
+    const resolved = await resolveWorkerInvocation(options.runId)
+    if (
+      resolved.runtimeSelectionEpoch !== runtimeSelectionEpoch ||
+      runtimeSelectionActivation
+    ) {
+      continue
+    }
+    worker = resolved.invocation
+    break
+  }
   broadcastAutoChartProgress({
     runId: options.runId,
     stage: 'bootstrap',
@@ -2495,9 +2627,20 @@ async function startJsonEventJob(
   ) => Promise<Record<string, unknown> | TrainingPromotionResult>,
   runId?: string
 ): Promise<void> {
-  const worker = await resolveWorkerInvocation(jobId)
   const requestPath = join(app.getPath('temp'), `octave-training-${jobId}.json`)
   await writeFile(requestPath, JSON.stringify(request), 'utf8')
+  let worker: WorkerInvocation
+  for (;;) {
+    const resolved = await resolveWorkerInvocation(jobId)
+    if (
+      resolved.runtimeSelectionEpoch !== runtimeSelectionEpoch ||
+      runtimeSelectionActivation
+    ) {
+      continue
+    }
+    worker = resolved.invocation
+    break
+  }
   const child = spawn(
     worker.command,
     [...worker.baseArgs, ...args, '--request', requestPath, '--json-events'],

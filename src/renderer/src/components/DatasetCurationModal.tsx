@@ -544,6 +544,7 @@ export function TrainingModal({
     useState<DiscoveredCheckpoint | null>(null)
   const [selectedDiscoveredProfileId, setSelectedDiscoveredProfileId] = useState('')
   const [selectedDifficultyPolicy, setSelectedDifficultyPolicy] = useState('')
+  const [enablingTrainingRuntime, setEnablingTrainingRuntime] = useState(false)
   const [discoveringCheckpoints, setDiscoveringCheckpoints] = useState(false)
   const [savingAutoChartProfile, setSavingAutoChartProfile] = useState(false)
   const [trainingJob, setTrainingJob] = useState<TrainingJob | null>(null)
@@ -1119,13 +1120,25 @@ export function TrainingModal({
   }
 
   const enableDeveloperRuntime = async (): Promise<void> => {
+    if (enablingTrainingRuntime) return
+    setEnablingTrainingRuntime(true)
     setError(null)
-    const runtime = await window.api.enableDeveloperTrainingRuntime()
-    if (!runtime?.capabilities.includes('training')) {
+    try {
+      const runtime = await window.api.enableDeveloperTrainingRuntime()
+      if (!runtime?.capabilities.includes('training')) {
+        setError('No compatible local STRUM training runtime was found.')
+        return
+      }
+      // The main process only returns after it has persisted the validated
+      // runtime lock. Keep the renderer on this exact DTO until the refresh
+      // completes so a user cannot race into a bundled worker action.
+      setTrainingRuntime(runtime)
+      await refreshTrainingState()
+    } catch {
       setError('No compatible local STRUM training runtime was found.')
-      return
+    } finally {
+      setEnablingTrainingRuntime(false)
     }
-    await refreshTrainingState()
   }
 
   const chooseInstalledRuntime = async (): Promise<void> => {
@@ -1139,6 +1152,7 @@ export function TrainingModal({
   }
 
   const discoverCheckpointFolder = async (): Promise<void> => {
+    if (enablingTrainingRuntime) return
     setDiscoveringCheckpoints(true)
     setError(null)
     try {
@@ -1158,6 +1172,7 @@ export function TrainingModal({
 
   const saveSelectedAutoChartProfile = async (): Promise<void> => {
     if (
+      enablingTrainingRuntime ||
       !selectedDiscoveredCheckpoint ||
       selectedDiscoveredCheckpoint.deploymentStatus !== 'ready' ||
       !selectedDiscoveredProfile ||
@@ -1183,7 +1198,7 @@ export function TrainingModal({
   }
 
   const prepareDataset = async (): Promise<void> => {
-    if (!catalogParent || !selectedCatalog || !selectedPipelineId) return
+    if (enablingTrainingRuntime || !catalogParent || !selectedCatalog || !selectedPipelineId) return
     setError(null)
     try {
       const started = await window.api.prepareTrainingDataset({
@@ -1207,7 +1222,7 @@ export function TrainingModal({
   }
 
   const startTraining = async (): Promise<void> => {
-    if (!selectedTaskViewId || !selectedPipelineId) return
+    if (enablingTrainingRuntime || !selectedTaskViewId || !selectedPipelineId) return
     setError(null)
     try {
       const started = await window.api.startTrainingRun({
@@ -1229,7 +1244,7 @@ export function TrainingModal({
   }
 
   const startPromotion = async (job: StrumPromotionJobDescriptor): Promise<void> => {
-    if (!promotionArtifactId || job.status !== 'available') return
+    if (enablingTrainingRuntime || !promotionArtifactId || job.status !== 'available') return
     setError(null)
     try {
       const controls = trainingSchemaControls(job.options_schema)
@@ -1258,6 +1273,9 @@ export function TrainingModal({
   }
 
   const trainingStepBlocker = (step: TrainingStep): string | null => {
+    if (enablingTrainingRuntime && step !== 'prepare') {
+      return 'STRUM runtime setup is still being verified.'
+    }
     if (step === 'prepare' && !selectedCatalog) {
       return 'Create or select a catalog before preparing a dataset.'
     }
@@ -1687,14 +1705,16 @@ export function TrainingModal({
                     <button
                       className="dataset-secondary"
                       onClick={() => void chooseInstalledRuntime()}
+                      disabled={enablingTrainingRuntime}
                     >
                       Select STRUM runtime
                     </button>
                     <button
                       className="dataset-secondary"
                       onClick={() => void enableDeveloperRuntime()}
+                      disabled={enablingTrainingRuntime}
                     >
-                      Developer override
+                      {enablingTrainingRuntime ? 'Verifying runtime…' : 'Developer override'}
                     </button>
                   </div>
                 )}
@@ -1773,6 +1793,7 @@ export function TrainingModal({
                     onClick={() => void prepareDataset()}
                     disabled={
                       !catalogInspection?.eligibleCount ||
+                      enablingTrainingRuntime ||
                       Boolean(
                         trainingJob &&
                         !['succeeded', 'failed', 'cancelled'].includes(trainingJob.state ?? '')
@@ -1871,6 +1892,7 @@ export function TrainingModal({
                     className="dataset-primary"
                     onClick={() => void startTraining()}
                     disabled={Boolean(
+                      enablingTrainingRuntime ||
                       trainingJob &&
                       !['succeeded', 'failed', 'cancelled'].includes(trainingJob.state ?? '')
                     )}
@@ -1959,7 +1981,9 @@ export function TrainingModal({
                           />
                           <button
                             className="dataset-secondary"
-                            disabled={Boolean(running) || job.status !== 'available'}
+                            disabled={
+                              enablingTrainingRuntime || Boolean(running) || job.status !== 'available'
+                            }
                             onClick={() => void startPromotion(job)}
                           >
                             {job.kind === 'evaluation' ? 'Evaluate candidate' : 'Package profile'}
@@ -1998,7 +2022,7 @@ export function TrainingModal({
               </p>
               <button
                 className="dataset-secondary"
-                disabled={discoveringCheckpoints}
+                disabled={discoveringCheckpoints || enablingTrainingRuntime}
                 onClick={() => void discoverCheckpointFolder()}
               >
                 {discoveringCheckpoints ? 'Discovering bundles…' : 'Choose model-bundle folder'}
@@ -2147,6 +2171,7 @@ export function TrainingModal({
                   !selectedDiscoveredProfile.execution.difficultyPolicies.includes(
                     selectedDifficultyPolicy
                   ) ||
+                  enablingTrainingRuntime ||
                   savingAutoChartProfile
                 }
                 onClick={() => void saveSelectedAutoChartProfile()}

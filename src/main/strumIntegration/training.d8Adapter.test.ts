@@ -9,6 +9,7 @@ const scratch = mkdtempSync(join(tmpdir(), 'octave-strum-d8-adapter-'))
 const sends: Array<Record<string, unknown>> = []
 const requests: Array<Record<string, unknown>> = []
 const workerCommands: string[][] = []
+const workerInvocations: Array<{ command: string; args: string[] }> = []
 let catalogInspectionPayload: Record<string, unknown> = {
   status: 'ready',
   catalog_id: 'approved_catalog',
@@ -24,6 +25,26 @@ let catalogInspectionPayload: Record<string, unknown> = {
   eligibility_selection: { mode: 'requested_prepare_options' }
 }
 let promotionResultOverride: Record<string, unknown> | undefined
+let selectedCheckpointFolder = ''
+let selectedInstalledWorker = ''
+let delayProbeResponse = false
+let holdBundledPythonResolution = false
+let releaseBundledPythonResolution: (() => void) | null = null
+let bundledPythonResolutionRequested: (() => void) | null = null
+let delayedInstalledFingerprintPath = ''
+let releaseInstalledFingerprint: (() => void) | null = null
+let installedFingerprintRequested: (() => void) | null = null
+let probePayload: Record<string, unknown> = {
+  protocol_version: '1.0',
+  runtime_id: 'd8-test',
+  capabilities: [
+    'dataset_prepare',
+    'training_start',
+    'post_train_job_discovery',
+    'post_train_job_start'
+  ]
+}
+const originalStrumSourceDir = process.env.OCTAVE_STRUM_SOURCE_DIR
 const manifestSha = 'a'.repeat(64)
 const artifactId = `strum-model-bundle/${'b'.repeat(64)}`
 
@@ -110,35 +131,61 @@ vi.mock('electron', () => ({
       }
     ]
   },
-  dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }) }
+  dialog: {
+    showOpenDialog: async (options: { title?: string }) => {
+      if (options.title === 'Select a compatible STRUM worker') {
+        return selectedInstalledWorker
+          ? { canceled: false, filePaths: [selectedInstalledWorker] }
+          : { canceled: true, filePaths: [] }
+      }
+      return selectedCheckpointFolder
+        ? { canceled: false, filePaths: [selectedCheckpointFolder] }
+        : { canceled: true, filePaths: [] }
+    }
+  }
 }))
 
+vi.mock('fs/promises', async (importOriginal) => {
+  const original = await importOriginal<typeof import('fs/promises')>()
+  return {
+    ...original,
+    stat: async (path: string) => {
+      if (path === delayedInstalledFingerprintPath) {
+        installedFingerprintRequested?.()
+        await new Promise<void>((resolve) => {
+          releaseInstalledFingerprint = resolve
+        })
+      }
+      return await original.stat(path)
+    }
+  }
+})
+
 vi.mock('./runner', () => ({
-  resolvePythonCommand: async () => ({ command: 'strum-test-worker', baseArgs: [] })
+  resolvePythonCommand: async (purpose: string) => {
+    if (holdBundledPythonResolution && purpose === 'training-probe') {
+      bundledPythonResolutionRequested?.()
+      await new Promise<void>((resolve) => {
+        releaseBundledPythonResolution = resolve
+      })
+    }
+    return { command: 'strum-test-worker', baseArgs: [] }
+  }
 }))
 
 vi.mock('child_process', () => ({
   execFile: (
-    _command: string,
+    command: string,
     args: string[],
     _options: unknown,
     callback: (error: Error | null, stdout: string) => void
   ) => {
     workerCommands.push(args)
+    workerInvocations.push({ command, args })
     if (args.includes('probe')) {
-      callback(
-        null,
-        `${JSON.stringify({
-          protocol_version: '1.0',
-          runtime_id: 'd8-test',
-          capabilities: [
-            'dataset_prepare',
-            'training_start',
-            'post_train_job_discovery',
-            'post_train_job_start'
-          ]
-        })}\n`
-      )
+      const respond = (): void => callback(null, `${JSON.stringify(probePayload)}\n`)
+      if (delayProbeResponse) setTimeout(respond, 20)
+      else respond()
       return
     }
     if (args.includes('pipeline') && args.includes('list')) {
@@ -151,6 +198,21 @@ vi.mock('child_process', () => ({
     }
     if (args.includes('checkpoint') && args.includes('inspect')) {
       callback(null, `${JSON.stringify(candidate())}\n`)
+      return
+    }
+    if (args.includes('checkpoint') && args.includes('discover')) {
+      callback(
+        null,
+        `${JSON.stringify({
+          format: 'strum-model-bundle-discovery/v1',
+          status: 'ready',
+          candidate_count: 1,
+          profile_count: 0,
+          rejected_bundle_count: 0,
+          truncated: false,
+          candidates: [candidate()]
+        })}\n`
+      )
       return
     }
     callback(new Error('unexpected STRUM request'), '')
@@ -257,6 +319,10 @@ import {
   inspectTrainingCatalog,
   listTrainingArtifacts,
   listPromotionJobs,
+  chooseCheckpointFolder,
+  chooseInstalledTrainingRuntime,
+  enableDetectedDeveloperTrainingRuntime,
+  probeTrainingRuntime,
   startPromotionJob,
   startTrainingPrepare,
   startTrainingRun
@@ -270,6 +336,7 @@ afterEach(() => {
   sends.length = 0
   requests.length = 0
   workerCommands.length = 0
+  workerInvocations.length = 0
   catalogInspectionPayload = {
     status: 'ready',
     catalog_id: 'approved_catalog',
@@ -285,10 +352,235 @@ afterEach(() => {
     eligibility_selection: { mode: 'requested_prepare_options' }
   }
   promotionResultOverride = undefined
+  selectedCheckpointFolder = ''
+  selectedInstalledWorker = ''
+  delayProbeResponse = false
+  holdBundledPythonResolution = false
+  releaseBundledPythonResolution = null
+  bundledPythonResolutionRequested = null
+  delayedInstalledFingerprintPath = ''
+  releaseInstalledFingerprint = null
+  installedFingerprintRequested = null
+  probePayload = {
+    protocol_version: '1.0',
+    runtime_id: 'd8-test',
+    capabilities: [
+      'dataset_prepare',
+      'training_start',
+      'post_train_job_discovery',
+      'post_train_job_start'
+    ]
+  }
+  if (originalStrumSourceDir === undefined) {
+    delete process.env.OCTAVE_STRUM_SOURCE_DIR
+  } else {
+    process.env.OCTAVE_STRUM_SOURCE_DIR = originalStrumSourceDir
+  }
   rmSync(join(scratch, 'strum-training'), { recursive: true, force: true })
 })
 
 describe('STRUM d8 training adapter', () => {
+  it('keeps a validated developer runtime kind in the renderer-safe runtime DTO', async () => {
+    const developerRoot = join(scratch, 'developer-runtime')
+    mkdirSync(join(developerRoot, 'src'), { recursive: true })
+    writeFileSync(join(developerRoot, 'src', 'worker.py'), '# worker fixture\n')
+    mkdirSync(join(scratch, 'strum-training'), { recursive: true })
+    writeFileSync(
+      join(scratch, 'strum-training', 'runtime.json'),
+      JSON.stringify({
+        developerSourceRoot: developerRoot,
+        developerPython: { command: 'strum-test-worker', baseArgs: [] },
+        developerRuntimeLock: {
+          runtimeId: 'd8-test',
+          protocolVersion: '1.0',
+          capabilities: [
+            'dataset_prepare',
+            'post_train_job_discovery',
+            'post_train_job_start',
+            'training',
+            'training_start'
+          ],
+          sourceRevision: null,
+          dirty: false,
+          validatedAt: '2026-08-24T00:00:00.000Z',
+          sourceRoot: developerRoot
+        }
+      })
+    )
+
+    const runtime = await probeTrainingRuntime()
+
+    expect(runtime).toMatchObject({
+      runtimeId: 'd8-test',
+      kind: 'developer_override',
+      capabilities: expect.arrayContaining(['training'])
+    })
+    expect(JSON.stringify(runtime)).not.toContain(developerRoot)
+    expect(JSON.stringify(runtime)).not.toMatch(/[/\\](home|tmp|run)[/\\]/)
+  })
+
+  it('fails closed on path-bearing developer probe metadata', async () => {
+    const developerRoot = join(scratch, 'hostile-developer-runtime')
+    mkdirSync(join(developerRoot, 'src'), { recursive: true })
+    writeFileSync(join(developerRoot, 'src', 'worker.py'), '# worker fixture\n')
+    process.env.OCTAVE_STRUM_SOURCE_DIR = developerRoot
+    probePayload = {
+      protocol_version: '1.0',
+      runtime_id: 'd8-test',
+      display_name: '/private/worker/name',
+      capabilities: ['dataset_prepare', '/private/worker/capability'],
+      pipeline_ids: ['chart_transform.five_lane/v1', '/private/worker/pipeline'],
+      device_support: ['cpu', '/private/worker/device'],
+      source_revision: '/private/worker/revision'
+    }
+
+    await expect(enableDetectedDeveloperTrainingRuntime()).rejects.toThrow(
+      'invalid capabilities'
+    )
+  })
+
+  it('canonicalizes STRUM’s numeric protocol and accepts its safe fallback runtime ID', async () => {
+    const developerRoot = join(scratch, 'numeric-protocol-runtime')
+    mkdirSync(join(developerRoot, 'src'), { recursive: true })
+    writeFileSync(join(developerRoot, 'src', 'worker.py'), '# worker fixture\n')
+    process.env.OCTAVE_STRUM_SOURCE_DIR = developerRoot
+    probePayload = {
+      protocol_version: 1,
+      runtime: { id: 'strum-0.1.0+git.72ff57cd9b5a' },
+      capabilities: ['dataset_prepare', 'training_start']
+    }
+
+    await expect(enableDetectedDeveloperTrainingRuntime()).resolves.toMatchObject({
+      protocolVersion: '1',
+      runtimeId: 'strum-0.1.0+git.72ff57cd9b5a',
+      kind: 'developer_override'
+    })
+
+    for (const invalidVersion of [1.5, true, '/private/protocol']) {
+      probePayload = {
+        protocol_version: invalidVersion,
+        runtime_id: 'd8-test',
+        capabilities: ['dataset_prepare', 'training_start']
+      }
+      await expect(enableDetectedDeveloperTrainingRuntime()).rejects.toThrow(
+        'invalid protocol version'
+      )
+    }
+  })
+
+  it('rejects generic, malformed, and path-bearing fallback runtime IDs', async () => {
+    const developerRoot = join(scratch, 'invalid-fallback-runtime')
+    mkdirSync(join(developerRoot, 'src'), { recursive: true })
+    writeFileSync(join(developerRoot, 'src', 'worker.py'), '# worker fixture\n')
+    process.env.OCTAVE_STRUM_SOURCE_DIR = developerRoot
+
+    for (const runtimeId of [
+      'generic-runtime',
+      'strum-0.1.0+git.ABCDEF12',
+      'strum-0.1.0+git.nothex',
+      '/private/worker/runtime'
+    ]) {
+      probePayload = {
+        protocol_version: 1,
+        runtime: { id: runtimeId },
+        capabilities: ['dataset_prepare', 'training_start']
+      }
+      await expect(enableDetectedDeveloperTrainingRuntime()).rejects.toThrow(
+        'invalid runtime identity'
+      )
+    }
+  })
+
+  it('waits for a delayed activation before same-tick checkpoint discovery', async () => {
+    const developerRoot = join(scratch, 'developer-runtime-for-discovery')
+    const modelRoot = join(scratch, 'checkpoint-folder')
+    mkdirSync(join(developerRoot, 'src'), { recursive: true })
+    mkdirSync(modelRoot, { recursive: true })
+    writeFileSync(join(developerRoot, 'src', 'worker.py'), '# worker fixture\n')
+    writeFileSync(join(modelRoot, 'strum-model-bundle.json'), '{}\n')
+    process.env.OCTAVE_STRUM_SOURCE_DIR = developerRoot
+    selectedCheckpointFolder = modelRoot
+    delayProbeResponse = true
+
+    const [enabled, discovery] = await Promise.all([
+      enableDetectedDeveloperTrainingRuntime(),
+      chooseCheckpointFolder()
+    ])
+
+    expect(enabled).toMatchObject({ kind: 'developer_override' })
+    expect(discovery).toMatchObject({ candidateCount: 1, profileCount: 0 })
+    expect(workerCommands.some((args) => args.includes('checkpoint') && args.includes('discover'))).toBe(
+      true
+    )
+    expect(
+      workerCommands.find((args) => args.includes('checkpoint') && args.includes('discover'))
+    ).toEqual(expect.arrayContaining(['-m', 'src.worker']))
+  })
+
+  it('reselects the worker when activation starts after bundled selection begins', async () => {
+    const developerRoot = join(scratch, 'interleaved-developer-runtime')
+    const modelRoot = join(scratch, 'interleaved-checkpoint-folder')
+    mkdirSync(join(developerRoot, 'src'), { recursive: true })
+    mkdirSync(modelRoot, { recursive: true })
+    writeFileSync(join(developerRoot, 'src', 'worker.py'), '# worker fixture\n')
+    writeFileSync(join(modelRoot, 'strum-model-bundle.json'), '{}\n')
+    process.env.OCTAVE_STRUM_SOURCE_DIR = developerRoot
+    selectedCheckpointFolder = modelRoot
+    holdBundledPythonResolution = true
+    const bundledSelectionStarted = new Promise<void>((resolve) => {
+      bundledPythonResolutionRequested = resolve
+    })
+
+    const discoveryPromise = chooseCheckpointFolder()
+    await bundledSelectionStarted
+    const enabled = await enableDetectedDeveloperTrainingRuntime()
+    releaseBundledPythonResolution?.()
+    const discovery = await discoveryPromise
+
+    expect(enabled).toMatchObject({ kind: 'developer_override' })
+    expect(discovery).toMatchObject({ candidateCount: 1 })
+    expect(
+      workerCommands.find((args) => args.includes('checkpoint') && args.includes('discover'))
+    ).toEqual(expect.arrayContaining(['-m', 'src.worker']))
+  })
+
+  it('reselects installed runtime B when a worker action began fingerprinting installed runtime A', async () => {
+    const workerA = join(scratch, 'installed-worker-a')
+    const workerB = join(scratch, 'installed-worker-b')
+    const modelRoot = join(scratch, 'installed-interleaving-checkpoint')
+    writeFileSync(workerA, 'worker A\n')
+    writeFileSync(workerB, 'worker B\n')
+    mkdirSync(modelRoot, { recursive: true })
+    writeFileSync(join(modelRoot, 'strum-model-bundle.json'), '{}\n')
+
+    selectedInstalledWorker = workerA
+    await expect(chooseInstalledTrainingRuntime()).resolves.toMatchObject({
+      kind: 'installed_runtime'
+    })
+
+    selectedCheckpointFolder = modelRoot
+    delayedInstalledFingerprintPath = workerA
+    const fingerprintStarted = new Promise<void>((resolve) => {
+      installedFingerprintRequested = resolve
+    })
+    const discoveryPromise = chooseCheckpointFolder()
+    await fingerprintStarted
+
+    selectedInstalledWorker = workerB
+    await expect(chooseInstalledTrainingRuntime()).resolves.toMatchObject({
+      kind: 'installed_runtime'
+    })
+    releaseInstalledFingerprint?.()
+    await expect(discoveryPromise).resolves.toMatchObject({ candidateCount: 1 })
+
+    expect(
+      workerInvocations.find(
+        (invocation) =>
+          invocation.args.includes('checkpoint') && invocation.args.includes('discover')
+      )
+    ).toMatchObject({ command: workerB })
+  })
+
   it('uses strict d8 request/result DTOs and keeps candidate roots private', async () => {
     const catalogRoot = join(scratch, 'private-catalog')
     mkdirSync(catalogRoot, { recursive: true })
