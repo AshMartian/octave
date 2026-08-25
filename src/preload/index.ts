@@ -652,6 +652,13 @@ const api = {
       songFolders: string[]
       errors: string[]
       urlSongFolders?: Array<{ url: string; songFolder: string }>
+      typedArtifacts?: {
+        format: 'strum-typed-chart-artifacts/v1'
+        profileId: string
+        capability: string
+        manifestSha256: string
+        artifacts: Array<{ id: 'notes_midi' | 'run_manifest'; name: string; sha256: string }>
+      }
     }) => void
   ): (() => void) => {
     const handler = (
@@ -663,6 +670,13 @@ const api = {
         songFolders: string[]
         errors: string[]
         urlSongFolders?: Array<{ url: string; songFolder: string }>
+        typedArtifacts?: {
+          format: 'strum-typed-chart-artifacts/v1'
+          profileId: string
+          capability: string
+          manifestSha256: string
+          artifacts: Array<{ id: 'notes_midi' | 'run_manifest'; name: string; sha256: string }>
+        }
       }
     ): void => callback(payload)
     ipcRenderer.on('strum:complete', handler)

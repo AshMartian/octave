@@ -1,4 +1,5 @@
 import { mkdtempSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -63,6 +64,14 @@ let selectedFolder = ''
 const inspections = new Map<string, Record<string, unknown>>()
 const preflightRequests: Record<string, unknown>[] = []
 const chartRunRequests: Record<string, unknown>[] = []
+const materializedUrls: string[] = []
+const materializedAudioPath = join(scratch, 'materialized-url.wav')
+let preflightManifestOverride: string | null = null
+let holdPreflight = false
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value).digest('hex')
+}
 
 vi.mock('electron', () => ({
   app: { getPath: () => scratch, isPackaged: false },
@@ -73,7 +82,13 @@ vi.mock('electron', () => ({
 }))
 
 vi.mock('./runner', () => ({
-  resolvePythonCommand: async () => ({ command: 'strum-test-worker', baseArgs: [] })
+  resolvePythonCommand: async () => ({ command: 'strum-test-worker', baseArgs: [] }),
+  materializeProfileUrlAudio: async (_runId: string, url: string) => {
+    materializedUrls.push(url)
+    await writeFile(materializedAudioPath, 'materialized-audio')
+    return { audioPath: materializedAudioPath, cleanup: async () => undefined }
+  },
+  cancelProfileUrlMaterialization: async () => false
 }))
 
 vi.mock('child_process', () => ({
@@ -132,6 +147,8 @@ vi.mock('child_process', () => ({
       void readFile(requestPath, 'utf8').then((text) => {
         const request = JSON.parse(text) as Record<string, unknown>
         preflightRequests.push(request)
+        const manifestSha256 =
+          preflightManifestOverride ?? inspections.get(String(request.model_root))?.manifest_sha256
         callback(
           null,
           `${JSON.stringify({
@@ -141,7 +158,8 @@ vi.mock('child_process', () => ({
             profile_id: request.profile_id,
             difficulty_policy: request.difficulty_policy,
             instruments: request.instruments,
-            device: request.device
+            device: request.device,
+            manifest_sha256: manifestSha256
           })}\n`
         )
       })
@@ -153,18 +171,64 @@ vi.mock('child_process', () => ({
     const child = new EventEmitter() as EventEmitter & {
       stdout: EventEmitter
       stderr: EventEmitter
-      pid: number
+      pid: number | undefined
       kill: () => boolean
     }
     child.stdout = new EventEmitter()
     child.stderr = new EventEmitter()
-    child.pid = 1234
-    child.kill = () => true
+    child.pid = undefined
+    child.kill = () => {
+      queueMicrotask(() => child.emit('close', null))
+      return true
+    }
     const requestPath = args[args.indexOf('--request') + 1]
-    void readFile(requestPath, 'utf8').then((text) => {
+    if (args.includes('chart') && args.includes('preflight')) {
+      if (holdPreflight) return child
+      void readFile(requestPath, 'utf8').then((text) => {
+        const request = JSON.parse(text) as Record<string, unknown>
+        preflightRequests.push(request)
+        const manifestSha256 =
+          preflightManifestOverride ?? inspections.get(String(request.model_root))?.manifest_sha256
+        child.stdout.emit(
+          'data',
+          Buffer.from(
+            `${JSON.stringify({
+              format: 'strum-chart-preflight/v1',
+              status: 'ready',
+              execution: 'available',
+              profile_id: request.profile_id,
+              difficulty_policy: request.difficulty_policy,
+              instruments: request.instruments,
+              device: request.device,
+              manifest_sha256: manifestSha256
+            })}\n`
+          )
+        )
+        child.emit('close', 0)
+      })
+      return child
+    }
+    void readFile(requestPath, 'utf8').then(async (text) => {
       const request = JSON.parse(text) as Record<string, unknown>
       chartRunRequests.push(request)
       const preflight = preflightRequests.at(-1) ?? {}
+      const outputDir = String(request.output_dir)
+      const manifestSha256 = inspections.get(String(preflight.model_root))?.manifest_sha256
+      const notesHash = sha256('typed-notes')
+      const instrument = Array.isArray(preflight.instruments) ? preflight.instruments[0] : null
+      await mkdir(outputDir, { recursive: true })
+      await writeFile(join(outputDir, 'notes.mid'), 'typed-notes')
+      await writeFile(
+        join(outputDir, 'run.json'),
+        JSON.stringify({
+          format: 'strum-chart-run/v1',
+          status: 'completed',
+          profile_id: preflight.profile_id,
+          capability: instrument === 'drums' ? 'drums.v14-expert/v1' : 'guitar.hybrid-v2-rule/v1',
+          manifest_sha256: manifestSha256,
+          artifacts: { notes_midi: { name: 'notes.mid', sha256: notesHash } }
+        })
+      )
       child.stdout.emit(
         'data',
         Buffer.from(
@@ -172,6 +236,7 @@ vi.mock('child_process', () => ({
             format: 'strum-chart-run/v1',
             status: 'completed',
             profile_id: preflight.profile_id,
+            manifest_sha256: manifestSha256,
             run_manifest_name: 'run.json',
             output_name: 'notes.mid'
           })}\n`
@@ -184,6 +249,7 @@ vi.mock('child_process', () => ({
 }))
 
 import {
+  cancelDefaultAutoChartProfile,
   chooseCheckpointFolder,
   inspectDiscoveredCheckpoint,
   runDefaultAutoChartProfile,
@@ -209,6 +275,9 @@ beforeEach(async () => {
   selectedFolder = ''
   preflightRequests.length = 0
   chartRunRequests.length = 0
+  materializedUrls.length = 0
+  preflightManifestOverride = null
+  holdPreflight = false
 })
 
 describe('discovered STRUM profile boundaries', () => {
@@ -388,7 +457,22 @@ describe('discovered STRUM profile boundaries', () => {
           stemFolders: [],
           urls: []
         })
-      ).resolves.toEqual({ success: true, outputDir, songFolders: [], errors: [] })
+      ).resolves.toMatchObject({
+        success: true,
+        outputDir,
+        songFolders: [],
+        errors: [],
+        typedArtifacts: {
+          format: 'strum-typed-chart-artifacts/v1',
+          profileId: profile.id,
+          capability: profile.capability,
+          manifestSha256: manifestA,
+          artifacts: [
+            { id: 'notes_midi', name: 'notes.mid', sha256: sha256('typed-notes') },
+            { id: 'run_manifest', name: 'run.json', sha256: expect.any(String) }
+          ]
+        }
+      })
 
       expect(preflightRequests).toEqual([
         {
@@ -409,7 +493,64 @@ describe('discovered STRUM profile boundaries', () => {
     }
   )
 
-  it('rejects URL and raw/nonexecutable bundle paths before any chart run starts', async () => {
+  it('fails closed when the typed preflight no longer matches the saved candidate manifest', async () => {
+    selectedFolder = await addBundle(
+      'manifest-mismatch',
+      candidate({ artifactId: artifactA, manifestSha256: manifestA })
+    )
+    const audioPath = join(scratch, 'mismatch.wav')
+    await writeFile(audioPath, 'local-audio')
+    await chooseCheckpointFolder()
+    await saveDiscoveredAutoChartProfile({
+      artifactId: artifactA,
+      profileId: 'guitar-hybrid-v2-rule',
+      difficultyPolicy: 'expert_only'
+    })
+    preflightManifestOverride = manifestB
+
+    await expect(
+      runDefaultAutoChartProfile({
+        runId: 'manifest-mismatch-run',
+        outputDir: join(scratch, 'mismatch-output'),
+        files: [audioPath],
+        folders: [],
+        stemFolders: [],
+        urls: []
+      })
+    ).rejects.toThrow(/could not be preflighted/)
+    expect(chartRunRequests).toEqual([])
+  })
+
+  it('registers and cancels a profile run while typed preflight is still running', async () => {
+    selectedFolder = await addBundle(
+      'cancel-preflight',
+      candidate({ artifactId: artifactA, manifestSha256: manifestA })
+    )
+    const audioPath = join(scratch, 'cancel.wav')
+    await writeFile(audioPath, 'local-audio')
+    await chooseCheckpointFolder()
+    await saveDiscoveredAutoChartProfile({
+      artifactId: artifactA,
+      profileId: 'guitar-hybrid-v2-rule',
+      difficultyPolicy: 'expert_only'
+    })
+    holdPreflight = true
+    const run = runDefaultAutoChartProfile({
+      runId: 'cancel-preflight-run',
+      outputDir: join(scratch, 'cancel-output'),
+      files: [audioPath],
+      folders: [],
+      stemFolders: [],
+      urls: []
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    await expect(cancelDefaultAutoChartProfile('cancel-preflight-run')).resolves.toBe(true)
+    await expect(run).rejects.toThrow(/cancelled/)
+    expect(chartRunRequests).toEqual([])
+  })
+
+  it('rejects raw candidates and remote file-shaped inputs before any chart command starts', async () => {
     selectedFolder = await addBundle(
       'raw-candidate',
       candidate({
@@ -439,15 +580,49 @@ describe('discovered STRUM profile boundaries', () => {
     })
     await expect(
       runDefaultAutoChartProfile({
-        runId: 'url-run',
+        runId: 'remote-file-run',
         outputDir: join(scratch, 'output'),
+        files: ['https://example.invalid/video'],
+        folders: [],
+        stemFolders: [],
+        urls: []
+      })
+    ).rejects.toThrow(/absolute local audio file or one HTTPS URL/)
+    expect(preflightRequests).toEqual([])
+    expect(chartRunRequests).toEqual([])
+  })
+
+  it('materializes one HTTPS URL privately before the typed STRUM chart commands', async () => {
+    selectedFolder = await addBundle(
+      'guitar-url-candidate',
+      candidate({ artifactId: artifactA, manifestSha256: manifestA })
+    )
+    const outputDir = join(scratch, 'url-output')
+    await chooseCheckpointFolder()
+    await saveDiscoveredAutoChartProfile({
+      artifactId: artifactA,
+      profileId: 'guitar-hybrid-v2-rule',
+      difficultyPolicy: 'expert_only'
+    })
+
+    await expect(
+      runDefaultAutoChartProfile({
+        runId: 'url-materialization-run',
+        outputDir,
         files: [],
         folders: [],
         stemFolders: [],
-        urls: ['https://example.invalid/video']
+        urls: ['https://example.invalid/watch?v=private']
       })
-    ).rejects.toThrow(/exactly one local audio file/)
-    expect(preflightRequests).toEqual([])
-    expect(chartRunRequests).toEqual([])
+    ).resolves.toMatchObject({ success: true, outputDir })
+
+    expect(materializedUrls).toEqual(['https://example.invalid/watch?v=private'])
+    expect(chartRunRequests).toHaveLength(1)
+    expect(chartRunRequests[0]).toMatchObject({
+      audio_path: materializedAudioPath,
+      output_dir: outputDir
+    })
+    expect(JSON.stringify(chartRunRequests[0])).not.toContain('example.invalid')
+    expect(JSON.stringify(preflightRequests)).not.toContain('example.invalid')
   })
 })
