@@ -866,6 +866,62 @@ function isSafeContractToken(value: unknown): value is string {
   return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value)
 }
 
+function isContainedPath(root: string, candidate: string): boolean {
+  const relativePath = relative(root, candidate)
+  return (
+    Boolean(relativePath) &&
+    relativePath !== '..' &&
+    !relativePath.startsWith('../') &&
+    !relativePath.startsWith('..\\') &&
+    !isAbsolute(relativePath)
+  )
+}
+
+/**
+ * Revalidate a registered bundle before any worker call. Both the run and its
+ * bundle are canonicalized again so a later symlink replacement cannot escape
+ * OCTAVE's private training-runs root.
+ */
+async function resolveContainedTrainingBundleRoot(
+  outputRoot: string,
+  bundleRoot: string
+): Promise<string> {
+  const [resolvedRunsRoot, resolvedOutputRoot, resolvedBundleRoot] = await Promise.all([
+    realpath(join(trainingRoot(), 'runs')),
+    realpath(outputRoot),
+    realpath(bundleRoot)
+  ])
+  if (!isContainedPath(resolvedRunsRoot, resolvedOutputRoot)) {
+    throw new Error('The training run is outside OCTAVE storage.')
+  }
+  if (!isContainedPath(resolvedOutputRoot, resolvedBundleRoot)) {
+    throw new Error('STRUM returned a bundle outside the training run.')
+  }
+  if (!(await stat(resolvedBundleRoot)).isDirectory()) {
+    throw new Error('STRUM returned an invalid trained bundle location.')
+  }
+  return resolvedBundleRoot
+}
+
+/** Resolve STRUM's terminal single-token bundle identity inside a private run. */
+async function resolveTrainingBundleRoot(outputRoot: string, bundleName: string): Promise<string> {
+  return await resolveContainedTrainingBundleRoot(outputRoot, join(outputRoot, bundleName))
+}
+
+async function resolveLegacyTrainingRunRoot(outputRoot: string): Promise<string> {
+  const [resolvedRunsRoot, resolvedOutputRoot] = await Promise.all([
+    realpath(join(trainingRoot(), 'runs')),
+    realpath(outputRoot)
+  ])
+  if (
+    !isContainedPath(resolvedRunsRoot, resolvedOutputRoot) ||
+    !(await stat(resolvedOutputRoot)).isDirectory()
+  ) {
+    throw new Error('The training run is outside OCTAVE storage.')
+  }
+  return resolvedOutputRoot
+}
+
 function isSafeDisplayText(value: unknown): value is string {
   return (
     typeof value === 'string' &&
@@ -1584,7 +1640,7 @@ async function resolveCandidateBinding(
   const binding = run.candidateBinding
   try {
     const [bundleRoot, taskView, catalogRoot] = await Promise.all([
-      realpath(binding.bundleRoot),
+      resolveContainedTrainingBundleRoot(run.outputRoot, binding.bundleRoot),
       realpath(binding.taskView),
       realpath(binding.catalogRoot)
     ])
@@ -2276,8 +2332,11 @@ export async function inspectTrainingCheckpoint(runId: string): Promise<Training
   const registry = await readRegistry()
   const run = registry.runs.find((entry) => entry.runId === runId && existsSync(entry.outputRoot))
   if (!run) throw new Error('The selected training run is no longer available.')
+  const bundleRoot = run.candidateBinding
+    ? await resolveContainedTrainingBundleRoot(run.outputRoot, run.candidateBinding.bundleRoot)
+    : await resolveLegacyTrainingRunRoot(run.outputRoot)
   const candidate = normalizeDiscoveredCheckpoint(
-    await runWorkerJson(['checkpoint', 'inspect', '--model-root', run.outputRoot, '--json'])
+    await runWorkerJson(['checkpoint', 'inspect', '--model-root', bundleRoot, '--json'])
   )
   if (
     !candidate ||
@@ -2878,17 +2937,19 @@ export async function startTrainingRun(options: {
       options: train
     },
     async (result) => {
+      const bundleName = result.bundle_name
       if (
         result.status !== 'completed' ||
         result.pipeline_id !== options.pipelineId ||
-        !isSafeContractToken(result.bundle_name) ||
+        !isSafeContractToken(bundleName) ||
         !/^[a-f0-9]{64}$/.test(String(result.manifest_sha256 ?? '')) ||
         !Array.isArray(result.components)
       ) {
         throw new Error('STRUM returned an invalid training result.')
       }
+      const bundleRoot = await resolveTrainingBundleRoot(outputRoot, bundleName)
       const inspection = normalizeDiscoveredCheckpoint(
-        await runWorkerJson(['checkpoint', 'inspect', '--model-root', outputRoot, '--json'])
+        await runWorkerJson(['checkpoint', 'inspect', '--model-root', bundleRoot, '--json'])
       )
       if (
         !inspection ||
@@ -2918,7 +2979,7 @@ export async function startTrainingRun(options: {
         outputRoot,
         candidateBinding: {
           artifactId: inspection.artifactId,
-          bundleRoot: outputRoot,
+          bundleRoot,
           taskView: task.taskRoot,
           catalogRoot: task.catalogRoot
         }
