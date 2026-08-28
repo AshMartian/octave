@@ -1113,12 +1113,12 @@ export function TrainingModal({
     void buildCatalog(catalog)
   }
 
-  const enableDeveloperRuntime = async (): Promise<void> => {
+  const chooseDeveloperRuntime = async (): Promise<void> => {
     if (enablingTrainingRuntime) return
     setEnablingTrainingRuntime(true)
     setError(null)
     try {
-      const runtime = await window.api.enableDeveloperTrainingRuntime()
+      const runtime = await window.api.chooseDeveloperTrainingRuntime()
       if (!runtime?.capabilities.includes('training')) {
         setError('No compatible local STRUM training runtime was found.')
         return
@@ -1129,7 +1129,7 @@ export function TrainingModal({
       setTrainingRuntime(runtime)
       await refreshTrainingState()
     } catch {
-      setError('No compatible local STRUM training runtime was found.')
+      setError('Choose a folder containing STRUM’s versioned worker.')
     } finally {
       setEnablingTrainingRuntime(false)
     }
@@ -1705,10 +1705,10 @@ export function TrainingModal({
                     </button>
                     <button
                       className="dataset-secondary"
-                      onClick={() => void enableDeveloperRuntime()}
+                      onClick={() => void chooseDeveloperRuntime()}
                       disabled={enablingTrainingRuntime}
                     >
-                      {enablingTrainingRuntime ? 'Verifying runtime…' : 'Developer override'}
+                      {enablingTrainingRuntime ? 'Verifying runtime…' : 'Choose STRUM checkout'}
                     </button>
                   </div>
                 )}

@@ -29,6 +29,7 @@ import {
 import {
   cancelTrainingJob,
   cancelDefaultAutoChartProfile,
+  chooseDeveloperTrainingRuntime,
   chooseInstalledTrainingRuntime,
   chooseCheckpointFolder,
   enableDetectedDeveloperTrainingRuntime,
@@ -1110,6 +1111,14 @@ ipcMain.handle('training:runtime', async () => {
 ipcMain.handle('training:enableDeveloperRuntime', async () => {
   try {
     return await enableDetectedDeveloperTrainingRuntime()
+  } catch {
+    return null
+  }
+})
+
+ipcMain.handle('training:chooseDeveloperRuntime', async () => {
+  try {
+    return await chooseDeveloperTrainingRuntime()
   } catch {
     return null
   }

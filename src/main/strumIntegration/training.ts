@@ -395,9 +395,7 @@ function findDetectedDeveloperRoot(): string | null {
   const candidates = [configured, join(process.cwd(), '..', 'strum'), join(process.cwd(), 'strum')]
   return (
     candidates.find((candidate): candidate is string =>
-      Boolean(
-        candidate && (hasVersionedWorkerSource(candidate) || hasLegacyGuitarSources(candidate))
-      )
+      Boolean(candidate && hasVersionedWorkerSource(candidate))
     ) ?? null
   )
 }
@@ -727,11 +725,12 @@ export async function probeTrainingRuntime(): Promise<TrainingRuntime> {
   }
 }
 
-async function enableDetectedDeveloperTrainingRuntimeOnce(): Promise<TrainingRuntime | null> {
+async function activateDeveloperTrainingRuntime(rootPath: string): Promise<TrainingRuntime | null> {
   if (app.isPackaged) return null
-  const detectedRoot = findDetectedDeveloperRoot()
-  if (!detectedRoot) return null
-  const root = await realpath(detectedRoot)
+  const root = await realpath(rootPath)
+  if (!hasVersionedWorkerSource(root)) {
+    throw new Error('The selected folder does not contain a compatible STRUM worker.')
+  }
   const developerPython = await resolvePythonCommand('developer-training-runtime')
   const settings: RuntimeSettings = {
     developerSourceRoot: root,
@@ -765,6 +764,11 @@ async function enableDetectedDeveloperTrainingRuntimeOnce(): Promise<TrainingRun
   return runtime
 }
 
+async function enableDetectedDeveloperTrainingRuntimeOnce(): Promise<TrainingRuntime | null> {
+  const detectedRoot = findDetectedDeveloperRoot()
+  return detectedRoot ? await activateDeveloperTrainingRuntime(detectedRoot) : null
+}
+
 function beginRuntimeSelection(
   operation: () => Promise<TrainingRuntime | null>
 ): Promise<TrainingRuntime | null> {
@@ -779,6 +783,25 @@ function beginRuntimeSelection(
 
 export function enableDetectedDeveloperTrainingRuntime(): Promise<TrainingRuntime | null> {
   return beginRuntimeSelection(enableDetectedDeveloperTrainingRuntimeOnce)
+}
+
+async function chooseDeveloperTrainingRuntimeOnce(): Promise<TrainingRuntime | null> {
+  if (app.isPackaged) return null
+  const selection = await dialog.showOpenDialog({
+    title: 'Select a STRUM checkout with its versioned worker',
+    properties: ['openDirectory']
+  })
+  if (selection.canceled || selection.filePaths.length === 0) return null
+  return await activateDeveloperTrainingRuntime(selection.filePaths[0])
+}
+
+/**
+ * Explicitly select a contributor checkout. This is deliberately separate
+ * from the installed-runtime executable picker so the release path can never
+ * silently discover or execute a sibling source tree.
+ */
+export function chooseDeveloperTrainingRuntime(): Promise<TrainingRuntime | null> {
+  return beginRuntimeSelection(chooseDeveloperTrainingRuntimeOnce)
 }
 
 async function chooseInstalledTrainingRuntimeOnce(): Promise<TrainingRuntime | null> {

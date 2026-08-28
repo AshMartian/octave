@@ -26,6 +26,7 @@ let catalogInspectionPayload: Record<string, unknown> = {
 }
 let promotionResultOverride: Record<string, unknown> | undefined
 let selectedCheckpointFolder = ''
+let selectedDeveloperRoot = ''
 let selectedInstalledWorker = ''
 let delayProbeResponse = false
 let holdBundledPythonResolution = false
@@ -138,6 +139,11 @@ vi.mock('electron', () => ({
       if (options.title === 'Select a compatible STRUM worker') {
         return selectedInstalledWorker
           ? { canceled: false, filePaths: [selectedInstalledWorker] }
+          : { canceled: true, filePaths: [] }
+      }
+      if (options.title === 'Select a STRUM checkout with its versioned worker') {
+        return selectedDeveloperRoot
+          ? { canceled: false, filePaths: [selectedDeveloperRoot] }
           : { canceled: true, filePaths: [] }
       }
       return selectedCheckpointFolder
@@ -342,6 +348,7 @@ import {
   listTrainingArtifacts,
   listPromotionJobs,
   chooseCheckpointFolder,
+  chooseDeveloperTrainingRuntime,
   chooseInstalledTrainingRuntime,
   enableDetectedDeveloperTrainingRuntime,
   probeTrainingRuntime,
@@ -375,6 +382,7 @@ afterEach(() => {
   }
   promotionResultOverride = undefined
   selectedCheckpointFolder = ''
+  selectedDeveloperRoot = ''
   selectedInstalledWorker = ''
   delayProbeResponse = false
   holdBundledPythonResolution = false
@@ -406,6 +414,23 @@ afterEach(() => {
 })
 
 describe('STRUM d8 training adapter', () => {
+  it('selects and locks an explicit versioned developer checkout', async () => {
+    selectedDeveloperRoot = join(scratch, 'selected-developer-runtime')
+    mkdirSync(join(selectedDeveloperRoot, 'src'), { recursive: true })
+    writeFileSync(join(selectedDeveloperRoot, 'src', 'worker.py'), '# worker fixture\n')
+
+    await expect(chooseDeveloperTrainingRuntime()).resolves.toMatchObject({
+      kind: 'developer_override',
+      runtimeId: 'd8-test'
+    })
+
+    const stored = JSON.parse(
+      readFileSync(join(scratch, 'strum-training', 'runtime.json'), 'utf8')
+    ) as Record<string, unknown>
+    expect(stored.developerSourceRoot).toBe(selectedDeveloperRoot)
+    expect(stored).not.toHaveProperty('installedWorkerPath')
+  })
+
   it('keeps a validated developer runtime kind in the renderer-safe runtime DTO', async () => {
     const developerRoot = join(scratch, 'developer-runtime')
     mkdirSync(join(developerRoot, 'src'), { recursive: true })

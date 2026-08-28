@@ -138,6 +138,18 @@ interface ChartEditorAPI {
     dirty: boolean
     sourceRevision: string | null
   } | null>
+  chooseDeveloperTrainingRuntime: () => Promise<{
+    runtimeId: string
+    displayName: string
+    kind: 'bundled_inference' | 'developer_override' | 'managed_checkout' | 'installed_runtime'
+    protocolVersion: string
+    capabilities: string[]
+    pipelineIds: string[]
+    deviceSupport: string[]
+    trainingSetupRequired: boolean
+    dirty: boolean
+    sourceRevision: string | null
+  } | null>
   chooseInstalledTrainingRuntime: () => Promise<{
     runtimeId: string
     displayName: string

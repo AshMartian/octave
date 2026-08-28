@@ -57,7 +57,7 @@ The current `resources/strum/strum_worker.py` is an OCTAVE-specific temporary ad
 
 Release OCTAVE must not clone arbitrary GitHub branches to auto-chart. It continues to use its shipped inference runtime. "Install STRUM training runtime" is an explicit setup action: choose an official release/tag/immutable commit, verify published hash/signature, stage atomically, provision an isolated environment, probe it, and write a lock manifest. Never fetch `main`/`master`, run `git pull`, or automatically download a runtime because an override was absent.
 
-The developer setting is a **STRUM runtime**, not only a Python path. It contains a canonical main-process-only source root or executable, interpreter/environment where needed, resolved runtime ID, protocol/capability snapshot, revision/dirty state, and validation timestamp. The renderer stores an opaque runtime ID/display name, never an absolute path.
+The developer setting is a **STRUM runtime**, not only a Python path. It contains a canonical main-process-only source root or executable, interpreter/environment where needed, resolved runtime ID, protocol/capability snapshot, revision/dirty state, and validation timestamp. OCTAVE prompts for the checkout explicitly and accepts only a versioned `src.worker`; it never implicitly executes a sibling source tree. The renderer stores an opaque runtime ID/display name, never an absolute path.
 
 Existing `OCTAVE_STRUM_SOURCE_DIR` and `OCTAVE_STRUM_PYTHON` remain development bootstrap inputs, but must feed the same validator. A bare interpreter override is insufficient. Current development Python selection also needs to align with STRUM's declared Python minimum before the interface is enabled.
 

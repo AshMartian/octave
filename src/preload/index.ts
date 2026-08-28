@@ -195,6 +195,19 @@ const api = {
     sourceRevision: string | null
   } | null> => ipcRenderer.invoke('training:enableDeveloperRuntime'),
 
+  chooseDeveloperTrainingRuntime: (): Promise<{
+    runtimeId: string
+    displayName: string
+    kind: 'bundled_inference' | 'developer_override' | 'managed_checkout' | 'installed_runtime'
+    protocolVersion: string
+    capabilities: string[]
+    pipelineIds: string[]
+    deviceSupport: string[]
+    trainingSetupRequired: boolean
+    dirty: boolean
+    sourceRevision: string | null
+  } | null> => ipcRenderer.invoke('training:chooseDeveloperRuntime'),
+
   chooseInstalledTrainingRuntime: (): Promise<{
     runtimeId: string
     displayName: string
