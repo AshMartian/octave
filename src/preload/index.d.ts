@@ -497,7 +497,7 @@ interface ChartEditorAPI {
     }) => void
   ) => () => void
   onAutoChartError: (
-    callback: (event: { runId: string; message: string; requirementsPath?: string }) => void
+    callback: (event: { runId: string; message: string }) => void
   ) => () => void
 
   // Bootstrapped Python runtime (managed in userData on packaged builds)

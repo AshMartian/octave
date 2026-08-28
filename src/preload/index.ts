@@ -697,14 +697,13 @@ const api = {
   },
 
   onAutoChartError: (
-    callback: (event: { runId: string; message: string; requirementsPath?: string }) => void
+    callback: (event: { runId: string; message: string }) => void
   ): (() => void) => {
     const handler = (
       _event: unknown,
       payload: {
         runId: string
         message: string
-        requirementsPath?: string
       }
     ): void => callback(payload)
     ipcRenderer.on('strum:error', handler)

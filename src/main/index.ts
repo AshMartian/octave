@@ -1419,8 +1419,7 @@ ipcMain.handle(
         for (const win of BrowserWindow.getAllWindows()) {
           win.webContents.send('strum:error', {
             runId,
-            message,
-            requirementsPath: getStrumRequirementsPath()
+            message
           })
         }
       })
@@ -1463,8 +1462,7 @@ ipcMain.handle('runtime:bootstrap', async () => {
     for (const win of BrowserWindow.getAllWindows()) {
       win.webContents.send('strum:error', {
         runId: 'runtime-setup',
-        message,
-        requirementsPath: getStrumRequirementsPath()
+        message
       })
     }
     return { ok: false, message }
