@@ -21,6 +21,23 @@ const EVENT_PREFIX = '__OCTAVE_EVENT__'
 const PYTHON_CHECK_TIMEOUT_MS = 10_000
 const NO_OUTPUT_WARN_MS = 30_000
 const HEARTBEAT_TICK_MS = 15_000
+// Keep this in lockstep with REQUIRED_MODULES in strum_worker.py. A local
+// interpreter is eligible only when it can satisfy the worker's full import
+// boundary, not merely the first packages that commonly go missing.
+const STRUM_RUNTIME_MODULES = [
+  'torch',
+  'torchaudio',
+  'librosa',
+  'mido',
+  'basic_pitch',
+  'huggingface_hub',
+  'numpy',
+  'soundfile',
+  'omegaconf',
+  'yaml',
+  'requests',
+  'pyphen'
+] as const
 
 /**
  * Locate the bundled ffmpeg-static binary so we can prepend its directory to
@@ -257,6 +274,32 @@ async function commandExists(candidate: PythonCommand): Promise<boolean> {
   })
 }
 
+/**
+ * A Python executable being present does not mean it can run STRUM.  In
+ * particular, development machines commonly have `python3` on PATH while the
+ * ML dependencies live nowhere (or in a stale, unrelated environment). Keep
+ * that probe deliberately import-free: importing basic-pitch also imports
+ * torch and can take several seconds just to decide whether to bootstrap.
+ */
+async function hasStrumRuntimeModules(candidate: PythonCommand): Promise<boolean> {
+  const probe = [
+    'import importlib.util, sys',
+    `modules = ${JSON.stringify(STRUM_RUNTIME_MODULES)}`,
+    'sys.exit(0 if all(importlib.util.find_spec(module) is not None for module in modules) else 1)'
+  ].join('; ')
+
+  return await new Promise<boolean>((resolve) => {
+    execFile(
+      candidate.command,
+      [...candidate.baseArgs, '-c', probe],
+      { timeout: PYTHON_CHECK_TIMEOUT_MS },
+      (error) => {
+        resolve(!error)
+      }
+    )
+  })
+}
+
 async function findPythonCommand(runId?: string): Promise<PythonCommand> {
   if (isBootstrapTarget()) {
     const requirementsPath = getStrumRequirementsPath()
@@ -295,14 +338,20 @@ async function findPythonCommand(runId?: string): Promise<PythonCommand> {
   candidates.push({ command: 'python', baseArgs: [] })
 
   for (const candidate of candidates) {
-    if (await commandExists(candidate)) {
+    if ((await commandExists(candidate)) && (await hasStrumRuntimeModules(candidate))) {
       return candidate
     }
   }
 
-  throw new Error(
-    'A compatible Python runtime for development was not found. Set OCTAVE_STRUM_PYTHON, or install Python 3.10/3.11 and ensure it is available on PATH.'
-  )
+  // Source builds should behave like installed builds: a bare system Python
+  // must never produce the worker's opaque "install these packages globally"
+  // failure. The isolated user-data runtime is cacheable and emits bootstrap
+  // progress through the normal STRUM UI while it is being prepared.
+  const requirementsPath = getStrumRequirementsPath()
+  if (!existsSync(requirementsPath)) {
+    throw new Error('OCTAVE could not find the bundled STRUM runtime requirements.')
+  }
+  return { command: await ensureBootstrappedPython(requirementsPath, runId), baseArgs: [] }
 }
 
 export async function resolvePythonCommand(runId?: string): Promise<PythonCommand> {
