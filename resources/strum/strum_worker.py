@@ -1677,6 +1677,19 @@ def download_youtube_audio(url: str, target_dir: Path, run_id: str) -> Path:
             emit_progress(run_id, "download", f"yt-dlp: {message}", current_item=url)
 
     output_template = str(target_dir / "%(title).180B-%(id)s.%(ext)s")
+    # Modern YouTube extraction requires yt-dlp's EJS solver plus a supported
+    # JavaScript runtime. OCTAVE's managed refresh installs yt-dlp[default,deno]
+    # so Deno is normally preferred; enable a Node 22+ runtime from PATH as a
+    # local fallback for development and installations that already provide it.
+    # The executable path stays inside this worker process and is never exposed
+    # through OCTAVE's renderer protocol.
+    js_runtimes: dict[str, dict[str, str]] = {}
+    deno_path = shutil.which("deno")
+    if deno_path:
+        js_runtimes["deno"] = {"path": deno_path}
+    node_path = shutil.which("node")
+    if node_path:
+        js_runtimes["node"] = {"path": node_path}
     options = {
         "format": "bestaudio/best",
         "noplaylist": True,
@@ -1689,6 +1702,7 @@ def download_youtube_audio(url: str, target_dir: Path, run_id: str) -> Path:
             "preferredcodec": "mp3",
             "preferredquality": "192",
         }],
+        **({"js_runtimes": js_runtimes} if js_runtimes else {}),
     }
     try:
         with yt_dlp.YoutubeDL(options) as downloader:
