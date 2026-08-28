@@ -858,6 +858,7 @@ async function findDatasetPackages(
       )
         packages.push(entryPath)
     }
+  }
   return packages.sort((left, right) => left.localeCompare(right))
 }
 

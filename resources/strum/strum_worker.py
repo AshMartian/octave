@@ -18,17 +18,9 @@ from pathlib import Path
 from typing import Any
 
 EVENT_PREFIX = "__OCTAVE_EVENT__"
-GITHUB_REPO_URL = "https://github.com/opria123/strum"
-GITHUB_ZIP_URL = "https://codeload.github.com/opria123/strum/zip/refs/heads/master"
 HF_REPO_ID = "opria123/strum"
 HF_REPO_URL = "https://huggingface.co/opria123/strum"
 SOURCE_FOLDER_NAME = "strum-source"
-# Bump this whenever strum's GitHub HEAD changes in a way the worker depends on
-# (new pipeline params, new checkpoints, etc.). The cached source under
-# <cache_dir>/strum-source/.octave-source-version is compared on every run and
-# the cache is wiped + re-downloaded on mismatch.
-STRUM_SOURCE_VERSION = "2026-05-06.1"
-SOURCE_VERSION_FILE = ".octave-source-version"
 SNAPSHOT_FOLDER_NAME = "strum-checkpoints-snapshot"
 # Hard wall-clock ceiling for stem separation. Slow (often older) CPUs can
 # legitimately take >15 min per song with the Python demucs fallback, which is
@@ -556,26 +548,9 @@ def bootstrap_source(cache_dir: Path, run_id: str) -> Path:
             emit_progress(run_id, "bootstrap", f"Using local STRUM source override: {configured_path}", percent=100)
             return configured_path
 
-    source_root = cache_dir / SOURCE_FOLDER_NAME
-    if is_valid_source_root(source_root):
-        version_marker = source_root / SOURCE_VERSION_FILE
-        cached_version = version_marker.read_text(encoding="utf-8").strip() if version_marker.exists() else ""
-        if cached_version == STRUM_SOURCE_VERSION:
-            emit_progress(run_id, "bootstrap", "Using cached STRUM source.", percent=100)
-            return source_root
-        emit_progress(
-            run_id,
-            "bootstrap",
-            f"Cached STRUM source is stale (have='{cached_version or 'none'}', want='{STRUM_SOURCE_VERSION}'). Refreshing...",
-            percent=0,
-        )
-        try:
-            shutil.rmtree(source_root)
-        except Exception:
-            pass
-
     local_source = resolve_local_source_override()
     if local_source is not None:
+        source_root = cache_dir / SOURCE_FOLDER_NAME
         emit_progress(run_id, "bootstrap", f"Using local STRUM source: {local_source}", percent=0)
         try:
             copy_source_root(local_source, source_root, run_id)
@@ -585,48 +560,12 @@ def bootstrap_source(cache_dir: Path, run_id: str) -> Path:
             ) from exc
 
         emit_progress(run_id, "bootstrap", "STRUM source ready from local checkout.", percent=100)
-        try:
-            (source_root / SOURCE_VERSION_FILE).write_text(STRUM_SOURCE_VERSION, encoding="utf-8")
-        except Exception:
-            pass
         return source_root
 
-    emit_progress(run_id, "bootstrap", "Downloading STRUM source...", percent=0)
-    with tempfile.TemporaryDirectory(prefix="octave-strum-src-") as temp_dir_name:
-        temp_dir = Path(temp_dir_name)
-        zip_path = temp_dir / "strum-main.zip"
-        try:
-            download_to_path(GITHUB_ZIP_URL, zip_path, run_id, "bootstrap")
-        except Exception as exc:
-            raise IntegrationError(
-                "Could not download STRUM source from GitHub. "
-                f"Check your connection, set OCTAVE_STRUM_SOURCE_DIR to a local STRUM checkout, "
-                f"or fetch it manually from {GITHUB_REPO_URL}."
-            ) from exc
-
-        try:
-            with zipfile.ZipFile(zip_path) as archive:
-                archive.extractall(temp_dir)
-        except Exception as exc:
-            raise IntegrationError("Downloaded STRUM source archive could not be extracted.") from exc
-
-        extracted_roots = [child for child in temp_dir.iterdir() if child.is_dir() and child.name.startswith("strum-")]
-        if not extracted_roots:
-            raise IntegrationError("Downloaded STRUM source archive did not contain the expected folder layout.")
-
-        extracted_root = extracted_roots[0]
-        if source_root.exists():
-            shutil.rmtree(source_root)
-        source_root.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(extracted_root), str(source_root))
-
-    try:
-        (source_root / SOURCE_VERSION_FILE).write_text(STRUM_SOURCE_VERSION, encoding="utf-8")
-    except Exception:
-        pass
-
-    emit_progress(run_id, "bootstrap", "STRUM source ready.", percent=100)
-    return source_root
+    raise IntegrationError(
+        "No verified STRUM inference runtime is available. Select a validated local model bundle "
+        "or configure an explicit developer runtime; OCTAVE will not download executable STRUM source."
+    )
 
 
 def mirror_checkpoint_layout(snapshot_root: Path, flat_root: Path, run_id: str) -> None:

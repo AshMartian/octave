@@ -2,7 +2,7 @@ import { app, BrowserWindow, dialog } from 'electron'
 import { execFile, spawn, type ChildProcess } from 'child_process'
 import { createHash, randomUUID } from 'crypto'
 import { createReadStream, existsSync, type Dirent } from 'fs'
-import { mkdir, readFile, readdir, realpath, stat, unlink, writeFile } from 'fs/promises'
+import { lstat, mkdir, readFile, readdir, realpath, stat, unlink, writeFile } from 'fs/promises'
 import { isAbsolute, join, relative } from 'path'
 import type {
   StrumCheckpointCandidateInputContract,
@@ -2318,6 +2318,25 @@ function privateCheckpointRoot(artifactId: string): string {
   return root
 }
 
+/**
+ * Profile roots are chosen through the main-process picker and saved in their
+ * canonical form. Requiring that same canonical location on every use turns a
+ * later symlink replacement into a stale profile rather than an arbitrary
+ * model-root handoff. Content changes are caught separately by STRUM's
+ * manifest re-inspection below.
+ */
+async function resolveRegisteredProfileRoot(profile: StoredAutoChartProfile): Promise<string> {
+  const root = await realpath(profile.checkpointRoot)
+  if (root !== profile.checkpointRoot || !(await stat(root)).isDirectory()) {
+    throw new Error('The saved model bundle location changed.')
+  }
+  const manifest = await lstat(join(root, MODEL_BUNDLE_MANIFEST_NAME))
+  if (!manifest.isFile() || manifest.isSymbolicLink()) {
+    throw new Error('The saved model bundle location changed.')
+  }
+  return root
+}
+
 export async function inspectDiscoveredCheckpoint(
   artifactId: string
 ): Promise<DiscoveredCheckpoint> {
@@ -2386,7 +2405,7 @@ export async function saveDiscoveredAutoChartProfile(options: {
   if (!runtime.capabilities.includes('chart')) {
     throw new Error('The selected STRUM runtime cannot run deployed Auto Chart profiles.')
   }
-  const root = privateCheckpointRoot(options.artifactId)
+  const root = await realpath(privateCheckpointRoot(options.artifactId))
   const validation = await runWorkerJson([
     'inference',
     'profile',
@@ -2447,16 +2466,15 @@ async function discardInvalidDefaultProfile(
 
 async function resolveDefaultAutoChartProfile(): Promise<ResolvedAutoChartProfile | null> {
   const registry = await readRegistry()
-  const profile = (registry.profiles ?? []).find(
-    (entry) => entry.profileId === registry.defaultProfileId && existsSync(entry.checkpointRoot)
-  )
+  const profile = (registry.profiles ?? []).find((entry) => entry.profileId === registry.defaultProfileId)
   if (!profile) return null
-  const runtime = await probeTrainingRuntime()
-  if (runtime.runtimeId !== profile.runtimeId || !runtime.capabilities.includes('chart')) {
-    await discardInvalidDefaultProfile(registry, profile.profileId)
-    return null
-  }
   try {
+    const checkpointRoot = await resolveRegisteredProfileRoot(profile)
+    const runtime = await probeTrainingRuntime()
+    if (runtime.runtimeId !== profile.runtimeId || !runtime.capabilities.includes('chart')) {
+      await discardInvalidDefaultProfile(registry, profile.profileId)
+      return null
+    }
     // A profile is usable only when the current bundle re-inspection retains
     // the exact artifact and manifest identity that OCTAVE saved.
     if (!profile.artifactId || !profile.manifestSha256) {
@@ -2468,7 +2486,7 @@ async function resolveDefaultAutoChartProfile(): Promise<ResolvedAutoChartProfil
         'checkpoint',
         'inspect',
         '--model-root',
-        profile.checkpointRoot,
+        checkpointRoot,
         '--json'
       ])
     )
@@ -2498,7 +2516,7 @@ async function resolveDefaultAutoChartProfile(): Promise<ResolvedAutoChartProfil
       'profile',
       'validate',
       '--model-root',
-      profile.checkpointRoot,
+      checkpointRoot,
       '--profile',
       strumProfileId,
       '--difficulty-policy',
@@ -2513,7 +2531,7 @@ async function resolveDefaultAutoChartProfile(): Promise<ResolvedAutoChartProfil
       await discardInvalidDefaultProfile(registry, profile.profileId)
       return null
     }
-    return { ...profile, instruments: declaredProfile.instruments }
+    return { ...profile, checkpointRoot, instruments: declaredProfile.instruments }
   } catch {
     await discardInvalidDefaultProfile(registry, profile.profileId)
     return null

@@ -562,6 +562,15 @@ function hasRemoteInputs(options: Omit<AutoChartRunOptions, 'cacheDir'>): boolea
 export async function runAutoChart(
   options: Omit<AutoChartRunOptions, 'cacheDir'>
 ): Promise<AutoChartRunResult> {
+  // The legacy adapter bootstraps from a STRUM source tree. A packaged OCTAVE
+  // build must never let that compatibility path acquire mutable remote code
+  // when no verified Deploy profile is active. Profiled charting is resolved
+  // before this fallback in the main-process IPC handler.
+  if (app.isPackaged) {
+    throw new Error(
+      'No verified STRUM Auto Chart profile is selected. Choose a validated local model bundle in Training → Deploy before charting.'
+    )
+  }
   const remote = hasRemoteInputs(options)
   try {
     return await runAutoChartOnce(options, { allowYtDlpRetry: remote, refreshYtDlp: remote })

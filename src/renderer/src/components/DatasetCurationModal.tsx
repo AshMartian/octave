@@ -1106,16 +1106,10 @@ export function TrainingModal({
     }
   }
 
-  const updateCatalog = (
-    event: React.MouseEvent<HTMLButtonElement>,
-    catalog: ExistingCatalog
-  ): void => {
-    // The catalog row remains selectable, but Update is a separate action. Keep
-    // this explicit so a click can never be interpreted as a row selection or
-    // form submission before the update request is started.
-    event.preventDefault()
-    event.stopPropagation()
-    chooseExistingCatalog(catalog)
+  const updateCatalog = (catalog: ExistingCatalog): void => {
+    // Updating is intentionally independent of selection state. React state
+    // updates are asynchronous, so first selecting a row here could otherwise
+    // leave the save request with stale curation fields.
     void buildCatalog(catalog)
   }
 
@@ -1511,7 +1505,7 @@ export function TrainingModal({
                           <button
                             type="button"
                             className="dataset-catalog-update"
-                            onClick={(event) => updateCatalog(event, catalog)}
+                            onClick={() => updateCatalog(catalog)}
                             disabled={exporting}
                           >
                             {exporting ? 'Updating…' : 'Update'}

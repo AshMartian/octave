@@ -1,7 +1,7 @@
 import { mkdtempSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -351,6 +351,41 @@ describe('discovered STRUM profile boundaries', () => {
     await expect(
       runDefaultAutoChartProfile({
         runId: 'run-1',
+        outputDir: join(scratch, 'output'),
+        files: [],
+        folders: [],
+        stemFolders: [],
+        urls: []
+      })
+    ).resolves.toBeNull()
+
+    const persisted = await registry()
+    expect(persisted).not.toHaveProperty('defaultProfileId')
+    expect(persisted.profiles).toEqual([])
+  })
+
+  it('clears a saved default when its registered root becomes a symlink', async () => {
+    const root = await addBundle(
+      'bundle-a',
+      candidate({ artifactId: artifactA, manifestSha256: manifestA })
+    )
+    const replacement = await addBundle(
+      'bundle-replacement',
+      candidate({ artifactId: artifactA, manifestSha256: manifestA })
+    )
+    selectedFolder = root
+    await chooseCheckpointFolder()
+    await saveDiscoveredAutoChartProfile({
+      artifactId: artifactA,
+      profileId: 'guitar-hybrid-v2-rule',
+      difficultyPolicy: 'expert_only'
+    })
+    await rm(root, { recursive: true, force: true })
+    await symlink(replacement, root, 'dir')
+
+    await expect(
+      runDefaultAutoChartProfile({
+        runId: 'symlinked-default',
         outputDir: join(scratch, 'output'),
         files: [],
         folders: [],
