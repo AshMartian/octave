@@ -333,6 +333,24 @@ function workerScriptPath(): string {
     : join(process.cwd(), 'resources', 'strum', 'strum_worker.py')
 }
 
+/**
+ * An installer can ship a signed, self-contained STRUM worker beside the
+ * compatibility adapter. `extraResources` already keeps this directory out
+ * of the asar archive, so the worker remains directly executable. The Python
+ * adapter is retained only as the development/inference compatibility path
+ * until such a worker is present.
+ */
+function bundledRuntimeExecutablePath(): string | null {
+  const root = app.isPackaged
+    ? join(process.resourcesPath, 'resources', 'strum')
+    : join(process.cwd(), 'resources', 'strum')
+  const names =
+    process.platform === 'win32'
+      ? ['strum-worker.exe', 'strum-worker.cmd', 'strum-worker.bat']
+      : ['strum-worker']
+  return names.map((name) => join(root, name)).find((candidate) => existsSync(candidate)) ?? null
+}
+
 function broadcast(payload: TrainingJobEvent): void {
   for (const window of BrowserWindow.getAllWindows()) {
     window.webContents.send('training:progress', payload)
@@ -495,6 +513,14 @@ async function bundledAdapterInvocation(
   purpose: string,
   settings: RuntimeSettings
 ): Promise<WorkerInvocation> {
+  const bundledWorker = bundledRuntimeExecutablePath()
+  if (bundledWorker) {
+    return {
+      command: bundledWorker,
+      baseArgs: [],
+      env: await workerEnvironment(settings)
+    }
+  }
   const python = settings.developerPython ?? (await resolvePythonCommand(purpose))
   const script = workerScriptPath()
   if (!existsSync(script)) throw new Error('OCTAVE could not find its STRUM runtime adapter.')
