@@ -354,7 +354,28 @@ async function findPythonCommand(runId?: string): Promise<PythonCommand> {
   return { command: await ensureBootstrappedPython(requirementsPath, runId), baseArgs: [] }
 }
 
-export async function resolvePythonCommand(runId?: string): Promise<PythonCommand> {
+export async function resolvePythonCommand(
+  runId?: string,
+  options?: { developerSourceRoot?: string }
+): Promise<PythonCommand> {
+  if (options?.developerSourceRoot !== undefined) {
+    // Developer activation selects an existing environment. The versioned
+    // worker probe owns dependency/capability validation for that checkout.
+    const configured = process.env.OCTAVE_STRUM_PYTHON?.trim()
+    const root = options.developerSourceRoot
+    if (!root.trim()) throw new Error('Select a STRUM checkout with a Python environment.')
+    const localPython =
+      process.platform === 'win32'
+        ? join(root, '.venv', 'Scripts', 'python.exe')
+        : join(root, '.venv', 'bin', 'python')
+    const candidate: PythonCommand = { command: configured || localPython, baseArgs: [] }
+    if ((configured || existsSync(localPython)) && (await commandExists(candidate))) {
+      return candidate
+    }
+    throw new Error(
+      'The developer STRUM Python environment is unavailable. Configure OCTAVE_STRUM_PYTHON or create a .venv in the selected checkout.'
+    )
+  }
   return findPythonCommand(runId)
 }
 

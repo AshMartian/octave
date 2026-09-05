@@ -816,7 +816,9 @@ async function activateDeveloperTrainingRuntime(rootPath: string): Promise<Train
   if (!hasVersionedWorkerSource(root)) {
     throw new Error('The selected folder does not contain a compatible STRUM worker.')
   }
-  const developerPython = await resolvePythonCommand('developer-training-runtime')
+  const developerPython = await resolvePythonCommand('developer-training-runtime', {
+    developerSourceRoot: root
+  })
   const settings: RuntimeSettings = {
     developerSourceRoot: root,
     developerPython,
