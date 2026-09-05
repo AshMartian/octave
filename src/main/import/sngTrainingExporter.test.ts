@@ -514,31 +514,51 @@ describe('exportSngTrainingMidi', () => {
     ])
   })
 
-  it('serializes only allowed catalog records even when called directly for unreviewed STRUM output', async () => {
-    const songDir = join(testDir, 'catalog-strum-song')
-    const parentDir = join(testDir, 'catalog-strum-parent')
+  it.each([
+    ['unchanged', 'name = Generated\nartist = STRUM'],
+    ['metadata-only', 'name = Renamed by user\nartist = Edited metadata'],
+    [
+      'self-attested',
+      'name = Generated\ntraining_approved_revision = fabricated\nmanual_edit = true'
+    ]
+  ])('rejects %s generated charts even with explicit opt-in', async (variant, metadata) => {
+    const songDir = join(testDir, `catalog-strum-${variant}`)
+    const parentDir = join(testDir, `catalog-strum-parent-${variant}`)
     await mkdir(songDir, { recursive: true })
     await mkdir(parentDir, { recursive: true })
     await writeFile(join(songDir, 'notes.mid'), validMidi)
     await writeFile(
       join(songDir, 'song.ini'),
-      '[song]\nname = Generated\nartist = STRUM\nstrum_generated = true\ndataset_opt_in = false\n'
+      `[song]\n${metadata}\nstrum_generated = true\ndataset_opt_in = true\n`
     )
-
-    const result = await buildSongSourceCatalog({
-      sources: [{ kind: 'octave-library', sourcePath: songDir }],
-      parentDir,
-      catalogName: 'strum-catalog',
-      catalogId: 'strum-catalog',
-      provenance: 'Reviewed local collection',
-      license: 'test-only',
-      octaveVersion: 'test'
+    await expect(
+      summarizeDatasetSource({ kind: 'octave-library', sourcePath: songDir })
+    ).resolves.toMatchObject({
+      trainingUse: 'review_required',
+      warnings: [{ code: 'generated_revision_unverified' }]
     })
-
-    expect(result).toMatchObject({ recordCount: 1 })
-    expect(await readFile(join(parentDir, 'strum-catalog', 'records.jsonl'), 'utf8')).toContain(
-      '"training_use":"allowed"'
-    )
+    await expect(
+      buildSongSourceCatalog({
+        sources: [{ kind: 'octave-library', sourcePath: songDir }],
+        parentDir,
+        catalogName: 'strum-catalog',
+        catalogId: 'strum-catalog',
+        provenance: 'Explicitly reviewed',
+        license: 'test-only',
+        octaveVersion: 'test'
+      })
+    ).rejects.toThrow('Generated chart training is unavailable')
+    expect(existsSync(join(parentDir, 'strum-catalog'))).toBe(false)
+    const exported = await exportSngTrainingMidi({
+      sngPaths: [],
+      librarySongPaths: [songDir],
+      outputDir: join(testDir, `generated-export-${variant}`),
+      datasetId: 'generated-export',
+      provenance: 'Explicitly reviewed',
+      license: 'test-only'
+    })
+    expect(exported.exported).toEqual([])
+    expect(exported.skipped).toEqual([{ sourceIndex: 0, reason: 'generated_revision_unverified' }])
   })
 
   it('writes schema-shaped instrument coverage with track_names', async () => {
@@ -608,14 +628,14 @@ describe('exportSngTrainingMidi', () => {
     archive.addFile('song/notes.mid', validMidi)
     archive.addFile(
       'song/song.ini',
-      Buffer.from('[song]\nname = ZIP Song\ncharter = STRUM\nstrum_generated = true\n')
+      Buffer.from('[song]\nname = ZIP Song\ncharter = Human author\n')
     )
     archive.writeZip(archivePath)
     await mkdir(parentDir, { recursive: true })
 
     await expect(
       summarizeDatasetSource({ kind: 'zip', sourcePath: archivePath })
-    ).resolves.toMatchObject({ isStrumGenerated: true })
+    ).resolves.toMatchObject({ isStrumGenerated: false })
 
     const result = await buildSongSourceCatalog({
       sources: [{ kind: 'zip', sourcePath: archivePath }],
@@ -672,22 +692,18 @@ describe('exportSngTrainingMidi', () => {
     if (!strumEntry) throw new Error('Expected STRUM ZIP entry fixture')
     const parentDir = join(testDir, 'multi-song-catalog-parent')
     await mkdir(parentDir, { recursive: true })
-    await buildSongSourceCatalog({
-      sources: [{ kind: 'zip', sourcePath: archivePath, entryId: strumEntry.entryId }],
-      parentDir,
-      catalogName: 'selected-entry',
-      catalogId: 'selected-entry',
-      provenance: 'Reviewed',
-      license: 'test-only',
-      octaveVersion: 'test'
-    })
-    const record = JSON.parse(
-      await readFile(join(parentDir, 'selected-entry', 'records.jsonl'), 'utf8')
-    ) as { metadata: { name: string }; rights: { training_use: string } }
-    expect(record).toMatchObject({
-      metadata: { name: 'STRUM Song' },
-      rights: { training_use: 'allowed' }
-    })
+    await expect(
+      buildSongSourceCatalog({
+        sources: [{ kind: 'zip', sourcePath: archivePath, entryId: strumEntry.entryId }],
+        parentDir,
+        catalogName: 'selected-entry',
+        catalogId: 'selected-entry',
+        provenance: 'Reviewed',
+        license: 'test-only',
+        octaveVersion: 'test'
+      })
+    ).rejects.toThrow('Generated chart training is unavailable')
+    expect(existsSync(join(parentDir, 'selected-entry'))).toBe(false)
   })
 
   it('materializes only a review-selected ZIP chart from its exact snapshot', async () => {

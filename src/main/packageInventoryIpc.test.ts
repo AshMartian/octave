@@ -147,6 +147,30 @@ describe('dataset package inventory IPC lifecycle', () => {
     expect(JSON.stringify(restored)).not.toContain(scratch)
   })
 
+  it('refuses generated-song opt-in while allowing consent revocation', async () => {
+    const songDir = join(scratch, 'generated-approval-song')
+    await mkdir(songDir, { recursive: true })
+    await writeFile(join(songDir, 'notes.mid'), vocalMidi())
+    await writeFile(
+      join(songDir, 'song.ini'),
+      '[song]\nname = Generated approval fixture\nstrum_generated = true\ndataset_opt_in = false\n'
+    )
+    await handlers.get('dialog:openFolder')?.({})
+    const songs = (await handlers.get('dataset:scanLibrary')?.({})) as Array<{
+      candidateId: string
+      isStrumGenerated: boolean
+    }>
+    const generated = songs.find((song) => song.isStrumGenerated)
+    expect(generated).toBeDefined()
+    await expect(
+      handlers.get('dataset:setSongOptIn')?.({}, generated?.candidateId, true)
+    ).resolves.toBe(false)
+    expect(await readFile(join(songDir, 'song.ini'), 'utf8')).toContain('dataset_opt_in = false')
+    await expect(
+      handlers.get('dataset:setSongOptIn')?.({}, generated?.candidateId, false)
+    ).resolves.toBe(true)
+  })
+
   it('maps private reviewed entries to opaque safe candidates only after completion', async () => {
     const choose = handlers.get('dataset:choosePackageFolder')
     const inspect = handlers.get('dataset:inspectPackageGroup')

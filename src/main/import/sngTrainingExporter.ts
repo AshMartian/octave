@@ -298,6 +298,17 @@ function sanitizeMetadata(
   return sanitized
 }
 
+const GENERATED_REVISION_UNVERIFIED = 'generated_revision_unverified'
+const GENERATED_TRAINING_BLOCKED_MESSAGE =
+  'Generated chart training is unavailable until OCTAVE can verify manual edits and approval against a preserved baseline.'
+
+// A consent boolean, changed metadata, or changed MIDI bytes is not evidence of
+// a meaningful human correction. No canonical baseline/accepted-revision store
+// exists yet, so recognized generated sources remain inadmissible in every path.
+function assertSupervisedSourceAdmission(candidate: { isStrumGenerated: boolean }): void {
+  if (candidate.isStrumGenerated) throw new Error(GENERATED_TRAINING_BLOCKED_MESSAGE)
+}
+
 function isDatasetOptedIn(value: unknown): boolean {
   return value === true || value === 1 || /^(?:1|true|yes)$/i.test(String(value ?? '').trim())
 }
@@ -1040,8 +1051,12 @@ function summarizeCatalogCandidate(candidate: CatalogCandidate): DatasetSourceSu
     midiValid,
     instruments: midiValid ? discoverInstrumentCoverage(candidate.midi) : {},
     // This is a UI-only review state. Catalog records always serialize allowed.
-    trainingUse: candidate.requiresOptIn ? 'review_required' : 'allowed',
-    warnings: midiValid ? [] : [{ code: 'invalid_notes_midi' }],
+    trainingUse:
+      candidate.isStrumGenerated || candidate.requiresOptIn ? 'review_required' : 'allowed',
+    warnings: [
+      ...(midiValid ? [] : [{ code: 'invalid_notes_midi' }]),
+      ...(candidate.isStrumGenerated ? [{ code: GENERATED_REVISION_UNVERIFIED }] : [])
+    ],
     isStrumGenerated: candidate.isStrumGenerated
   }
 }
@@ -1090,7 +1105,12 @@ export async function summarizeDatasetSource(
       midiValid,
       instruments: midiValid ? discoverInstrumentCoverage(first.midi) : {},
       trainingUse: summarizeCatalogCandidate(first).trainingUse,
-      warnings: midiValid ? [] : [{ code: 'invalid_notes_midi' }],
+      warnings: [
+        ...(midiValid ? [] : [{ code: 'invalid_notes_midi' }]),
+        ...(candidates.some((candidate) => candidate.isStrumGenerated)
+          ? [{ code: GENERATED_REVISION_UNVERIFIED }]
+          : [])
+      ],
       isStrumGenerated: first.isStrumGenerated
     }
   } catch {
@@ -2481,6 +2501,7 @@ export async function buildSongSourceCatalog(options: {
         continue
       }
       for (const candidate of candidates) {
+        assertSupervisedSourceAdmission(candidate)
         if (!isValidMidi(candidate.midi)) {
           skipped.push({ sourceIndex, reason: 'Source has invalid notes.mid' })
           continue
@@ -2677,6 +2698,7 @@ export async function buildSongSourceCatalogAudioEnrichmentRevision(
       throw new Error('Reviewed package changed or selected chart is unavailable.')
     }
     const candidate = candidates[0]
+    assertSupervisedSourceAdmission(candidate)
     const notesSha256 = sha256Buffer(candidate.midi)
     assertSafeAlternateAudio(candidate.audio)
 
@@ -2811,6 +2833,7 @@ type Candidate = {
   midi: Buffer
   metadata: Record<string, string>
   packageSha256?: string
+  isStrumGenerated: boolean
 }
 
 /**
@@ -2844,6 +2867,10 @@ export async function exportSngTrainingMidi(
   let sourceIndex = 0
 
   const exportCandidate = async (candidate: Candidate, index: number): Promise<void> => {
+    if (candidate.isStrumGenerated) {
+      skipped.push({ sourceIndex: index, reason: GENERATED_REVISION_UNVERIFIED })
+      return
+    }
     if (!isValidMidi(candidate.midi)) {
       skipped.push({ sourceIndex: index, reason: 'Package could not be read or exported' })
       return
@@ -2927,6 +2954,7 @@ export async function exportSngTrainingMidi(
       await exportCandidate(
         {
           source: 'octave-library',
+          isStrumGenerated: isStrumGenerated(metadata),
           midi: await readFile(path.join(songPath, NOTES_MIDI)),
           metadata: sanitizeMetadata(metadata)
         },

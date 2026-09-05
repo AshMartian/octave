@@ -146,9 +146,12 @@ importer or tokenization layer.
    source kind, sanitized metadata, MIDI validity, instrument coverage,
    duplicate status, import warnings, and rights status.
 3. Require an explicit provenance and license/permission basis before a source
-   can be included. STRUM-charted library songs require saved explicit consent;
-   STRUM-charted external packages are shown per contained song and require an
-   explicit selection. OCTAVE then materializes only those approved sources,
+   can be included. Recognized STRUM-generated charts are currently blocked,
+   including explicitly opted-in library songs and selected package entries.
+   The catalog service returns `generated_revision_unverified` because OCTAVE
+   does not yet preserve a canonical generated baseline and a semantically
+   modified, explicitly approved revision. Metadata changes, byte differences,
+   and self-reported approval fields cannot satisfy that boundary. OCTAVE then materializes only those approved sources,
    with `training_use: allowed`; unresolved review states are never exported.
 4. Ask the user for a parent directory and a new catalog name. The final
    `<parent>/<name>` destination must not already exist; an existing empty
@@ -269,3 +272,20 @@ packages.
 - Deduplicate by canonical materialized asset hashes, not display metadata.
 - Add fields only in a backward-compatible minor revision; publish a new
   `.../v2` format for breaking changes. Consumers reject unknown major formats.
+
+### Generated chart admission
+
+The current release accepts human-authored reviewed sources. It fails closed
+for recognized STRUM-generated charts in catalog materialization, reviewed
+package audio enrichment, and legacy MIDI export. The UI explains this blocked
+workflow; ordinary editing and chart generation remain available.
+
+Enabling generated corrections later requires a preserved canonical chart
+baseline, instrument-aware semantic change evidence, and explicit approval
+bound to the exact accepted revision. Later edits must invalidate that approval.
+A `dataset_opt_in` flag or a metadata-only edit cannot provide this evidence.
+Existing catalogs made by older versions are not retroactively certified by
+this change; recreate any catalog that included generated charts. Sources
+whose generated provenance has been removed cannot be identified from the
+current metadata-only history and must not be represented as verified human
+corrections.
