@@ -1843,10 +1843,16 @@ async function resolvePromotionRequest(
       throw new Error('Required post-training evaluation evidence is unavailable.')
     }
   }
+  // STRUM's experiment directory owns experiment.json and its nested bundle.
+  // Package handlers consume that directory, while evaluators consume the bundle.
+  const experimentRoot = await resolveLegacyTrainingRunRoot(run.outputRoot)
+  if (!isContainedPath(experimentRoot, binding.bundleRoot)) {
+    throw new Error('The candidate is outside its registered training experiment.')
+  }
   const values: Record<string, string | undefined> = {
     bundle_root: binding.bundleRoot,
-    experiment: binding.bundleRoot,
-    experiment_root: binding.bundleRoot,
+    experiment: experimentRoot,
+    experiment_root: experimentRoot,
     task_view: binding.taskView,
     dataset_manifest: binding.taskView,
     catalog_root: binding.catalogRoot,
@@ -2830,6 +2836,14 @@ async function safeProfiledAutoChartResult(
   ) {
     throw new Error('The validated STRUM profile returned an invalid chart result.')
   }
+  const typedArtifacts = await inspectTypedChartArtifacts(outputDir, profile)
+  // Preserve generated provenance when this output is later imported as a song
+  // folder. A typed run has no legacy songFolders entry for the normal marker.
+  await writeFile(
+    join(outputDir, 'song.ini'),
+    '[song]\nname = STRUM chart\ncharter = STRUM\nstrum_generated = true\ndataset_opt_in = false\n',
+    { encoding: 'utf8', flag: 'wx' }
+  )
   // A direct STRUM profile produces chart artifacts, not a legacy song-package
   // folder. Keep the output location user-selected and do not invent a package
   // that OCTAVE has not received from the worker.
@@ -2838,7 +2852,7 @@ async function safeProfiledAutoChartResult(
     outputDir,
     songFolders: [],
     errors: [],
-    typedArtifacts: await inspectTypedChartArtifacts(outputDir, profile)
+    typedArtifacts
   }
 }
 
@@ -2929,7 +2943,7 @@ async function runProfiledWorkerJsonCommand(
 
 async function runResolvedAutoChartProfile(
   profile: ResolvedAutoChartProfile,
-  options: Omit<AutoChartRunOptions, 'cacheDir'>
+  options: Omit<AutoChartRunOptions, 'cacheDir'> & { sourceMidiPath?: string }
 ): Promise<AutoChartRunResult> {
   let worker: WorkerInvocation
   for (;;) {
@@ -2939,7 +2953,14 @@ async function runResolvedAutoChartProfile(
     worker = resolved.invocation
     break
   }
-  const input = resolveProfiledAudioInput(options)
+  const isTransform = profile.pipelineId === 'difficulty.transform/v1'
+  if (isTransform && !options.sourceMidiPath) {
+    throw new Error(
+      'This learned profile needs an Expert MIDI chart. Use Transform MIDI in Training Deploy.'
+    )
+  }
+  const input =
+    isTransform && options.files.length === 0 ? null : resolveProfiledAudioInput(options)
   let materialized: MaterializedProfileAudio | null = null
   const runtime = await probeTrainingRuntime()
   const device = profiledChartDevice(runtime)
@@ -2952,9 +2973,11 @@ async function runResolvedAutoChartProfile(
       throw new Error('The validated STRUM profile chart run was cancelled.')
     }
     const audioPath =
-      input.kind === 'local'
-        ? input.audioPath
-        : (materialized = await materializeProfileUrlAudio(options.runId, input.url)).audioPath
+      input === null
+        ? null
+        : input.kind === 'local'
+          ? input.audioPath
+          : (materialized = await materializeProfileUrlAudio(options.runId, input.url)).audioPath
     if (runningProfiledAutoCharts.get(options.runId)?.cancelling) {
       throw new Error('The validated STRUM profile chart run was cancelled.')
     }
@@ -2990,7 +3013,9 @@ async function runResolvedAutoChartProfile(
       runRequestPath,
       JSON.stringify({
         preflight_request: preflightRequestPath,
-        audio_path: audioPath,
+        ...(isTransform
+          ? { source_midi_path: options.sourceMidiPath, song_path: audioPath }
+          : { audio_path: audioPath }),
         output_dir: options.outputDir
       }),
       { encoding: 'utf8', mode: 0o600, flag: 'wx' }
@@ -3017,6 +3042,79 @@ async function runResolvedAutoChartProfile(
     throw error
   } finally {
     await materialized?.cleanup()
+  }
+}
+
+/** Select private transform inputs through native dialogs; expose only artifact identities. */
+export async function chooseAndRunTrainingTransform(options: {
+  runId: string
+  includeAudio: boolean
+}): Promise<{ cancelled: boolean; outputName?: string; artifacts?: TypedChartArtifacts }> {
+  if (
+    !options ||
+    !/^[a-f0-9-]{36}$/.test(options.runId) ||
+    typeof options.includeAudio !== 'boolean'
+  ) {
+    throw new Error('Invalid local transform request.')
+  }
+  if (runningProfiledAutoCharts.has(options.runId))
+    throw new Error('This transform is already running.')
+  runningProfiledAutoCharts.set(options.runId, { requestPaths: [], cancelling: false })
+  try {
+    const profile = await resolveDefaultAutoChartProfile()
+    if (runningProfiledAutoCharts.get(options.runId)?.cancelling) return { cancelled: true }
+    if (profile?.pipelineId !== 'difficulty.transform/v1') {
+      throw new Error('Select a validated learned transform as the default profile first.')
+    }
+    const source = await dialog.showOpenDialog({
+      title: 'Choose the source Expert MIDI chart',
+      properties: ['openFile'],
+      filters: [{ name: 'MIDI charts', extensions: ['mid', 'midi'] }]
+    })
+    if (
+      runningProfiledAutoCharts.get(options.runId)?.cancelling ||
+      source.canceled ||
+      !source.filePaths[0]
+    )
+      return { cancelled: true }
+    let audioPath: string | undefined
+    if (options.includeAudio) {
+      const audio = await dialog.showOpenDialog({
+        title: 'Choose aligned song audio',
+        properties: ['openFile'],
+        filters: [{ name: 'Audio', extensions: ['wav', 'ogg', 'flac', 'mp3', 'opus', 'm4a'] }]
+      })
+      if (
+        runningProfiledAutoCharts.get(options.runId)?.cancelling ||
+        audio.canceled ||
+        !audio.filePaths[0]
+      )
+        return { cancelled: true }
+      audioPath = audio.filePaths[0]
+    }
+    const destination = await dialog.showOpenDialog({
+      title: 'Choose a folder for the new chart output',
+      properties: ['openDirectory', 'createDirectory']
+    })
+    if (
+      runningProfiledAutoCharts.get(options.runId)?.cancelling ||
+      destination.canceled ||
+      !destination.filePaths[0]
+    )
+      return { cancelled: true }
+    const outputName = `strum-transform-${options.runId}`
+    const result = await runResolvedAutoChartProfile(profile, {
+      runId: options.runId,
+      sourceMidiPath: source.filePaths[0],
+      outputDir: join(destination.filePaths[0], outputName),
+      files: audioPath ? [audioPath] : [],
+      folders: [],
+      stemFolders: [],
+      urls: []
+    })
+    return { cancelled: false, outputName, artifacts: result.typedArtifacts }
+  } finally {
+    runningProfiledAutoCharts.delete(options.runId)
   }
 }
 

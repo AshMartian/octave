@@ -61,6 +61,9 @@ function candidate({
 }
 
 let selectedFolder = ''
+const selectedDialogPaths: string[] = []
+const deferredDialogs: Array<Promise<{ canceled: boolean; filePaths: string[] }>> = []
+let openedDialogs = 0
 const inspections = new Map<string, Record<string, unknown>>()
 const preflightRequests: Record<string, unknown>[] = []
 const chartRunRequests: Record<string, unknown>[] = []
@@ -79,7 +82,16 @@ vi.mock('electron', () => ({
   app: { getPath: () => scratch, isPackaged: false },
   BrowserWindow: { getAllWindows: () => [] },
   dialog: {
-    showOpenDialog: async () => ({ canceled: false, filePaths: [selectedFolder] })
+    showOpenDialog: async () => {
+      openedDialogs += 1
+      const deferred = deferredDialogs.shift()
+      return (
+        deferred ?? {
+          canceled: false,
+          filePaths: [selectedDialogPaths.shift() ?? selectedFolder]
+        }
+      )
+    }
   }
 }))
 
@@ -231,7 +243,11 @@ vi.mock('child_process', () => ({
           format: 'strum-chart-run/v1',
           status: 'completed',
           profile_id: preflight.profile_id,
-          capability: instrument === 'drums' ? 'drums.v14-expert/v1' : 'guitar.hybrid-v2-rule/v1',
+          capability: request.source_midi_path
+            ? 'difficulty.transform/v1'
+            : instrument === 'drums'
+              ? 'drums.v14-expert/v1'
+              : 'guitar.hybrid-v2-rule/v1',
           manifest_sha256: manifestSha256,
           artifacts: { notes_midi: { name: 'notes.mid', sha256: notesHash } }
         })
@@ -259,6 +275,7 @@ import {
   cancelDefaultAutoChartProfile,
   chooseCheckpointFolder,
   inspectDiscoveredCheckpoint,
+  chooseAndRunTrainingTransform,
   runDefaultAutoChartProfile,
   saveDiscoveredAutoChartProfile
 } from './training'
@@ -283,6 +300,9 @@ beforeEach(async () => {
   await mkdir(scratch, { recursive: true })
   inspections.clear()
   selectedFolder = ''
+  selectedDialogPaths.length = 0
+  deferredDialogs.length = 0
+  openedDialogs = 0
   preflightRequests.length = 0
   chartRunRequests.length = 0
   materializedUrls.length = 0
@@ -537,6 +557,110 @@ describe('discovered STRUM profile boundaries', () => {
       expect(JSON.stringify(chartRunRequests[0])).not.toContain(selectedFolder)
     }
   )
+
+  it.each([false, true])(
+    'uses private MIDI transform inputs with optional audio=%s',
+    async (includeAudio) => {
+      selectedFolder = await addBundle(
+        'transform-bundle',
+        candidate({
+          artifactId: artifactA,
+          manifestSha256: manifestA,
+          profile: {
+            id: 'learned-transform',
+            capability: 'difficulty.transform/v1',
+            instrument: 'guitar',
+            difficultyPolicy: 'expert_only'
+          }
+        })
+      )
+      await chooseCheckpointFolder()
+      await saveDiscoveredAutoChartProfile({
+        artifactId: artifactA,
+        profileId: 'learned-transform',
+        difficultyPolicy: 'expert_only'
+      })
+      const sourceMidi = join(scratch, 'private-source.mid')
+      const sourceAudio = join(scratch, 'private-song.wav')
+      await writeFile(sourceMidi, 'MThd')
+      await writeFile(sourceAudio, 'audio')
+      selectedDialogPaths.push(sourceMidi, ...(includeAudio ? [sourceAudio] : []), scratch)
+      const result = await chooseAndRunTrainingTransform({
+        runId: 'abcdef12-1234-1234-1234-abcdef123456',
+        includeAudio
+      })
+      expect(result.cancelled).toBe(false)
+      expect(result.artifacts?.capability).toBe('difficulty.transform/v1')
+      expect(chartRunRequests).toHaveLength(1)
+      expect(Object.keys(chartRunRequests[0]).sort()).toEqual([
+        'output_dir',
+        'preflight_request',
+        'song_path',
+        'source_midi_path'
+      ])
+      expect(chartRunRequests[0]).toMatchObject({
+        source_midi_path: sourceMidi,
+        song_path: includeAudio ? sourceAudio : null
+      })
+      expect(JSON.stringify(result)).not.toContain(scratch)
+      expect(
+        await readFile(join(String(chartRunRequests[0].output_dir), 'song.ini'), 'utf8')
+      ).toContain('strum_generated = true')
+      await expect(
+        runDefaultAutoChartProfile({
+          runId: 'audio-only-transform',
+          outputDir: scratch,
+          files: [sourceAudio],
+          folders: [],
+          stemFolders: [],
+          urls: []
+        })
+      ).rejects.toThrow('Transform MIDI')
+    }
+  )
+
+  it.each([0, 1, 2])('stops after cancellation during transform dialog %s', async (dialogIndex) => {
+    selectedFolder = await addBundle(
+      'cancel-transform-bundle',
+      candidate({
+        artifactId: artifactA,
+        manifestSha256: manifestA,
+        profile: {
+          id: 'learned-transform',
+          capability: 'difficulty.transform/v1',
+          instrument: 'guitar',
+          difficultyPolicy: 'expert_only'
+        }
+      })
+    )
+    await chooseCheckpointFolder()
+    await saveDiscoveredAutoChartProfile({
+      artifactId: artifactA,
+      profileId: 'learned-transform',
+      difficultyPolicy: 'expert_only'
+    })
+    const paths = [join(scratch, 'source.mid'), join(scratch, 'song.wav'), scratch]
+    for (let index = 0; index < dialogIndex; index += 1) {
+      deferredDialogs.push(Promise.resolve({ canceled: false, filePaths: [paths[index]] }))
+    }
+    let releaseDialog: ((result: { canceled: boolean; filePaths: string[] }) => void) | undefined
+    deferredDialogs.push(
+      new Promise((resolve) => {
+        releaseDialog = resolve
+      })
+    )
+    const previousDialogs = openedDialogs
+    const runId = 'abcdef12-1234-1234-1234-abcdef123456'
+    const run = chooseAndRunTrainingTransform({ runId, includeAudio: true })
+    await vi.waitFor(() => expect(openedDialogs).toBe(previousDialogs + dialogIndex + 1))
+    await expect(cancelDefaultAutoChartProfile(runId)).resolves.toBe(true)
+    releaseDialog?.({ canceled: false, filePaths: [paths[dialogIndex]] })
+    await expect(run).resolves.toEqual({ cancelled: true })
+    expect(openedDialogs).toBe(previousDialogs + dialogIndex + 1)
+    expect(preflightRequests).toHaveLength(0)
+    expect(chartRunRequests).toHaveLength(0)
+    await expect(cancelDefaultAutoChartProfile(runId)).resolves.toBe(false)
+  })
 
   it('fails closed when the typed preflight no longer matches the saved candidate manifest', async () => {
     selectedFolder = await addBundle(

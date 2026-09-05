@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type Dispatch,
   type SetStateAction
@@ -564,6 +565,7 @@ export function TrainingModal({
     records: number
     skipped: number
   } | null>(null)
+  const trainingRefreshEpoch = useRef(0)
   const [trainingRuntime, setTrainingRuntime] = useState<TrainingRuntime | null>(null)
   const [trainingPipelines, setTrainingPipelines] = useState<TrainingPipeline[]>([])
   const [selectedPipelineId, setSelectedPipelineId] = useState('')
@@ -597,6 +599,9 @@ export function TrainingModal({
   const [showCanonicalVocalMidiOnly, setShowCanonicalVocalMidiOnly] = useState(false)
   const [prepareConfig, setPrepareConfig] = useState<Record<string, TrainingControlValue>>({})
   const [trainConfig, setTrainConfig] = useState<Record<string, TrainingControlValue>>({})
+  const [transformRunId, setTransformRunId] = useState('')
+  const [transformAudio, setTransformAudio] = useState(false)
+  const [transformOutput, setTransformOutput] = useState('')
   const [parentArtifactId, setParentArtifactId] = useState('')
   const [promotionArtifactId, setPromotionArtifactId] = useState('')
   const [promotionJobs, setPromotionJobs] = useState<StrumPromotionJobDescriptor[]>([])
@@ -766,11 +771,13 @@ export function TrainingModal({
   }, [])
 
   const refreshTrainingState = useCallback(async (): Promise<void> => {
+    const epoch = ++trainingRefreshEpoch.current
     const [runtime, pipelines, artifacts] = await Promise.all([
       window.api.getTrainingRuntime(),
       window.api.listTrainingPipelines(),
       window.api.listTrainingArtifacts()
     ])
+    if (epoch !== trainingRefreshEpoch.current) return
     setTrainingRuntime(runtime)
     setTrainingPipelines(pipelines)
     setSelectedPipelineId((current) =>
@@ -1004,7 +1011,10 @@ export function TrainingModal({
     [songs]
   )
 
-  const selectableLibrarySongs = useMemo(() => songs.filter((song) => song.midiValid), [songs])
+  const selectableLibrarySongs = useMemo(
+    () => songs.filter((song) => song.midiValid && !song.isStrumGenerated),
+    [songs]
+  )
   const packageCandidates = useMemo(
     () => packageGroups.flatMap((group) => group.candidates),
     [packageGroups]
@@ -1356,6 +1366,7 @@ export function TrainingModal({
 
   const chooseDeveloperRuntime = async (): Promise<void> => {
     if (enablingTrainingRuntime) return
+    ++trainingRefreshEpoch.current
     setEnablingTrainingRuntime(true)
     setError(null)
     try {
@@ -1377,6 +1388,7 @@ export function TrainingModal({
   }
 
   const chooseInstalledRuntime = async (): Promise<void> => {
+    ++trainingRefreshEpoch.current
     setError(null)
     const runtime = await window.api.chooseInstalledTrainingRuntime()
     if (!runtime?.capabilities.includes('training')) {
@@ -1453,6 +1465,23 @@ export function TrainingModal({
       })
     } catch {
       setError('STRUM could not start catalog preparation.')
+    }
+  }
+
+  const transformMidi = async (): Promise<void> => {
+    const runId = crypto.randomUUID()
+    setTransformRunId(runId)
+    setTransformOutput('')
+    setError(null)
+    try {
+      const result = await window.api.transformTrainingMidi({ runId, includeAudio: transformAudio })
+      if (!result.cancelled) setTransformOutput(result.outputName ?? '')
+    } catch {
+      setError(
+        'STRUM could not transform the selected chart. Check the profile and its source chart/audio requirements.'
+      )
+    } finally {
+      setTransformRunId('')
     }
   }
 
@@ -1586,7 +1615,8 @@ export function TrainingModal({
       ? packageGroups.find((group) => group.groupId === packageCandidate.groupId)?.inventory
       : undefined
     const packageReady = Boolean(packageInventory && !packageInventory.cancelled)
-    const disabled = selectable ? !packageReady : !candidate.midiValid
+    const disabled =
+      candidate.isStrumGenerated || (selectable ? !packageReady : !candidate.midiValid)
     return (
       <label className={disabled ? 'disabled' : ''} key={candidate.candidateId}>
         <input
@@ -1622,7 +1652,7 @@ export function TrainingModal({
             ·{' '}
             {selectable
               ? candidate.isStrumGenerated
-                ? 'STRUM charted · select to explicitly include'
+                ? 'Generated revision unverified · training unavailable'
                 : candidate.canonicalVocalMidi
                   ? 'canonical Vocal MIDI · select to explicitly include'
                   : 'MIDI-backed · select to explicitly include'
@@ -1631,6 +1661,9 @@ export function TrainingModal({
             {Object.entries(candidate.instruments)
               .map(([instrument, coverage]) => `${instrument}: ${coverage.difficulties.join('/')}`)
               .join(', ')}
+            {candidate.isStrumGenerated
+              ? ' · Training is unavailable until manual edits and approval can be verified against a preserved baseline.'
+              : ''}
             {candidate.warnings.length
               ? ` · ${candidate.warnings.map((warning) => warning.code).join(', ')}`
               : ''}
@@ -2262,14 +2295,14 @@ export function TrainingModal({
                   aria-hidden="true"
                 />
                 <div>
-                  <strong>{trainingRuntime?.displayName ?? 'Checking STRUM runtime…'}</strong>
+                  <strong>{trainingRuntime?.displayName ?? 'Select a STRUM runtime'}</strong>
                   <small>
                     {trainingRuntime
                       ? `${trainingRuntime.kind.replace('_', ' ')} · protocol ${trainingRuntime.protocolVersion}${trainingRuntime.sourceRevision ? ` · ${trainingRuntime.sourceRevision}` : ''}`
-                      : 'Validating the local runtime.'}
+                      : 'Choose an installed runtime or a local developer checkout.'}
                   </small>
                 </div>
-                {trainingRuntime?.trainingSetupRequired && (
+                {(!trainingRuntime || trainingRuntime.trainingSetupRequired) && (
                   <div className="training-runtime-actions">
                     <button
                       className="dataset-secondary"
@@ -2623,6 +2656,47 @@ export function TrainingModal({
               >
                 {discoveringCheckpoints ? 'Discovering bundles…' : 'Choose model-bundle folder'}
               </button>
+              {trainingProfiles.some(
+                (profile) => profile.isDefault && profile.pipelineId === 'difficulty.transform/v1'
+              ) && (
+                <section className="training-promotion-panel">
+                  <h4>Use the learned transform</h4>
+                  <p>
+                    Select an Expert MIDI chart and an output folder. STRUM writes a new chart using
+                    the learned difficulty policy of the default profile.
+                  </p>
+                  <label className="training-toggle-control">
+                    <input
+                      type="checkbox"
+                      checked={transformAudio}
+                      disabled={Boolean(transformRunId)}
+                      onChange={(event) => setTransformAudio(event.target.checked)}
+                    />
+                    Provide aligned audio for an audio-conditioned profile
+                  </label>
+                  <button
+                    className="dataset-primary"
+                    disabled={Boolean(transformRunId)}
+                    onClick={() => void transformMidi()}
+                  >
+                    {transformRunId ? 'Transforming MIDI…' : 'Transform MIDI'}
+                  </button>
+                  {transformRunId && (
+                    <button
+                      className="dataset-secondary"
+                      onClick={() => void window.api.cancelAutoChart(transformRunId)}
+                    >
+                      Cancel transform
+                    </button>
+                  )}
+                  {transformOutput && (
+                    <p className="training-inline-note">
+                      Created notes.mid and run.json in {transformOutput} inside your selected
+                      output folder.
+                    </p>
+                  )}
+                </section>
+              )}
               {checkpointDiscovery && (
                 <>
                   <p className="training-inline-note">

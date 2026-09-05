@@ -269,7 +269,11 @@ vi.mock('child_process', () => ({
         writeFileSync(output, '{}\n')
       } else {
         const bundleRoot = args.includes('train') ? join(output, 'bundle') : output
-        if (args.includes('train')) trainingBundleRoot = bundleRoot
+        if (args.includes('train')) {
+          trainingBundleRoot = bundleRoot
+          mkdirSync(output, { recursive: true })
+          writeFileSync(join(output, 'experiment.json'), '{}\n')
+        }
         if (args.includes('train') && trainingBundleEscapesRun) {
           const escapedBundle = join(scratch, 'escaped-bundle')
           mkdirSync(escapedBundle, { recursive: true })
@@ -1107,6 +1111,12 @@ describe('STRUM d8 training adapter', () => {
       options: { profile_id: 'hard' }
     })
     expect(packageRequest?.evaluation).toEqual(evaluationRequest?.output)
+    expect(packageRequest?.experiment).toBe(requests[1].output)
+    expect(packageRequest?.experiment).not.toBe(evaluationRequest?.bundle_root)
+    expect(existsSync(join(String(packageRequest?.experiment), 'experiment.json'))).toBe(true)
+    expect(
+      existsSync(join(String(packageRequest?.experiment), 'bundle', 'strum-model-bundle.json'))
+    ).toBe(true)
     expect(JSON.stringify(packageRequest)).toContain(scratch)
     expect(sends.at(-1)?.result).toMatchObject({ artifactId, deploymentStatus: 'not_deployable' })
   })

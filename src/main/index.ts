@@ -29,6 +29,7 @@ import {
 import {
   cancelTrainingJob,
   cancelDefaultAutoChartProfile,
+  chooseAndRunTrainingTransform,
   chooseDeveloperTrainingRuntime,
   chooseInstalledTrainingRuntime,
   chooseCheckpointFolder,
@@ -1274,6 +1275,7 @@ ipcMain.handle('dataset:setSongOptIn', async (_event, candidateId: string, opted
   const source = datasetSources.get(candidateId)
   if (!source || source.kind !== 'octave-library' || !isPathAllowed(source.sourcePath)) return false
   try {
+    if (optedIn && (await summarizeDatasetSource(source)).isStrumGenerated) return false
     const iniPath = join(source.sourcePath, 'song.ini')
     const metadata = parseIniFile(await readFile(iniPath, 'utf8'))
     metadata.dataset_opt_in = optedIn ? 'true' : 'false'
@@ -1583,6 +1585,19 @@ ipcMain.handle(
   }
 )
 
+ipcMain.handle(
+  'training:transformMidi',
+  async (_event, options: { runId: string; includeAudio: boolean }) => {
+    try {
+      return await chooseAndRunTrainingTransform(options)
+    } catch {
+      throw new Error(
+        'STRUM could not transform this chart. Check the selected profile and required source chart/audio.'
+      )
+    }
+  }
+)
+
 ipcMain.handle('training:startPromotionJob', async (_event, options: unknown) => {
   if (!options || typeof options !== 'object' || Array.isArray(options)) {
     throw new Error('Select a post-training job first.')
@@ -1713,8 +1728,8 @@ ipcMain.handle(
       .then((profileResult) => profileResult ?? runAutoChart(autoChartOptions))
       .then(async (result) => {
         // STRUM output is generated rather than manually curated. Persist an
-        // explicit opt-out so it can only enter a training dataset after a user
-        // reviews it in Dataset Curation and opts it in.
+        // explicit opt-out. Generated training remains unavailable until manual
+        // edits and approval can be bound to a preserved original revision.
         await Promise.all(
           result.songFolders.map(async (songFolder) => {
             try {

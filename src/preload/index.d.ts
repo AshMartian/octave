@@ -422,6 +422,16 @@ interface ChartEditorAPI {
     jobId: string
     options: Record<string, unknown>
   }) => Promise<{ jobId: string }>
+  transformTrainingMidi: (options: { runId: string; includeAudio: boolean }) => Promise<{
+    cancelled: boolean
+    outputName?: string
+    artifacts?: {
+      profileId: string
+      capability: string
+      manifestSha256: string
+      artifacts: Array<{ id: string; name: string; sha256: string }>
+    }
+  }>
   cancelTrainingJob: (jobId: string) => Promise<boolean>
   onTrainingProgress: (
     callback: (event: {

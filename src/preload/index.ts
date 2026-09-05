@@ -526,6 +526,19 @@ const api = {
     options: Record<string, unknown>
   }): Promise<{ jobId: string }> => ipcRenderer.invoke('training:startPromotionJob', options),
 
+  transformTrainingMidi: (options: {
+    runId: string
+    includeAudio: boolean
+  }): Promise<{
+    cancelled: boolean
+    outputName?: string
+    artifacts?: {
+      profileId: string
+      capability: string
+      manifestSha256: string
+      artifacts: Array<{ id: string; name: string; sha256: string }>
+    }
+  }> => ipcRenderer.invoke('training:transformMidi', options),
   cancelTrainingJob: (jobId: string): Promise<boolean> =>
     ipcRenderer.invoke('training:cancel', jobId),
 
