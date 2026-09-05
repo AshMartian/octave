@@ -1,6 +1,6 @@
 # STRUM training: charter workflow, contracts, and scaling roadmap
 
-This document explains the training workflow implemented for OCTAVE and the work needed to turn it into a reliable personal-charting system. It complements the [orchestration contract](strum-orchestration-contract.md), [local training runbook](../docs/reference/strum-training.md), and [catalog contract](../docs/reference/song-source-catalog.md).
+This document explains the training workflow implemented for OCTAVE and the work needed to turn it into a reliable personal-charting system. It complements the [orchestration contract](strum-orchestration-contract.md), [illustrated training tutorial](../docs/guide/strum-training.md), and [catalog contract](../docs/reference/song-source-catalog.md).
 
 **Current scope:** OCTAVE can curate approved local sources, prepare STRUM datasets, supervise training and supported fine-tuning, evaluate candidates, package qualifying profiles, and explicitly select and execute a learned MIDI difficulty transform. These are working software paths. They do not establish that a trained model has learned a charter's style or produces release-quality charts.
 
@@ -8,7 +8,13 @@ This document explains the training workflow implemented for OCTAVE and the work
 
 ## Visual evidence from OCTAVE
 
-These are actual Electron screenshots, captured without changing the application's rendered text or results. Preparation, evaluation and deployment come from the successful 10-stage isolated acceptance run against OCTAVE `81f0f6c` and STRUM `b32fa0a`; the later documentation commits leave that application code unchanged. The fine-tune screenshot is a newly captured configuration state using the same isolated acceptance history. No additional fine-tuning run was started for that image, and the user's active OCTAVE settings were not used.
+These are actual Electron screenshots, captured without changing the application's rendered text or results. Preparation, evaluation and deployment come from the successful 10-stage isolated acceptance run against OCTAVE `81f0f6c` and STRUM `b32fa0a`. The Curate screenshot was captured later from the same isolated history, with the consent explanation corrected to match generated-source exclusion. The fine-tune screenshot is a newly captured configuration state using the same isolated acceptance history. No additional fine-tuning run was started for that image, and the user's active OCTAVE settings were not used.
+
+### Curate an approved catalog
+
+The selected approved catalog contains 212 package-backed records. The screen exposes catalog selection, revision controls, permission basis, provenance, and the boundary between existing records and newly selected library/package inputs. The bottom zero counts describe this editor session's new selections, not the selected catalog's 212 retained records. This is a catalog inspection capture, not a new publication run; Harmony-source validation is still in progress in the image.
+
+![OCTAVE Curate screen showing the selected approved catalog, permission basis, provenance, and revision controls](../docs/public/screenshots/strum-training/curate-approved-catalog.png)
 
 <details>
 <summary>1. Prepare an approved local library</summary>

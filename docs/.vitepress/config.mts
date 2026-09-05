@@ -74,10 +74,11 @@ export default defineConfig({
           items: [{ text: 'Stems Mixer', link: '/guide/stems-mixer' }]
         },
         {
-          text: 'Auto-Chart',
+          text: 'Auto-Chart & Training',
           items: [
             { text: 'Overview', link: '/guide/auto-chart' },
-            { text: 'Advanced Options', link: '/guide/auto-chart-advanced' }
+            { text: 'Advanced Options', link: '/guide/auto-chart-advanced' },
+            { text: 'STRUM Training Tutorial', link: '/guide/strum-training' }
           ]
         },
         {

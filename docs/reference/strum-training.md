@@ -2,17 +2,11 @@
 
 OCTAVE curates approved local songs and supervises STRUM. STRUM owns task eligibility, labels, training, evaluation, model packaging, and chart execution. A completed training run produces a candidate; only a compatible profile that passes its STRUM quality policy can become an Auto-Chart default.
 
-## Set up a developer runtime
+For a complete first run, follow the illustrated [STRUM training tutorial](/guide/strum-training). It includes the pinned developer installation, approved catalog selection, chart-only CPU experiment, quality gates, profile activation, and compatible fine-tuning.
 
-Use a STRUM checkout containing the versioned worker and Python 3.11 or 3.12. Create an isolated environment in that checkout and install STRUM there:
+## Runtime contract
 
-```sh
-python3.12 -m venv .venv
-.venv/bin/python -m pip install '.[dev]'
-.venv/bin/python -m src.worker probe --json
-```
-
-On Windows, use `.venv\Scripts\python.exe`. GPU support depends on the installed PyTorch build. The optional STRUM `pitch` extra is required for mapper preparation; ordinary chart-transform training does not need it.
+Use a compatible versioned STRUM worker in a developer checkout with an isolated `.venv`, or an installed worker executable. The tutorial supplies a reproducible reviewed revision and dependency commands. GPU support depends on the installed PyTorch build. The optional STRUM `pitch` extra is required for mapper preparation; ordinary chart-transform training does not need it.
 
 Open OCTAVE's Training window and explicitly select the developer runtime. OCTAVE validates the worker protocol and advertised capabilities before allowing work. An installed `strum-worker` executable can also be selected. Runtime paths and catalog locations stay in the main process; the renderer receives opaque identities and display names.
 

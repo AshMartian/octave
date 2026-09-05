@@ -2111,8 +2111,9 @@ export function TrainingModal({
                       Octave library
                     </h3>
                     <p>
-                      STRUM-generated songs require explicit consent. Checking a reviewed song
-                      stores explicit consent in <code>song.ini</code>.
+                      Checking a reviewed human-authored song stores training consent in{' '}
+                      <code>song.ini</code>. Recognized STRUM-generated songs remain excluded until
+                      verified revision admission is available.
                     </p>
                   </div>
                   <div className="dataset-section-actions">
