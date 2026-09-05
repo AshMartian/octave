@@ -2628,6 +2628,12 @@ export async function inspectTrainingCheckpoint(runId: string): Promise<Training
   }
 }
 
+function supportsTypedChartExecution(runtime: TrainingRuntime): boolean {
+  return ['chart_preflight', 'chart_run', 'typed_chart_results'].every((capability) =>
+    runtime.capabilities.includes(capability)
+  )
+}
+
 export async function saveDiscoveredAutoChartProfile(options: {
   artifactId: string
   profileId: string
@@ -2646,7 +2652,7 @@ export async function saveDiscoveredAutoChartProfile(options: {
     throw new Error('The selected STRUM profile is not executable for that difficulty policy.')
   }
   const runtime = await probeTrainingRuntime()
-  if (!runtime.capabilities.includes('chart')) {
+  if (!supportsTypedChartExecution(runtime)) {
     throw new Error('The selected STRUM runtime cannot run deployed Auto Chart profiles.')
   }
   const root = await realpath(privateCheckpointRoot(options.artifactId))
@@ -2715,7 +2721,7 @@ async function resolveDefaultAutoChartProfile(): Promise<ResolvedAutoChartProfil
   try {
     const checkpointRoot = await resolveRegisteredProfileRoot(profile)
     const runtime = await probeTrainingRuntime()
-    if (runtime.runtimeId !== profile.runtimeId || !runtime.capabilities.includes('chart')) {
+    if (runtime.runtimeId !== profile.runtimeId || !supportsTypedChartExecution(runtime)) {
       await discardInvalidDefaultProfile(profile.profileId)
       return null
     }

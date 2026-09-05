@@ -60,6 +60,8 @@ function candidate({
   }
 }
 
+const typedChartCapabilities = ['chart_preflight', 'chart_run', 'typed_chart_results']
+let runtimeCapabilities = [...typedChartCapabilities]
 let selectedFolder = ''
 const selectedDialogPaths: string[] = []
 const deferredDialogs: Array<Promise<{ canceled: boolean; filePaths: string[] }>> = []
@@ -120,7 +122,7 @@ vi.mock('child_process', () => ({
         `${JSON.stringify({
           protocol_version: '1.0',
           runtime_id: 'test-runtime',
-          capabilities: ['chart'],
+          capabilities: runtimeCapabilities,
           device_support: ['cpu']
         })}\n`
       )
@@ -299,6 +301,7 @@ beforeEach(async () => {
   await rm(scratch, { recursive: true, force: true })
   await mkdir(scratch, { recursive: true })
   inspections.clear()
+  runtimeCapabilities = [...typedChartCapabilities]
   selectedFolder = ''
   selectedDialogPaths.length = 0
   deferredDialogs.length = 0
@@ -342,6 +345,64 @@ describe('discovered STRUM profile boundaries', () => {
       { checkpointRoot: selectedFolder, artifactId: artifactA, manifestSha256: manifestA }
     ])
   })
+
+  it.each(['chart_preflight', 'chart_run', 'typed_chart_results', 'legacy-chart-only'])(
+    'rejects saving a default when typed capability %s is unavailable',
+    async (missing) => {
+      selectedFolder = await addBundle(
+        'incomplete-runtime',
+        candidate({
+          artifactId: artifactA,
+          manifestSha256: manifestA
+        })
+      )
+      await chooseCheckpointFolder()
+      runtimeCapabilities =
+        missing === 'legacy-chart-only'
+          ? ['chart']
+          : typedChartCapabilities.filter((capability) => capability !== missing)
+      await expect(
+        saveDiscoveredAutoChartProfile({
+          artifactId: artifactA,
+          profileId: 'guitar-hybrid-v2-rule',
+          difficultyPolicy: 'expert_only'
+        })
+      ).rejects.toThrow('cannot run deployed Auto Chart profiles')
+      await expect(registry()).rejects.toMatchObject({ code: 'ENOENT' })
+    }
+  )
+
+  it.each(typedChartCapabilities)(
+    'invalidates a saved default when runtime loses %s',
+    async (missing) => {
+      selectedFolder = await addBundle(
+        'runtime-capability-change',
+        candidate({
+          artifactId: artifactA,
+          manifestSha256: manifestA
+        })
+      )
+      await chooseCheckpointFolder()
+      await saveDiscoveredAutoChartProfile({
+        artifactId: artifactA,
+        profileId: 'guitar-hybrid-v2-rule',
+        difficultyPolicy: 'expert_only'
+      })
+      runtimeCapabilities = typedChartCapabilities.filter((capability) => capability !== missing)
+      await expect(
+        runDefaultAutoChartProfile({
+          runId: 'runtime-capability-loss',
+          outputDir: join(scratch, 'output'),
+          files: [],
+          folders: [],
+          stemFolders: [],
+          urls: []
+        })
+      ).resolves.toBeNull()
+      expect((await registry()).defaultProfileId).toBeUndefined()
+      expect(chartRunRequests).toHaveLength(0)
+    }
+  )
 
   it('clears artifact bindings from the previous folder selection', async () => {
     selectedFolder = await addBundle(
