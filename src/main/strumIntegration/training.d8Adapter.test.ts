@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events'
 import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 const scratch = mkdtempSync(join(tmpdir(), 'octave-strum-d8-adapter-'))
@@ -49,6 +49,9 @@ let holdWorkerClose = false
 let workerExitCode = 0
 let terminalOnStderr = false
 let spawnedWorker: EventEmitter | undefined
+let directTrainingBundle = false
+let directoryTaskOutput = false
+let escapedTaskManifest = false
 let trainingBundleRoot = ''
 let trainingBundleEscapesRun = false
 const originalStrumSourceDir = process.env.OCTAVE_STRUM_SOURCE_DIR
@@ -263,12 +266,23 @@ vi.mock('child_process', () => ({
       const isPromotion = args.includes('promotion')
       if (args.includes('dataset')) {
         mkdirSync(join(output, '..'), { recursive: true })
-        writeFileSync(output, '{}\n')
+        if (directoryTaskOutput) {
+          mkdirSync(output, { recursive: true })
+          if (escapedTaskManifest) {
+            const escaped = join(scratch, 'outside-task.json')
+            writeFileSync(escaped, '{}\n')
+            symlinkSync(escaped, join(output, 'task.json'))
+          } else {
+            writeFileSync(join(output, 'task.json'), '{}\n')
+            writeFileSync(join(output, 'pairs.jsonl'), '{"target_events":[1]}\n')
+          }
+        } else writeFileSync(output, '{}\n')
       } else if (isPromotion && output.endsWith('.json')) {
         mkdirSync(join(output, '..'), { recursive: true })
         writeFileSync(output, '{}\n')
       } else {
-        const bundleRoot = args.includes('train') ? join(output, 'bundle') : output
+        const bundleRoot =
+          args.includes('train') && !directTrainingBundle ? join(output, 'bundle') : output
         if (args.includes('train')) {
           trainingBundleRoot = bundleRoot
           mkdirSync(output, { recursive: true })
@@ -297,7 +311,7 @@ vi.mock('child_process', () => ({
             pipeline_id: pipeline.id,
             task_view_id: 'taskviewd8',
             record_count: 2,
-            output_name: 'task.json'
+            output_name: directoryTaskOutput ? 'task.json' : basename(output)
           }
         : isPromotion
           ? (promotionResultOverride ?? {
@@ -319,7 +333,7 @@ vi.mock('child_process', () => ({
           : {
               status: 'completed',
               pipeline_id: pipeline.id,
-              bundle_name: 'bundle',
+              bundle_name: directTrainingBundle ? basename(output) : 'bundle',
               manifest_sha256: manifestSha,
               components: [{ id: 'chart_transform', sha256: 'c'.repeat(64), byte_length: 42 }]
             }
@@ -373,11 +387,39 @@ import {
 } from './training'
 
 async function settled(): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 15))
+  const queuedIds = new Set(
+    sends.filter((event) => event.state === 'queued').map((event) => event.jobId)
+  )
+  await vi.waitFor(() => {
+    for (const jobId of queuedIds) {
+      expect(
+        sends.some(
+          (event) =>
+            event.jobId === jobId &&
+            ['succeeded', 'failed', 'cancelled'].includes(String(event.state))
+        )
+      ).toBe(true)
+    }
+  })
+  // Terminal delivery follows registration, but queues its own durable summary.
+  // Snapshot waits for those writes before tests inspect or replace registry files.
+  // The corrupt-registry test deliberately makes this read fail after draining.
+  await listTrainingArtifacts().catch(() => undefined)
 }
 
-afterEach(() => {
+async function workerStarted(jobId: string): Promise<void> {
+  await vi.waitFor(() => {
+    expect(sends.some((event) => event.jobId === jobId && event.state === 'running')).toBe(true)
+  })
+}
+
+afterEach(async () => {
+  // Never remove a fixture while a completed worker still owns queued writes.
+  await settled()
   vi.restoreAllMocks()
+  directTrainingBundle = false
+  directoryTaskOutput = false
+  escapedTaskManifest = false
   holdWorkerClose = false
   workerExitCode = 0
   terminalOnStderr = false
@@ -481,6 +523,7 @@ describe('STRUM d8 training adapter', () => {
   })
 
   it('preserves a corrupt registry instead of replacing training history', async () => {
+    await settled()
     mkdirSync(join(scratch, 'strum-training'), { recursive: true })
     const registryPath = join(scratch, 'strum-training', 'registry.json')
     writeFileSync(registryPath, '{incomplete history')
@@ -493,7 +536,7 @@ describe('STRUM d8 training adapter', () => {
   it('waits for exit before registering success and preserves the request until exit', async () => {
     holdWorkerClose = true
     const started = await prepareFixture()
-    await settled()
+    await workerStarted(started.jobId)
     expect(sends.some((event) => event.state === 'succeeded')).toBe(false)
     expect((await listTrainingArtifacts()).tasks).toHaveLength(0)
     const requestPath = join(scratch, `octave-training-${started.jobId}.json`)
@@ -525,7 +568,7 @@ describe('STRUM d8 training adapter', () => {
     holdWorkerClose = true
     const kill = vi.spyOn(process, 'kill').mockReturnValue(true)
     const started = await prepareFixture()
-    await settled()
+    await workerStarted(started.jobId)
     await expect(cancelTrainingJob(started.jobId)).resolves.toBe(true)
     expect(kill).toHaveBeenCalledWith(-123, 'SIGTERM')
     const requestPath = join(scratch, `octave-training-${started.jobId}.json`)
@@ -807,6 +850,107 @@ describe('STRUM d8 training adapter', () => {
       }
     })
     expect(JSON.stringify(sends)).not.toContain(parentRoot)
+  })
+
+  it.each([false, true])(
+    'trains from directory preparation with direct bundle=%s and rejects mutation',
+    async (direct) => {
+      directTrainingBundle = direct
+      directoryTaskOutput = true
+      const catalogRoot = join(scratch, 'directory-catalog')
+      mkdirSync(catalogRoot, { recursive: true })
+      const task = await startTrainingPrepare({
+        catalogRoot,
+        catalogId: 'directory',
+        catalogName: 'Directory task',
+        pipelineId: pipeline.id,
+        prepare: { instrument: 'guitar', target_difficulty: 'Hard' }
+      })
+      await settled()
+      const manifest = join(String(requests[0].output), 'task.json')
+      await startTrainingRun({
+        taskViewId: task.taskViewId,
+        pipelineId: pipeline.id,
+        train: { model_id: 'directory-model' }
+      })
+      await settled()
+      expect(requests[1].task_view).toBe(manifest)
+      expect((await listTrainingArtifacts()).runs).toHaveLength(1)
+      expect(await listPromotionJobs(artifactId)).toHaveLength(1)
+      await startPromotionJob({
+        candidateArtifactId: artifactId,
+        jobId: 'chart-transform.profile-evaluate/v1',
+        options: {}
+      })
+      await settled()
+      expect(requests[2].bundle_root).toBe(
+        direct ? requests[1].output : join(String(requests[1].output), 'bundle')
+      )
+      writeFileSync(manifest, '{"modified":true}\n')
+      await expect(
+        startTrainingRun({
+          taskViewId: task.taskViewId,
+          pipelineId: pipeline.id,
+          train: { model_id: 'changed-task' }
+        })
+      ).rejects.toThrow('Prepare a new task view')
+    }
+  )
+
+  it.each(['content', 'addition', 'removal', 'symlink'])(
+    'rejects prepared-directory sidecar %s changes before training',
+    async (mutation) => {
+      directoryTaskOutput = true
+      const catalogRoot = join(scratch, 'tree-catalog')
+      mkdirSync(catalogRoot, { recursive: true })
+      const task = await startTrainingPrepare({
+        catalogRoot,
+        catalogId: 'tree',
+        catalogName: 'Tree task',
+        pipelineId: pipeline.id,
+        prepare: { instrument: 'guitar', target_difficulty: 'Hard' }
+      })
+      await settled()
+      const output = String(requests[0].output)
+      const pairs = join(output, 'pairs.jsonl')
+      const manifestBefore = readFileSync(join(output, 'task.json'), 'utf8')
+      if (mutation === 'content') writeFileSync(pairs, '{"target_events":[2]}\n')
+      else if (mutation === 'addition') writeFileSync(join(output, 'extra.jsonl'), '{}\n')
+      else if (mutation === 'removal') rmSync(pairs)
+      else {
+        rmSync(pairs)
+        const outside = join(scratch, 'outside-pairs.jsonl')
+        writeFileSync(outside, '{"target_events":[1]}\n')
+        symlinkSync(outside, pairs)
+      }
+      expect(readFileSync(join(output, 'task.json'), 'utf8')).toBe(manifestBefore)
+      await expect(
+        startTrainingRun({
+          taskViewId: task.taskViewId,
+          pipelineId: pipeline.id,
+          train: { model_id: 'mutated-tree' }
+        })
+      ).rejects.toThrow('Prepare a new task view')
+      expect(requests).toHaveLength(1)
+      expect(JSON.stringify(await listTrainingArtifacts())).not.toContain(output)
+    }
+  )
+
+  it('rejects a prepared directory manifest symlink escaping its output', async () => {
+    directoryTaskOutput = true
+    escapedTaskManifest = true
+    const catalogRoot = join(scratch, 'escape-catalog')
+    mkdirSync(catalogRoot, { recursive: true })
+    await startTrainingPrepare({
+      catalogRoot,
+      catalogId: 'escape',
+      catalogName: 'Escaped task',
+      pipelineId: pipeline.id,
+      prepare: { instrument: 'guitar', target_difficulty: 'Hard' }
+    })
+    await settled()
+    expect((await listTrainingArtifacts()).tasks).toEqual([])
+    expect(sends.at(-1)).toMatchObject({ state: 'failed', code: 'result_unavailable' })
   })
 
   it('registers a nested raw training bundle and keeps candidate roots private', async () => {

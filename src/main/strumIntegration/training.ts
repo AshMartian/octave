@@ -1,10 +1,12 @@
 import { app, BrowserWindow, dialog } from 'electron'
 import { execFile, spawn, type ChildProcess } from 'child_process'
 import { createHash, randomUUID } from 'crypto'
-import { createReadStream, existsSync, type Dirent } from 'fs'
+import { constants, createReadStream, existsSync, type Dirent } from 'fs'
 import {
   lstat,
   mkdir,
+  open,
+  opendir,
   readFile,
   readdir,
   realpath,
@@ -13,7 +15,7 @@ import {
   unlink,
   writeFile
 } from 'fs/promises'
-import { isAbsolute, join, relative } from 'path'
+import { basename, dirname, isAbsolute, join, relative } from 'path'
 import type {
   StrumCheckpointCandidateInputContract,
   StrumCheckpointCandidateOutputContract,
@@ -292,8 +294,23 @@ type StoredPromotion = TrainingPromotionResult & {
   outputRoot: string
 }
 
+type PreparedTaskTree = {
+  root: string
+  entries: Array<
+    | { path: string; kind: 'directory' }
+    | { path: string; kind: 'file'; byteLength: number; sha256: string }
+  >
+}
+
 type TrainingRegistry = {
-  tasks: Array<TrainingTask & { taskRoot: string; catalogRoot: string }>
+  tasks: Array<
+    TrainingTask & {
+      taskRoot: string
+      catalogRoot: string
+      taskManifestSha256?: string
+      taskTree?: PreparedTaskTree
+    }
+  >
   runs: StoredTrainingRun[]
   promotions?: StoredPromotion[]
   profiles?: StoredAutoChartProfile[]
@@ -990,6 +1007,81 @@ function isContainedPath(root: string, candidate: string): boolean {
   )
 }
 
+// Prepared views may contain large paired-data files. Bound traversal and
+// streaming reads without imposing an audio/model-sized memory allocation.
+const MAX_PREPARED_TASK_ENTRIES = 10_000
+const MAX_PREPARED_TASK_BYTES = 64 * 1024 * 1024 * 1024
+
+async function fingerprintPreparedTaskFile(
+  path: string,
+  maximumBytes = MAX_PREPARED_TASK_BYTES
+): Promise<{ byteLength: number; sha256: string }> {
+  const handle = await open(
+    path,
+    constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)
+  )
+  try {
+    const before = await handle.stat()
+    if (!before.isFile() || !Number.isSafeInteger(before.size) || before.size > maximumBytes)
+      throw new Error('Prepared task file exceeds the supported artifact limits.')
+    const hash = createHash('sha256')
+    let byteLength = 0
+    for await (const chunk of handle.createReadStream({ autoClose: false })) {
+      byteLength += chunk.length
+      if (byteLength > before.size || byteLength > maximumBytes)
+        throw new Error('Prepared task file changed while verifying.')
+      hash.update(chunk)
+    }
+    const after = await handle.stat()
+    if (
+      byteLength !== before.size ||
+      after.size !== before.size ||
+      after.mtimeMs !== before.mtimeMs ||
+      after.ctimeMs !== before.ctimeMs
+    )
+      throw new Error('Prepared task file changed while verifying.')
+    return { byteLength, sha256: hash.digest('hex') }
+  } finally {
+    await handle.close()
+  }
+}
+
+async function fingerprintPreparedTaskTree(root: string): Promise<PreparedTaskTree> {
+  if ((await realpath(root)) !== root || !(await lstat(root)).isDirectory())
+    throw new Error('Prepared task directory changed.')
+  const entries: PreparedTaskTree['entries'] = []
+  const pending = [root]
+  let totalBytes = 0
+  while (pending.length) {
+    const directory = pending.pop()!
+    if ((await realpath(directory)) !== directory || !(await lstat(directory)).isDirectory())
+      throw new Error('Prepared task directory changed.')
+    for await (const entry of await opendir(directory)) {
+      if (entries.length >= MAX_PREPARED_TASK_ENTRIES)
+        throw new Error('Prepared task contains too many entries.')
+      const path = join(directory, entry.name)
+      const info = await lstat(path)
+      if (info.isSymbolicLink() || (await realpath(path)) !== path || !isContainedPath(root, path))
+        throw new Error('Prepared task contains an unsafe entry.')
+      const relativePath = relative(root, path)
+      if (info.isDirectory()) {
+        entries.push({ path: relativePath, kind: 'directory' })
+        pending.push(path)
+      } else if (info.isFile()) {
+        const fingerprint = await fingerprintPreparedTaskFile(
+          path,
+          MAX_PREPARED_TASK_BYTES - totalBytes
+        )
+        totalBytes += fingerprint.byteLength
+        if ((await realpath(path)) !== path) throw new Error('Prepared task file changed.')
+        entries.push({ path: relativePath, kind: 'file', ...fingerprint })
+      } else throw new Error('Prepared task contains a non-regular entry.')
+    }
+  }
+  entries.sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0))
+  return { root, entries }
+}
+
 /**
  * Revalidate a registered bundle before any worker call. Both the run and its
  * bundle are canonicalized again so a later symlink replacement cannot escape
@@ -1007,7 +1099,10 @@ async function resolveContainedTrainingBundleRoot(
   if (!isContainedPath(resolvedRunsRoot, resolvedOutputRoot)) {
     throw new Error('The training run is outside OCTAVE storage.')
   }
-  if (!isContainedPath(resolvedOutputRoot, resolvedBundleRoot)) {
+  if (
+    resolvedBundleRoot !== resolvedOutputRoot &&
+    !isContainedPath(resolvedOutputRoot, resolvedBundleRoot)
+  ) {
     throw new Error('STRUM returned a bundle outside the training run.')
   }
   if (!(await stat(resolvedBundleRoot)).isDirectory()) {
@@ -1018,7 +1113,10 @@ async function resolveContainedTrainingBundleRoot(
 
 /** Resolve STRUM's terminal single-token bundle identity inside a private run. */
 async function resolveTrainingBundleRoot(outputRoot: string, bundleName: string): Promise<string> {
-  return await resolveContainedTrainingBundleRoot(outputRoot, join(outputRoot, bundleName))
+  return await resolveContainedTrainingBundleRoot(
+    outputRoot,
+    bundleName === basename(outputRoot) ? outputRoot : join(outputRoot, bundleName)
+  )
 }
 
 async function resolveLegacyTrainingRunRoot(outputRoot: string): Promise<string> {
@@ -1846,7 +1944,10 @@ async function resolvePromotionRequest(
   // STRUM's experiment directory owns experiment.json and its nested bundle.
   // Package handlers consume that directory, while evaluators consume the bundle.
   const experimentRoot = await resolveLegacyTrainingRunRoot(run.outputRoot)
-  if (!isContainedPath(experimentRoot, binding.bundleRoot)) {
+  if (
+    binding.bundleRoot !== experimentRoot &&
+    !isContainedPath(experimentRoot, binding.bundleRoot)
+  ) {
     throw new Error('The candidate is outside its registered training experiment.')
   }
   const values: Record<string, string | undefined> = {
@@ -3382,8 +3483,8 @@ export async function startTrainingPrepare(options: {
   const prepare = sanitizeTrainingSchemaValues(pipeline.prepare_schema, options.prepare, 'prepare')
   const jobId = randomUUID()
   const taskViewId = `task-${randomUUID()}`
-  // Worker d8 writes one task-view manifest at its declared output location.
-  // Keep that location private; the renderer only receives OCTAVE's opaque ID.
+  // Some pipelines write one manifest; others write a directory containing
+  // a manifest plus paired data. Resolve STRUM's declared output after exit.
   const taskRoot = join(trainingRoot(), 'tasks', `${taskViewId}.json`)
   await mkdir(join(trainingRoot(), 'tasks'), { recursive: true })
   await startJsonEventJob(
@@ -3409,7 +3510,21 @@ export async function startTrainingPrepare(options: {
       ) {
         throw new Error('STRUM returned an invalid prepared task result.')
       }
-      const task: TrainingTask & { taskRoot: string; catalogRoot: string } = {
+      const ownedTasksRoot = await realpath(join(trainingRoot(), 'tasks'))
+      const producedRoot = await realpath(taskRoot)
+      if (!isContainedPath(ownedTasksRoot, producedRoot))
+        throw new Error('Task output escaped OCTAVE storage.')
+      const outputInfo = await stat(producedRoot)
+      const manifestPath = outputInfo.isDirectory()
+        ? await realpath(join(producedRoot, result.output_name))
+        : producedRoot
+      if (
+        (!outputInfo.isDirectory() && basename(producedRoot) !== result.output_name) ||
+        (outputInfo.isDirectory() && !isContainedPath(producedRoot, manifestPath)) ||
+        !(await stat(manifestPath)).isFile()
+      )
+        throw new Error('STRUM returned an invalid task manifest location.')
+      const task: TrainingRegistry['tasks'][number] = {
         taskViewId,
         catalogId: options.catalogId,
         catalogName: options.catalogName,
@@ -3419,7 +3534,11 @@ export async function startTrainingPrepare(options: {
         // historical public field name for the existing renderer.
         contentHash: workerTaskViewId,
         createdAt: new Date().toISOString(),
-        taskRoot,
+        taskRoot: manifestPath,
+        taskManifestSha256: (await fingerprintPreparedTaskFile(manifestPath)).sha256,
+        ...(outputInfo.isDirectory()
+          ? { taskTree: await fingerprintPreparedTaskTree(producedRoot) }
+          : {}),
         catalogRoot: options.catalogRoot
       }
       await updateRegistry((registry) => {
@@ -3448,6 +3567,29 @@ export async function startTrainingRun(options: {
       existsSync(entry.catalogRoot)
   )
   if (!task) throw new Error('Select a prepared task view before training.')
+  try {
+    const ownedTasksRoot = await realpath(join(trainingRoot(), 'tasks'))
+    if (
+      (await realpath(task.taskRoot)) !== task.taskRoot ||
+      !isContainedPath(ownedTasksRoot, task.taskRoot) ||
+      !task.taskManifestSha256 ||
+      (await fingerprintPreparedTaskFile(task.taskRoot)).sha256 !== task.taskManifestSha256 ||
+      (dirname(task.taskRoot) !== ownedTasksRoot && !task.taskTree)
+    )
+      throw new Error('Prepared task identity changed.')
+    if (
+      task.taskTree &&
+      (!isContainedPath(ownedTasksRoot, task.taskTree.root) ||
+        !isContainedPath(task.taskTree.root, task.taskRoot) ||
+        JSON.stringify(await fingerprintPreparedTaskTree(task.taskTree.root)) !==
+          JSON.stringify(task.taskTree))
+    )
+      throw new Error('Prepared task directory changed.')
+  } catch {
+    throw new Error(
+      'The prepared task changed or predates manifest verification. Prepare a new task view.'
+    )
+  }
   if (task.pipelineId !== options.pipelineId) {
     throw new Error('The selected task view belongs to a different training pipeline.')
   }

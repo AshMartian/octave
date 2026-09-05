@@ -29,6 +29,8 @@ The release installer does not yet ship a verified training runtime. Managed rel
 
 Catalog updates do not rewrite already prepared snapshots. Audio enrichment creates a reviewed revision. Harmony materialization requires explicit isolated assets and declared track bindings; shared vocals or a mix are not an isolated Harmony source.
 
+OCTAVE verifies the prepared manifest and any accompanying directory files before each training run. If prepared content changed, or a task predates verification, prepare a new task view from the approved catalog. Both single-file tasks and directory tasks with paired data are supported.
+
 ## Capability limits
 
 | Pipeline                                          | Training and promotion boundary                                                                                                                                                         |

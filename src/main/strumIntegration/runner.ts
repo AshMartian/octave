@@ -54,10 +54,7 @@ function resolveBundledFfmpegDir(): string | null {
     // unpacked path at runtime, so dirname() is enough.
     let resolved = ffmpegPath
     if (resolved.includes(`app.asar${sep}`)) {
-      resolved = resolved.replace(
-        `app.asar${sep}`,
-        `app.asar.unpacked${sep}`
-      )
+      resolved = resolved.replace(`app.asar${sep}`, `app.asar.unpacked${sep}`)
     }
     if (!existsSync(resolved)) return null
     return dirname(resolved)
