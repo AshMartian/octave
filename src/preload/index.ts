@@ -173,18 +173,16 @@ const api = {
   chooseDatasetCatalogParent: (): Promise<{
     parentId: string
     name: string
-    path: string
   } | null> => ipcRenderer.invoke('dataset:chooseCatalogParent'),
 
   useDefaultDatasetCatalogParent: (): Promise<{
     parentId: string
     name: string
-    path: string
   } | null> => ipcRenderer.invoke('dataset:useDefaultCatalogParent'),
 
   restoreDatasetCatalogParent: (
     parentId: string
-  ): Promise<{ parentId: string; name: string; path: string } | null> =>
+  ): Promise<{ parentId: string; name: string } | null> =>
     ipcRenderer.invoke('dataset:restoreCatalogParent', parentId),
 
   listDatasetCatalogs: (

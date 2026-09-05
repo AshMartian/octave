@@ -251,18 +251,16 @@ async function rememberDatasetCatalogParent(
 ): Promise<{
   parentId: string
   name: string
-  path: string
 }> {
   const bookmark = { parentId: randomUUID(), name, path: parentPath }
   datasetCatalogParents.set(bookmark.parentId, bookmark.path)
   await writeFile(datasetCatalogParentBookmarkPath(), JSON.stringify(bookmark), 'utf8')
-  return { parentId: bookmark.parentId, name: bookmark.name, path: bookmark.path }
+  return { parentId: bookmark.parentId, name: bookmark.name }
 }
 
 async function restoreDatasetCatalogParent(parentId: string): Promise<{
   parentId: string
   name: string
-  path: string
 } | null> {
   try {
     const bookmark = JSON.parse(
@@ -271,7 +269,7 @@ async function restoreDatasetCatalogParent(parentId: string): Promise<{
     if (bookmark.parentId !== parentId) return null
     if (!(await stat(bookmark.path)).isDirectory()) return null
     datasetCatalogParents.set(bookmark.parentId, bookmark.path)
-    return { parentId: bookmark.parentId, name: bookmark.name, path: bookmark.path }
+    return { parentId: bookmark.parentId, name: bookmark.name }
   } catch {
     return null
   }
@@ -2589,86 +2587,89 @@ ipcMain.handle('video:download-url', async (event, songPath: string, url: string
   // still rejected, force a refresh and retry once with the newer build.
   await ensureFreshYtDlp(pythonCmd)
 
-  const attemptDownload = (): Promise<{ success: boolean; filePath?: string; error?: string }> => new Promise((resolvePromise) => {
-    console.log('[yt-dlp] Starting download:', url)
-    const proc = execFile(
-      pythonCmd.command,
-      args,
-      { maxBuffer: 10 * 1024 * 1024 },
-      (error, stdout, stderr) => {
-        if (error) {
-          console.error('[yt-dlp] Error:', error.message)
-          console.error('[yt-dlp] stderr:', stderr)
-          resolvePromise({ success: false, error: error.message })
-          return
-        }
-        console.log('[yt-dlp] Done:', stdout.slice(-200))
-        // Locate the downloaded file, then (on Linux) transcode it to VP8/webm so
-        // YARG can actually decode it.
-        const finalize = async (downloadedPath: string): Promise<void> => {
-          if (!isLinux) {
-            resolvePromise({ success: true, filePath: downloadedPath })
+  const attemptDownload = (): Promise<{ success: boolean; filePath?: string; error?: string }> =>
+    new Promise((resolvePromise) => {
+      console.log('[yt-dlp] Starting download:', url)
+      const proc = execFile(
+        pythonCmd.command,
+        args,
+        { maxBuffer: 10 * 1024 * 1024 },
+        (error, stdout, stderr) => {
+          if (error) {
+            console.error('[yt-dlp] Error:', error.message)
+            console.error('[yt-dlp] stderr:', stderr)
+            resolvePromise({ success: false, error: error.message })
             return
           }
-          try {
-            event.sender.send('video:download-progress', 99)
-            const webmPath = await transcodeVideoToVp8Webm(downloadedPath, songPath)
-            resolvePromise({ success: true, filePath: webmPath })
-          } catch (err) {
-            console.error('[yt-dlp] Linux VP8 transcode failed:', err)
-            resolvePromise({
-              success: false,
-              error: `Video downloaded but could not be converted for Linux playback: ${err instanceof Error ? err.message : String(err)}`
-            })
+          console.log('[yt-dlp] Done:', stdout.slice(-200))
+          // Locate the downloaded file, then (on Linux) transcode it to VP8/webm so
+          // YARG can actually decode it.
+          const finalize = async (downloadedPath: string): Promise<void> => {
+            if (!isLinux) {
+              resolvePromise({ success: true, filePath: downloadedPath })
+              return
+            }
+            try {
+              event.sender.send('video:download-progress', 99)
+              const webmPath = await transcodeVideoToVp8Webm(downloadedPath, songPath)
+              resolvePromise({ success: true, filePath: webmPath })
+            } catch (err) {
+              console.error('[yt-dlp] Linux VP8 transcode failed:', err)
+              resolvePromise({
+                success: false,
+                error: `Video downloaded but could not be converted for Linux playback: ${err instanceof Error ? err.message : String(err)}`
+              })
+            }
+          }
+          // Find the output file (video.mp4 or similar)
+          const expectedPath = join(songPath, 'video.mp4')
+          if (existsSync(expectedPath)) {
+            void finalize(expectedPath)
+          } else {
+            // Look for any video.* file
+            readdir(songPath)
+              .then((entries) => {
+                const videoFile = entries.find(
+                  (e) => e.startsWith('video.') && !e.endsWith('.part')
+                )
+                if (videoFile) {
+                  void finalize(join(songPath, videoFile))
+                } else {
+                  resolvePromise({
+                    success: false,
+                    error: 'Download completed but output file not found'
+                  })
+                }
+              })
+              .catch(() =>
+                resolvePromise({ success: false, error: 'Could not read output directory' })
+              )
           }
         }
-        // Find the output file (video.mp4 or similar)
-        const expectedPath = join(songPath, 'video.mp4')
-        if (existsSync(expectedPath)) {
-          void finalize(expectedPath)
-        } else {
-          // Look for any video.* file
-          readdir(songPath)
-            .then((entries) => {
-              const videoFile = entries.find((e) => e.startsWith('video.') && !e.endsWith('.part'))
-              if (videoFile) {
-                void finalize(join(songPath, videoFile))
-              } else {
-                resolvePromise({
-                  success: false,
-                  error: 'Download completed but output file not found'
-                })
-              }
-            })
-            .catch(() =>
-              resolvePromise({ success: false, error: 'Could not read output directory' })
-            )
-        }
-      }
-    )
+      )
 
-    // Forward progress to renderer
-    if (proc.stderr) {
-      proc.stderr.on('data', (data: Buffer) => {
-        const line = data.toString()
-        const match = line.match(/(\d+\.?\d*)%/)
-        if (match) {
-          const percent = parseFloat(match[1])
-          event.sender.send('video:download-progress', percent)
-        }
-      })
-    }
-    if (proc.stdout) {
-      proc.stdout.on('data', (data: Buffer) => {
-        const line = data.toString()
-        const match = line.match(/(\d+\.?\d*)%/)
-        if (match) {
-          const percent = parseFloat(match[1])
-          event.sender.send('video:download-progress', percent)
-        }
-      })
-    }
-  })
+      // Forward progress to renderer
+      if (proc.stderr) {
+        proc.stderr.on('data', (data: Buffer) => {
+          const line = data.toString()
+          const match = line.match(/(\d+\.?\d*)%/)
+          if (match) {
+            const percent = parseFloat(match[1])
+            event.sender.send('video:download-progress', percent)
+          }
+        })
+      }
+      if (proc.stdout) {
+        proc.stdout.on('data', (data: Buffer) => {
+          const line = data.toString()
+          const match = line.match(/(\d+\.?\d*)%/)
+          if (match) {
+            const percent = parseFloat(match[1])
+            event.sender.send('video:download-progress', percent)
+          }
+        })
+      }
+    })
 
   let result = await attemptDownload()
   if (!result.success && result.error && isYtDlpBlockedError(result.error)) {
@@ -2681,8 +2682,9 @@ ipcMain.handle('video:download-url', async (event, songPath: string, url: string
       const versionNote = refresh.version ? ` (yt-dlp ${refresh.version})` : ''
       result = {
         ...result,
-        error: `${result.error}\n\nyt-dlp is already the newest available build${versionNote}. `
-          + 'YouTube may have changed something upstream has not fixed yet — try again later.'
+        error:
+          `${result.error}\n\nyt-dlp is already the newest available build${versionNote}. ` +
+          'YouTube may have changed something upstream has not fixed yet — try again later.'
       }
     }
   }

@@ -531,7 +531,6 @@ export function TrainingModal({
   const [catalogParent, setCatalogParent] = useState<{
     parentId: string
     name: string
-    path: string
   } | null>(null)
   const [existingCatalogs, setExistingCatalogs] = useState<ExistingCatalog[]>([])
   const [selectedCatalog, setSelectedCatalog] = useState<ExistingCatalog | null>(null)
@@ -689,7 +688,7 @@ export function TrainingModal({
   }, [isOpen, refreshLibrary])
 
   useEffect(() => {
-    if (!isOpen || catalogParent?.path) return
+    if (!isOpen || catalogParent?.parentId) return
     const storedParentId = localStorage.getItem(CATALOG_PARENT_STORAGE_KEY)
     const restore = storedParentId
       ? window.api.restoreDatasetCatalogParent(storedParentId)
@@ -1766,7 +1765,7 @@ export function TrainingModal({
                   Catalog parent
                   <div className="dataset-output">
                     <input
-                      value={catalogParent?.path ?? catalogParent?.name ?? ''}
+                      value={catalogParent?.name ?? ''}
                       readOnly
                       placeholder="Preparing Catalog Parent"
                     />

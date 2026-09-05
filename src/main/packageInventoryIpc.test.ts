@@ -135,6 +135,18 @@ afterAll(async () => {
 })
 
 describe('dataset package inventory IPC lifecycle', () => {
+  it('keeps catalog parent locations private when selecting and restoring bookmarks', async () => {
+    const selected = (await handlers.get('dataset:chooseCatalogParent')?.({})) as {
+      parentId: string
+      name: string
+    }
+    expect(Object.keys(selected).sort()).toEqual(['name', 'parentId'])
+    expect(JSON.stringify(selected)).not.toContain(scratch)
+    const restored = await handlers.get('dataset:restoreCatalogParent')?.({}, selected.parentId)
+    expect(restored).toEqual(selected)
+    expect(JSON.stringify(restored)).not.toContain(scratch)
+  })
+
   it('maps private reviewed entries to opaque safe candidates only after completion', async () => {
     const choose = handlers.get('dataset:choosePackageFolder')
     const inspect = handlers.get('dataset:inspectPackageGroup')

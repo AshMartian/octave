@@ -116,15 +116,14 @@ interface ChartEditorAPI {
       total: number
     }) => void
   ) => () => void
-  chooseDatasetCatalogParent: () => Promise<{ parentId: string; name: string; path: string } | null>
+  chooseDatasetCatalogParent: () => Promise<{ parentId: string; name: string } | null>
   useDefaultDatasetCatalogParent: () => Promise<{
     parentId: string
     name: string
-    path: string
   } | null>
   restoreDatasetCatalogParent: (
     parentId: string
-  ) => Promise<{ parentId: string; name: string; path: string } | null>
+  ) => Promise<{ parentId: string; name: string } | null>
   listDatasetCatalogs: (parentId: string) => Promise<
     Array<{
       catalogName: string
@@ -595,9 +594,7 @@ interface ChartEditorAPI {
       }
     }) => void
   ) => () => void
-  onAutoChartError: (
-    callback: (event: { runId: string; message: string }) => void
-  ) => () => void
+  onAutoChartError: (callback: (event: { runId: string; message: string }) => void) => () => void
 
   // Bootstrapped Python runtime (managed in userData on packaged builds)
   getRuntimeStatus: () => Promise<{
