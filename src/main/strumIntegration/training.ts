@@ -307,6 +307,7 @@ type RunningTrainingJob = {
   sequence: number
   cancelling: boolean
   cancellationTimer?: NodeJS.Timeout
+  exited?: boolean
   runId?: string
 }
 
@@ -314,6 +315,7 @@ type RunningProfiledAutoChart = {
   process?: ChildProcess
   requestPaths: string[]
   cancelling: boolean
+  cancellationTimer?: NodeJS.Timeout
 }
 
 const trainingSessionId = randomUUID()
@@ -2863,8 +2865,16 @@ async function runProfiledWorkerJsonCommand(
       cancelling: running?.cancelling === true
     })
     let stdout = ''
+    let failed = false
+    let closed = false
     child.stdout?.on('data', (chunk: Buffer) => {
+      if (failed) return
       stdout += chunk.toString('utf8')
+      if (stdout.length > 1_048_576) {
+        failed = true
+        stdout = ''
+        signalTrainingProcessTree(child, true)
+      }
     })
     child.stderr?.on('data', () => {
       // Worker stderr may contain private host details; never forward it.
@@ -2883,19 +2893,23 @@ async function runProfiledWorkerJsonCommand(
       }
     }
     child.once('error', () => {
-      void clean().then(() =>
-        reject(new Error('The validated STRUM profile could not be started.'))
-      )
+      failed = true
+      // Node emits close after errors. Do not clean request files before exit.
     })
     child.once('close', (exitCode: number | null) => {
-      const wasCancelled = runningProfiledAutoCharts.get(runId)?.cancelling === true
+      if (closed) return
+      closed = true
+      const tracked = runningProfiledAutoCharts.get(runId)
+      const wasCancelled = tracked?.cancelling === true
+      if (tracked?.cancellationTimer) clearTimeout(tracked.cancellationTimer)
+      if (wasCancelled) signalTrainingProcessTree(child, true)
       void clean().then(() => {
         if (wasCancelled) {
           reject(new Error('The validated STRUM profile chart run was cancelled.'))
           return
         }
         const lines = stdout.split(/\r?\n/).filter((line) => line.trim())
-        if (exitCode !== 0 || lines.length !== 1) {
+        if (failed || exitCode !== 0 || lines.length !== 1) {
           reject(new Error('The validated STRUM profile could not complete this chart run.'))
           return
         }
@@ -2951,7 +2965,7 @@ async function runResolvedAutoChartProfile(
         instruments: profile.instruments,
         device
       }),
-      'utf8'
+      { encoding: 'utf8', mode: 0o600, flag: 'wx' }
     )
     broadcastAutoChartProgress({
       runId: options.runId,
@@ -2977,7 +2991,7 @@ async function runResolvedAutoChartProfile(
         audio_path: audioPath,
         output_dir: options.outputDir
       }),
-      'utf8'
+      { encoding: 'utf8', mode: 0o600, flag: 'wx' }
     )
     broadcastAutoChartProgress({
       runId: options.runId,
@@ -3028,17 +3042,21 @@ export async function runDefaultAutoChartProfile(
 export async function cancelDefaultAutoChartProfile(runId: string): Promise<boolean> {
   const job = runningProfiledAutoCharts.get(runId)
   if (!job) return false
+  if (job.cancelling) return true
   job.cancelling = true
-  const materializationCancelled = await cancelProfileUrlMaterialization(runId)
+  // Signal first: URL cancellation can itself wait for a child to finish.
   if (job.process) {
-    try {
-      if (process.platform !== 'win32' && job.process.pid) process.kill(-job.process.pid, 'SIGTERM')
-      else job.process.kill('SIGTERM')
-    } catch {
-      return materializationCancelled
-    }
+    const child = job.process
+    signalTrainingProcessTree(child, false)
+    job.cancellationTimer = setTimeout(() => {
+      if (runningProfiledAutoCharts.get(runId)?.process === child) {
+        signalTrainingProcessTree(child, true)
+      }
+    }, 5_000)
+    job.cancellationTimer.unref()
   }
-  await Promise.all(job.requestPaths.map(async (path) => await unlink(path).catch(() => undefined)))
+  await cancelProfileUrlMaterialization(runId)
+  // The process close handler and outer run finalizer own request cleanup.
   return true
 }
 
@@ -3247,6 +3265,7 @@ async function startJsonEventJob(
     // Node emits close after error, including spawn failures. Cleanup waits for it.
   })
   child.once('close', (code: number | null) => {
+    job.exited = true
     if (remainder.trim()) consumeLine(remainder)
     void finish(code).finally(() => runningJobs.delete(jobId))
   })
@@ -3431,7 +3450,7 @@ export async function startTrainingRun(options: {
 
 export async function cancelTrainingJob(jobId: string): Promise<boolean> {
   const job = runningJobs.get(jobId)
-  if (!job) return false
+  if (!job || job.exited) return false
   if (job.cancelling) return true
   job.cancelling = true
   job.sequence += 1
@@ -3451,6 +3470,10 @@ export async function cancelTrainingJob(jobId: string): Promise<boolean> {
 }
 
 export function killAllTrainingJobs(): void {
+  for (const [runId, job] of runningProfiledAutoCharts) {
+    void cancelDefaultAutoChartProfile(runId)
+    if (job.process) signalTrainingProcessTree(job.process, true)
+  }
   for (const [jobId, job] of runningJobs) {
     void cancelTrainingJob(jobId)
     // App shutdown cannot rely on an unref'ed grace timer firing later.

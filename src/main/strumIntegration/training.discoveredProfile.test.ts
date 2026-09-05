@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'node:fs'
+import { existsSync, mkdtempSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
@@ -68,6 +68,8 @@ const materializedUrls: string[] = []
 const materializedAudioPath = join(scratch, 'materialized-url.wav')
 let preflightManifestOverride: string | null = null
 let holdPreflight = false
+let heldPreflightChild: EventEmitter | undefined
+let heldPreflightRequest = ''
 
 function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex')
@@ -183,7 +185,12 @@ vi.mock('child_process', () => ({
     }
     const requestPath = args[args.indexOf('--request') + 1]
     if (args.includes('chart') && args.includes('preflight')) {
-      if (holdPreflight) return child
+      if (holdPreflight) {
+        child.pid = 9876
+        heldPreflightChild = child
+        heldPreflightRequest = requestPath
+        return child
+      }
       void readFile(requestPath, 'utf8').then((text) => {
         const request = JSON.parse(text) as Record<string, unknown>
         preflightRequests.push(request)
@@ -269,6 +276,9 @@ async function registry(): Promise<Record<string, unknown>> {
 }
 
 beforeEach(async () => {
+  vi.restoreAllMocks()
+  heldPreflightChild = undefined
+  heldPreflightRequest = ''
   await rm(scratch, { recursive: true, force: true })
   await mkdir(scratch, { recursive: true })
   inspections.clear()
@@ -578,10 +588,16 @@ describe('discovered STRUM profile boundaries', () => {
       stemFolders: [],
       urls: []
     })
-    await new Promise((resolve) => setTimeout(resolve, 0))
-
+    await vi.waitFor(() => expect(heldPreflightChild).toBeDefined())
+    const kill = vi.spyOn(process, 'kill').mockReturnValue(true)
     await expect(cancelDefaultAutoChartProfile('cancel-preflight-run')).resolves.toBe(true)
-    await expect(run).rejects.toThrow(/cancelled/)
+    expect(kill).toHaveBeenCalledWith(-9876, 'SIGTERM')
+    expect(existsSync(heldPreflightRequest)).toBe(true)
+    const rejected = expect(run).rejects.toThrow(/cancelled/)
+    heldPreflightChild?.emit('close', null)
+    await rejected
+    expect(kill).toHaveBeenCalledWith(-9876, 'SIGKILL')
+    expect(existsSync(heldPreflightRequest)).toBe(false)
     expect(chartRunRequests).toEqual([])
   })
 

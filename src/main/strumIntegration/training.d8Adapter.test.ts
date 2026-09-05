@@ -495,6 +495,7 @@ describe('STRUM d8 training adapter', () => {
     const requestPath = join(scratch, `octave-training-${started.jobId}.json`)
     expect(existsSync(requestPath)).toBe(true)
     spawnedWorker?.emit('close', 0)
+    await expect(cancelTrainingJob(started.jobId)).resolves.toBe(false)
     await settled()
     expect((await listTrainingArtifacts()).tasks).toHaveLength(1)
     expect(existsSync(requestPath)).toBe(false)
