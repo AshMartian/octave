@@ -52,3 +52,5 @@ Reviewed path-free reports are committed for reproducibility:
 - [Electron lifecycle and deployment](evidence/2026-09-05-ui.json): 10 passed stages, including cancellation, explicit failed evaluation, positive MIDI generation, and restart persistence.
 
 Both worker reports attest the exact clean STRUM source revision and declare `quality_claim: false`; the UI report also declares no quality claim. Private catalogs, checkpoints, requests, diagnostics and screenshots are excluded from this evidence directory. The accompanying source verification was 273 OCTAVE tests and 382 STRUM tests; broader model-quality and platform-release acceptance remains separate.
+
+See the [visual walkthrough, ownership diagrams, and charter scaling roadmap](../../plans/strum-charter-workflow.md) for reviewed UI screenshots and the distinction between current fine-tuning and planned correction feedback.
