@@ -550,6 +550,7 @@ export function TrainingModal({
   const [trainingJob, setTrainingJob] = useState<TrainingJob | null>(null)
   const [prepareConfig, setPrepareConfig] = useState<Record<string, TrainingControlValue>>({})
   const [trainConfig, setTrainConfig] = useState<Record<string, TrainingControlValue>>({})
+  const [parentArtifactId, setParentArtifactId] = useState('')
   const [promotionArtifactId, setPromotionArtifactId] = useState('')
   const [promotionJobs, setPromotionJobs] = useState<StrumPromotionJobDescriptor[]>([])
   const [promotionConfigs, setPromotionConfigs] = useState<
@@ -710,6 +711,7 @@ export function TrainingModal({
     setSelectedPipelineId((current) =>
       pipelines.some((pipeline) => pipeline.id === current) ? current : (pipelines[0]?.id ?? '')
     )
+    setTrainingJob((current) => current ?? artifacts.jobs.at(-1) ?? null)
     setTrainingTasks(artifacts.tasks)
     setTrainingRuns(artifacts.runs)
     setTrainingProfiles(artifacts.profiles)
@@ -1222,7 +1224,12 @@ export function TrainingModal({
       const started = await window.api.startTrainingRun({
         taskViewId: selectedTaskViewId,
         pipelineId: selectedPipelineId,
-        train: resolvedTrainConfig
+        train: {
+          ...resolvedTrainConfig,
+          ...(resolvedTrainConfig.checkpoint_mode === 'fine_tune'
+            ? { parent_artifact_id: parentArtifactId }
+            : {})
+        }
       })
       setTrainingJob({
         jobId: started.jobId,
@@ -1859,7 +1866,9 @@ export function TrainingModal({
                     </select>
                   </label>
                   <TrainingSchemaControls
-                    controls={trainControls}
+                    controls={trainControls.filter(
+                      (control) => control.key !== 'parent_artifact_id'
+                    )}
                     setValues={setTrainConfig}
                     values={resolvedTrainConfig}
                   />
@@ -1878,17 +1887,40 @@ export function TrainingModal({
                       </p>
                     </aside>
                   )}
+                  {resolvedTrainConfig.checkpoint_mode === 'fine_tune' && (
+                    <label className="training-control">
+                      Parent candidate
+                      <select
+                        value={parentArtifactId}
+                        onChange={(event) => setParentArtifactId(event.target.value)}
+                      >
+                        <option value="">Select a completed run</option>
+                        {trainingRuns
+                          .filter((run) => run.pipelineId === selectedPipelineId && run.artifactId)
+                          .map((run) => (
+                            <option key={run.runId} value={run.artifactId}>
+                              {run.runId}
+                            </option>
+                          ))}
+                      </select>
+                      <small>
+                        STRUM verifies parent compatibility before training. Fine-tuning starts a
+                        new run.
+                      </small>
+                    </label>
+                  )}
                   <p className="training-inline-note">
-                    OCTAVE submits only values declared by this STRUM pipeline. Any resume or
-                    fine-tune option remains unavailable until STRUM advertises compatible parents.
+                    OCTAVE submits the selected task and STRUM-declared options. Completed
+                    candidates remain available for evaluation and fine-tuning where supported.
                   </p>
                   <button
                     className="dataset-primary"
                     onClick={() => void startTraining()}
                     disabled={Boolean(
                       enablingTrainingRuntime ||
-                      trainingJob &&
-                      !['succeeded', 'failed', 'cancelled'].includes(trainingJob.state ?? '')
+                      (resolvedTrainConfig.checkpoint_mode === 'fine_tune' && !parentArtifactId) ||
+                      (trainingJob &&
+                        !['succeeded', 'failed', 'cancelled'].includes(trainingJob.state ?? ''))
                     )}
                   >
                     Start local {selectedPipelineName} run <span aria-hidden="true">⚡</span>
@@ -1976,7 +2008,9 @@ export function TrainingModal({
                           <button
                             className="dataset-secondary"
                             disabled={
-                              enablingTrainingRuntime || Boolean(running) || job.status !== 'available'
+                              enablingTrainingRuntime ||
+                              Boolean(running) ||
+                              job.status !== 'available'
                             }
                             onClick={() => void startPromotion(job)}
                           >

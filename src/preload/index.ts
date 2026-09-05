@@ -244,6 +244,15 @@ const api = {
   > => ipcRenderer.invoke('training:pipelines'),
 
   listTrainingArtifacts: (): Promise<{
+    jobs: Array<{
+      jobId: string
+      sequence: number
+      stage: string
+      progress?: number
+      state?: 'queued' | 'running' | 'cancelling' | 'cancelled' | 'succeeded' | 'failed'
+      message: string
+      code?: string
+    }>
     tasks: Array<{
       taskViewId: string
       catalogId: string

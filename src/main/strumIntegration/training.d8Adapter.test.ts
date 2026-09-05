@@ -45,6 +45,10 @@ let probePayload: Record<string, unknown> = {
     'post_train_job_start'
   ]
 }
+let holdWorkerClose = false
+let workerExitCode = 0
+let terminalOnStderr = false
+let spawnedWorker: EventEmitter | undefined
 let trainingBundleRoot = ''
 let trainingBundleEscapesRun = false
 const originalStrumSourceDir = process.env.OCTAVE_STRUM_SOURCE_DIR
@@ -71,7 +75,12 @@ const pipeline = {
   },
   train_schema: {
     type: 'object',
-    properties: { model_id: { type: 'string' }, epochs: { type: 'integer', default: 3 } },
+    properties: {
+      model_id: { type: 'string' },
+      epochs: { type: 'integer', default: 3 },
+      checkpoint_mode: { type: 'string', enum: ['fresh', 'fine_tune'] },
+      parent_artifact_id: { type: 'string' }
+    },
     required: ['model_id']
   },
   checkpoint_outputs: ['chart_transform'],
@@ -241,6 +250,7 @@ vi.mock('child_process', () => ({
       pid: number
       kill: () => boolean
     }
+    spawnedWorker = child
     child.stdout = new EventEmitter()
     child.stderr = new EventEmitter()
     child.pid = 123
@@ -309,7 +319,7 @@ vi.mock('child_process', () => ({
               manifest_sha256: manifestSha,
               components: [{ id: 'chart_transform', sha256: 'c'.repeat(64), byte_length: 42 }]
             }
-      child.stdout.emit(
+      ;(terminalOnStderr ? child.stderr : child.stdout).emit(
         'data',
         Buffer.from(
           `${JSON.stringify({
@@ -336,13 +346,14 @@ vi.mock('child_process', () => ({
           )
         )
       }
-      child.emit('close', 0)
+      if (!holdWorkerClose) child.emit('close', workerExitCode)
     })
     return child
   }
 }))
 
 import {
+  cancelTrainingJob,
   inspectTrainingCatalog,
   inspectTrainingCheckpoint,
   listTrainingArtifacts,
@@ -362,6 +373,11 @@ async function settled(): Promise<void> {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks()
+  holdWorkerClose = false
+  workerExitCode = 0
+  terminalOnStderr = false
+  spawnedWorker = undefined
   sends.length = 0
   requests.length = 0
   workerCommands.length = 0
@@ -414,6 +430,110 @@ afterEach(() => {
 })
 
 describe('STRUM d8 training adapter', () => {
+  const prepareFixture = async (): Promise<{ jobId: string; taskViewId: string }> => {
+    const catalogRoot = join(scratch, 'lifecycle-catalog')
+    mkdirSync(catalogRoot, { recursive: true })
+    return await startTrainingPrepare({
+      catalogRoot,
+      catalogId: 'catalog',
+      catalogName: 'Catalog',
+      pipelineId: pipeline.id,
+      prepare: { instrument: 'guitar', target_difficulty: 'Hard' }
+    })
+  }
+
+  it('recovers prior unfinished jobs as safe interrupted summaries', async () => {
+    mkdirSync(join(scratch, 'strum-training'), { recursive: true })
+    writeFileSync(
+      join(scratch, 'strum-training', 'registry.json'),
+      JSON.stringify({
+        tasks: [],
+        runs: [],
+        jobs: [
+          {
+            jobId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+            sessionId: 'prior-app',
+            sequence: 4,
+            state: 'running',
+            stage: '/private/stage',
+            message: '/private/diagnostic',
+            result: { path: '/private/output' }
+          }
+        ]
+      })
+    )
+    const { jobs } = await listTrainingArtifacts()
+    expect(jobs).toEqual([expect.objectContaining({ state: 'failed', code: 'interrupted' })])
+    expect(JSON.stringify(jobs)).not.toContain('/private/')
+  })
+
+  it('retains every artifact when preparations finish concurrently', async () => {
+    const started = await Promise.all(Array.from({ length: 8 }, () => prepareFixture()))
+    await settled()
+    const artifacts = await listTrainingArtifacts()
+    expect(artifacts.tasks.map((task) => task.taskViewId).sort()).toEqual(
+      started.map((task) => task.taskViewId).sort()
+    )
+  })
+
+  it('preserves a corrupt registry instead of replacing training history', async () => {
+    mkdirSync(join(scratch, 'strum-training'), { recursive: true })
+    const registryPath = join(scratch, 'strum-training', 'registry.json')
+    writeFileSync(registryPath, '{incomplete history')
+    await prepareFixture()
+    await settled()
+    expect(readFileSync(registryPath, 'utf8')).toBe('{incomplete history')
+    expect(sends.at(-1)).toMatchObject({ state: 'failed', code: 'result_unavailable' })
+  })
+
+  it('waits for exit before registering success and preserves the request until exit', async () => {
+    holdWorkerClose = true
+    const started = await prepareFixture()
+    await settled()
+    expect(sends.some((event) => event.state === 'succeeded')).toBe(false)
+    expect((await listTrainingArtifacts()).tasks).toHaveLength(0)
+    const requestPath = join(scratch, `octave-training-${started.jobId}.json`)
+    expect(existsSync(requestPath)).toBe(true)
+    spawnedWorker?.emit('close', 0)
+    await settled()
+    expect((await listTrainingArtifacts()).tasks).toHaveLength(1)
+    expect(existsSync(requestPath)).toBe(false)
+  })
+
+  it('rejects claimed success when the worker exits unsuccessfully', async () => {
+    workerExitCode = 1
+    await prepareFixture()
+    await settled()
+    expect((await listTrainingArtifacts()).tasks).toHaveLength(0)
+    expect(sends.at(-1)).toMatchObject({ state: 'failed' })
+  })
+
+  it('does not accept a diagnostic stderr terminal as protocol success', async () => {
+    terminalOnStderr = true
+    await prepareFixture()
+    await settled()
+    expect((await listTrainingArtifacts()).tasks).toHaveLength(0)
+    expect(sends.at(-1)).toMatchObject({ state: 'failed' })
+  })
+
+  it('signals the process group immediately and defers cancelled cleanup until exit', async () => {
+    holdWorkerClose = true
+    const kill = vi.spyOn(process, 'kill').mockReturnValue(true)
+    const started = await prepareFixture()
+    await settled()
+    await expect(cancelTrainingJob(started.jobId)).resolves.toBe(true)
+    expect(kill).toHaveBeenCalledWith(-123, 'SIGTERM')
+    const requestPath = join(scratch, `octave-training-${started.jobId}.json`)
+    expect(existsSync(requestPath)).toBe(true)
+    expect(workerCommands.some((args) => args.includes('cancel'))).toBe(false)
+    spawnedWorker?.emit('close', null)
+    await settled()
+    expect(kill).toHaveBeenCalledWith(-123, 'SIGKILL')
+    expect(existsSync(requestPath)).toBe(false)
+    expect((await listTrainingArtifacts()).tasks).toHaveLength(0)
+    expect(sends.at(-1)).toMatchObject({ state: 'cancelled' })
+  })
+
   it('selects and locks an explicit versioned developer checkout', async () => {
     selectedDeveloperRoot = join(scratch, 'selected-developer-runtime')
     mkdirSync(join(selectedDeveloperRoot, 'src'), { recursive: true })
@@ -485,9 +605,7 @@ describe('STRUM d8 training adapter', () => {
       source_revision: '/private/worker/revision'
     }
 
-    await expect(enableDetectedDeveloperTrainingRuntime()).rejects.toThrow(
-      'invalid capabilities'
-    )
+    await expect(enableDetectedDeveloperTrainingRuntime()).rejects.toThrow('invalid capabilities')
   })
 
   it('canonicalizes STRUM’s numeric protocol and accepts its safe fallback runtime ID', async () => {
@@ -560,9 +678,9 @@ describe('STRUM d8 training adapter', () => {
 
     expect(enabled).toMatchObject({ kind: 'developer_override' })
     expect(discovery).toMatchObject({ candidateCount: 1, profileCount: 0 })
-    expect(workerCommands.some((args) => args.includes('checkpoint') && args.includes('discover'))).toBe(
-      true
-    )
+    expect(
+      workerCommands.some((args) => args.includes('checkpoint') && args.includes('discover'))
+    ).toBe(true)
     expect(
       workerCommands.find((args) => args.includes('checkpoint') && args.includes('discover'))
     ).toEqual(expect.arrayContaining(['-m', 'src.worker']))
@@ -632,6 +750,60 @@ describe('STRUM d8 training adapter', () => {
     ).toMatchObject({ command: workerB })
   })
 
+  it('resolves a fine-tune parent from verified registry identity without exposing its root', async () => {
+    const catalogRoot = join(scratch, 'parent-catalog')
+    mkdirSync(catalogRoot, { recursive: true })
+    const prepared = await startTrainingPrepare({
+      catalogRoot,
+      catalogId: 'parent-catalog',
+      catalogName: 'Parent catalog',
+      pipelineId: pipeline.id,
+      prepare: { instrument: 'guitar', target_difficulty: 'Hard' }
+    })
+    await settled()
+    const options = { taskViewId: prepared.taskViewId, pipelineId: pipeline.id }
+    await startTrainingRun({ ...options, train: { model_id: 'parent' } })
+    await settled()
+    const parentRoot = join(String(requests[1].output), 'bundle')
+    await expect(
+      startTrainingRun({
+        ...options,
+        train: {
+          model_id: 'invalid',
+          checkpoint_mode: 'fine_tune',
+          parent_artifact_id: '/private/unregistered'
+        }
+      })
+    ).rejects.toThrow()
+    await expect(
+      startTrainingRun({
+        ...options,
+        train: {
+          model_id: 'invalid',
+          checkpoint_mode: 'fresh',
+          parent_artifact_id: artifactId
+        }
+      })
+    ).rejects.toThrow('fine-tune mode')
+    await startTrainingRun({
+      ...options,
+      train: {
+        model_id: 'child',
+        checkpoint_mode: 'fine_tune',
+        parent_artifact_id: artifactId
+      }
+    })
+    await settled()
+    expect(requests.at(-1)).toMatchObject({
+      parent_bundle: parentRoot,
+      options: {
+        parent_artifact_id: artifactId,
+        checkpoint_mode: 'fine_tune'
+      }
+    })
+    expect(JSON.stringify(sends)).not.toContain(parentRoot)
+  })
+
   it('registers a nested raw training bundle and keeps candidate roots private', async () => {
     const catalogRoot = join(scratch, 'private-catalog')
     mkdirSync(catalogRoot, { recursive: true })
@@ -690,7 +862,12 @@ describe('STRUM d8 training adapter', () => {
     expect(JSON.stringify(artifacts)).not.toContain(scratch)
     const trainingOutputRoot = String(requests[1].output)
     expect(workerCommands).toContainEqual(
-      expect.arrayContaining(['checkpoint', 'inspect', '--model-root', join(trainingOutputRoot, 'bundle')])
+      expect.arrayContaining([
+        'checkpoint',
+        'inspect',
+        '--model-root',
+        join(trainingOutputRoot, 'bundle')
+      ])
     )
     expect(workerCommands).not.toContainEqual(
       expect.arrayContaining(['checkpoint', 'inspect', '--model-root', trainingOutputRoot])
@@ -747,7 +924,8 @@ describe('STRUM d8 training adapter', () => {
     expect((await listTrainingArtifacts()).runs).toEqual([])
     expect(
       workerCommands.some(
-        (args) => args.includes('checkpoint') && args.includes('inspect') && args.includes('escaped-bundle')
+        (args) =>
+          args.includes('checkpoint') && args.includes('inspect') && args.includes('escaped-bundle')
       )
     ).toBe(false)
   })

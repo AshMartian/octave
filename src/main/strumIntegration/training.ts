@@ -2,7 +2,17 @@ import { app, BrowserWindow, dialog } from 'electron'
 import { execFile, spawn, type ChildProcess } from 'child_process'
 import { createHash, randomUUID } from 'crypto'
 import { createReadStream, existsSync, type Dirent } from 'fs'
-import { lstat, mkdir, readFile, readdir, realpath, stat, unlink, writeFile } from 'fs/promises'
+import {
+  lstat,
+  mkdir,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  stat,
+  unlink,
+  writeFile
+} from 'fs/promises'
 import { isAbsolute, join, relative } from 'path'
 import type {
   StrumCheckpointCandidateInputContract,
@@ -288,6 +298,7 @@ type TrainingRegistry = {
   promotions?: StoredPromotion[]
   profiles?: StoredAutoChartProfile[]
   defaultProfileId?: string
+  jobs?: Array<TrainingJobEvent & { sessionId: string }>
 }
 
 type RunningTrainingJob = {
@@ -295,6 +306,7 @@ type RunningTrainingJob = {
   requestPath: string
   sequence: number
   cancelling: boolean
+  cancellationTimer?: NodeJS.Timeout
   runId?: string
 }
 
@@ -304,6 +316,8 @@ type RunningProfiledAutoChart = {
   cancelling: boolean
 }
 
+const trainingSessionId = randomUUID()
+const latestTrainingEvents = new Map<string, TrainingJobEvent>()
 const runningJobs = new Map<string, RunningTrainingJob>()
 const runningProfiledAutoCharts = new Map<string, RunningProfiledAutoChart>()
 /** A runtime selection is not visible to any worker action until its lock is durable. */
@@ -352,6 +366,26 @@ function bundledRuntimeExecutablePath(): string | null {
 }
 
 function broadcast(payload: TrainingJobEvent): void {
+  latestTrainingEvents.set(payload.jobId, payload)
+  if (latestTrainingEvents.size > 256) {
+    const oldest = latestTrainingEvents.keys().next().value
+    if (oldest) latestTrainingEvents.delete(oldest)
+  }
+  if (
+    payload.state &&
+    ['queued', 'cancelling', 'succeeded', 'failed', 'cancelled'].includes(payload.state)
+  ) {
+    // Persist lifecycle transitions, without raw events or private request values.
+    // Registration and these writes share one mutation queue.
+    void updateRegistry((registry) => {
+      const summary = { ...payload }
+      delete summary.result
+      registry.jobs = [
+        ...(registry.jobs ?? []).filter((entry) => entry.jobId !== payload.jobId),
+        { ...summary, sessionId: trainingSessionId }
+      ].slice(-256)
+    }).catch(() => undefined)
+  }
   for (const window of BrowserWindow.getAllWindows()) {
     window.webContents.send('training:progress', payload)
   }
@@ -376,6 +410,8 @@ async function readRuntimeSettings(): Promise<RuntimeSettings> {
   }
 }
 
+let registryMutation: Promise<void> = Promise.resolve()
+
 async function readRegistry(): Promise<TrainingRegistry> {
   try {
     const registry = JSON.parse(await readFile(registryPath(), 'utf8')) as TrainingRegistry
@@ -384,17 +420,38 @@ async function readRegistry(): Promise<TrainingRegistry> {
       runs: Array.isArray(registry.runs) ? registry.runs : [],
       profiles: Array.isArray(registry.profiles) ? registry.profiles : [],
       promotions: Array.isArray(registry.promotions) ? registry.promotions : [],
+      jobs: Array.isArray(registry.jobs) ? registry.jobs : [],
       defaultProfileId:
         typeof registry.defaultProfileId === 'string' ? registry.defaultProfileId : undefined
     }
-  } catch {
-    return { tasks: [], runs: [], profiles: [], promotions: [] }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { tasks: [], runs: [], profiles: [], promotions: [] }
+    }
+    // Preserve unreadable history instead of overwriting it with an empty registry.
+    throw new Error('The local STRUM training registry could not be read.')
   }
 }
 
-async function writeRegistry(registry: TrainingRegistry): Promise<void> {
-  await mkdir(trainingRoot(), { recursive: true })
-  await writeFile(registryPath(), JSON.stringify(registry, null, 2) + '\n', 'utf8')
+async function updateRegistry(mutate: (registry: TrainingRegistry) => void): Promise<void> {
+  const operation = registryMutation.then(async () => {
+    const registry = await readRegistry()
+    mutate(registry)
+    await mkdir(trainingRoot(), { recursive: true })
+    const stagedPath = `${registryPath()}.${randomUUID()}.tmp`
+    try {
+      await writeFile(stagedPath, JSON.stringify(registry, null, 2) + '\n', {
+        encoding: 'utf8',
+        mode: 0o600,
+        flag: 'wx'
+      })
+      await rename(stagedPath, registryPath())
+    } finally {
+      await unlink(stagedPath).catch(() => undefined)
+    }
+  })
+  registryMutation = operation.catch(() => undefined)
+  await operation
 }
 
 function hasLegacyGuitarSources(root: string): boolean {
@@ -1880,18 +1937,18 @@ export async function startPromotionJob(options: {
     if (job.kind === 'package' && !packagedInspection) {
       throw new Error('STRUM could not re-inspect the packaged model bundle.')
     }
-    const registry = await readRegistry()
     const stored: StoredPromotion = {
       ...normalized,
       candidateArtifactId: options.candidateArtifactId,
       kind: job.kind,
       outputRoot
     }
-    registry.promotions = [
-      ...(registry.promotions ?? []).filter((entry) => entry.promotionId !== stored.promotionId),
-      stored
-    ]
-    await writeRegistry(registry)
+    await updateRegistry((registry) => {
+      registry.promotions = [
+        ...(registry.promotions ?? []).filter((entry) => entry.promotionId !== stored.promotionId),
+        stored
+      ]
+    })
     if (!packagedInspection) return normalized
     discoveredCheckpointRoots.set(packagedInspection.artifactId, outputRoot)
     return {
@@ -1992,9 +2049,36 @@ export async function listTrainingArtifacts(): Promise<{
   tasks: TrainingTask[]
   runs: TrainingRun[]
   profiles: AutoChartProfile[]
+  jobs: TrainingJobEvent[]
 }> {
+  await registryMutation
   const registry = await readRegistry()
   return {
+    jobs: (registry.jobs ?? []).flatMap<TrainingJobEvent>((entry) => {
+      if (typeof entry.jobId !== 'string' || !/^[a-f0-9-]{36}$/.test(entry.jobId)) return []
+      const live = latestTrainingEvents.get(entry.jobId)
+      if (live) return [{ ...live, result: undefined }]
+      const state = ['succeeded', 'failed', 'cancelled'].includes(String(entry.state))
+        ? (entry.state as 'succeeded' | 'failed' | 'cancelled')
+        : 'failed'
+      const interrupted = !['succeeded', 'failed', 'cancelled'].includes(String(entry.state))
+      return [
+        {
+          jobId: entry.jobId,
+          sequence: Number.isSafeInteger(entry.sequence) ? entry.sequence + 1 : 1,
+          stage: 'complete',
+          state,
+          code: interrupted ? 'interrupted' : state,
+          message: interrupted
+            ? 'This STRUM job was interrupted when OCTAVE stopped. Start a new job to retry.'
+            : state === 'succeeded'
+              ? 'Completed locally.'
+              : state === 'cancelled'
+                ? 'The STRUM training job was cancelled.'
+                : 'STRUM could not complete this local job.'
+        }
+      ]
+    }),
     tasks: registry.tasks
       .filter((task) => existsSync(task.taskRoot))
       .map((task) => ({
@@ -2474,7 +2558,6 @@ export async function saveDiscoveredAutoChartProfile(options: {
   ) {
     throw new Error('STRUM did not validate the selected checkpoint profile.')
   }
-  const registry = await readRegistry()
   const profileId = `octave-strum-profile-${randomUUID()}`
   const saved: StoredAutoChartProfile = {
     profileId,
@@ -2488,15 +2571,16 @@ export async function saveDiscoveredAutoChartProfile(options: {
     isDefault: true,
     checkpointRoot: root
   }
-  registry.profiles = [
-    ...(registry.profiles ?? []).filter(
-      (entry) =>
-        entry.artifactId !== checkpoint.artifactId || entry.strumProfileId !== profile.profileId
-    ),
-    saved
-  ]
-  registry.defaultProfileId = profileId
-  await writeRegistry(registry)
+  await updateRegistry((registry) => {
+    registry.profiles = [
+      ...(registry.profiles ?? []).filter(
+        (entry) =>
+          entry.artifactId !== checkpoint.artifactId || entry.strumProfileId !== profile.profileId
+      ),
+      saved
+    ]
+    registry.defaultProfileId = profileId
+  })
   return publicAutoChartProfile(saved, true)
 }
 
@@ -2504,40 +2588,34 @@ type ResolvedAutoChartProfile = StoredAutoChartProfile & {
   instruments: string[]
 }
 
-async function discardInvalidDefaultProfile(
-  registry: TrainingRegistry,
-  profileId: string
-): Promise<void> {
-  registry.profiles = (registry.profiles ?? []).filter((entry) => entry.profileId !== profileId)
-  if (registry.defaultProfileId === profileId) registry.defaultProfileId = undefined
-  await writeRegistry(registry)
+async function discardInvalidDefaultProfile(profileId: string): Promise<void> {
+  await updateRegistry((registry) => {
+    registry.profiles = (registry.profiles ?? []).filter((entry) => entry.profileId !== profileId)
+    if (registry.defaultProfileId === profileId) registry.defaultProfileId = undefined
+  })
 }
 
 async function resolveDefaultAutoChartProfile(): Promise<ResolvedAutoChartProfile | null> {
   const registry = await readRegistry()
-  const profile = (registry.profiles ?? []).find((entry) => entry.profileId === registry.defaultProfileId)
+  const profile = (registry.profiles ?? []).find(
+    (entry) => entry.profileId === registry.defaultProfileId
+  )
   if (!profile) return null
   try {
     const checkpointRoot = await resolveRegisteredProfileRoot(profile)
     const runtime = await probeTrainingRuntime()
     if (runtime.runtimeId !== profile.runtimeId || !runtime.capabilities.includes('chart')) {
-      await discardInvalidDefaultProfile(registry, profile.profileId)
+      await discardInvalidDefaultProfile(profile.profileId)
       return null
     }
     // A profile is usable only when the current bundle re-inspection retains
     // the exact artifact and manifest identity that OCTAVE saved.
     if (!profile.artifactId || !profile.manifestSha256) {
-      await discardInvalidDefaultProfile(registry, profile.profileId)
+      await discardInvalidDefaultProfile(profile.profileId)
       return null
     }
     const inspection = normalizeDiscoveredCheckpoint(
-      await runWorkerJson([
-        'checkpoint',
-        'inspect',
-        '--model-root',
-        checkpointRoot,
-        '--json'
-      ])
+      await runWorkerJson(['checkpoint', 'inspect', '--model-root', checkpointRoot, '--json'])
     )
     if (
       !inspection ||
@@ -2545,7 +2623,7 @@ async function resolveDefaultAutoChartProfile(): Promise<ResolvedAutoChartProfil
       inspection.manifestSha256 !== profile.manifestSha256 ||
       inspection.deploymentStatus !== 'ready'
     ) {
-      await discardInvalidDefaultProfile(registry, profile.profileId)
+      await discardInvalidDefaultProfile(profile.profileId)
       return null
     }
     const strumProfileId = profile.strumProfileId ?? profile.profileId
@@ -2557,7 +2635,7 @@ async function resolveDefaultAutoChartProfile(): Promise<ResolvedAutoChartProfil
         profile.difficultyPolicy ?? 'expert_only'
       )
     ) {
-      await discardInvalidDefaultProfile(registry, profile.profileId)
+      await discardInvalidDefaultProfile(profile.profileId)
       return null
     }
     const validation = await runWorkerJson([
@@ -2577,12 +2655,12 @@ async function resolveDefaultAutoChartProfile(): Promise<ResolvedAutoChartProfil
       validation.profile_id !== strumProfileId ||
       validation.manifest_sha256 !== profile.manifestSha256
     ) {
-      await discardInvalidDefaultProfile(registry, profile.profileId)
+      await discardInvalidDefaultProfile(profile.profileId)
       return null
     }
     return { ...profile, checkpointRoot, instruments: declaredProfile.instruments }
   } catch {
-    await discardInvalidDefaultProfile(registry, profile.profileId)
+    await discardInvalidDefaultProfile(profile.profileId)
     return null
   }
 }
@@ -2964,6 +3042,22 @@ export async function cancelDefaultAutoChartProfile(runId: string): Promise<bool
   return true
 }
 
+/** Cancel the entire worker tree; Windows does not support POSIX process groups. */
+function signalTrainingProcessTree(child: ChildProcess, force: boolean): void {
+  if (!child.pid) return
+  if (process.platform === 'win32') {
+    execFile('taskkill', ['/PID', String(child.pid), '/T', ...(force ? ['/F'] : [])], () => {
+      // The process may already have exited. Terminal handling owns cleanup.
+    })
+    return
+  }
+  try {
+    process.kill(-child.pid, force ? 'SIGKILL' : 'SIGTERM')
+  } catch {
+    // Process group already exited.
+  }
+}
+
 async function startJsonEventJob(
   jobId: string,
   args: string[],
@@ -2974,26 +3068,36 @@ async function startJsonEventJob(
   runId?: string
 ): Promise<void> {
   const requestPath = join(app.getPath('temp'), `octave-training-${jobId}.json`)
-  await writeFile(requestPath, JSON.stringify(request), 'utf8')
-  let worker: WorkerInvocation
-  for (;;) {
-    const resolved = await resolveWorkerInvocation(jobId)
-    if (resolved.runtimeSelectionEpoch !== runtimeSelectionEpoch || runtimeSelectionActivation) {
-      continue
+  let child: ChildProcess
+  try {
+    await writeFile(requestPath, JSON.stringify(request), {
+      encoding: 'utf8',
+      mode: 0o600,
+      flag: 'wx'
+    })
+    let worker: WorkerInvocation
+    for (;;) {
+      const resolved = await resolveWorkerInvocation(jobId)
+      if (resolved.runtimeSelectionEpoch !== runtimeSelectionEpoch || runtimeSelectionActivation) {
+        continue
+      }
+      worker = resolved.invocation
+      break
     }
-    worker = resolved.invocation
-    break
+    child = spawn(
+      worker.command,
+      [...worker.baseArgs, ...args, '--request', requestPath, '--json-events'],
+      {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: worker.env,
+        cwd: worker.cwd,
+        detached: process.platform !== 'win32'
+      }
+    )
+  } catch {
+    await unlink(requestPath).catch(() => undefined)
+    throw new Error('STRUM could not start this local job.')
   }
-  const child = spawn(
-    worker.command,
-    [...worker.baseArgs, ...args, '--request', requestPath, '--json-events'],
-    {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: worker.env,
-      cwd: worker.cwd,
-      detached: process.platform !== 'win32'
-    }
-  )
   const job: RunningTrainingJob = {
     process: child,
     requestPath,
@@ -3011,119 +3115,141 @@ async function startJsonEventJob(
     message: 'Queued locally.'
   })
   let remainder = ''
-  let terminal = false
-  let cleanedUp = false
+  let terminal: Record<string, unknown> | undefined
+  let finished = false
+  let protocolFailed = false
   const safeStage = (value: unknown): string =>
     isSafeContractToken(value) ? String(value) : 'running'
   const safeCode = (value: unknown): string | undefined =>
     isSafeContractToken(value) ? String(value) : undefined
-  const localMessage = (state: string, stage: string): string => {
-    if (state === 'succeeded') return 'Completed locally.'
-    if (state === 'cancelled') return 'The STRUM training job was cancelled.'
-    if (state === 'failed') return 'STRUM rejected or could not complete this local job.'
-    return `STRUM is processing ${stage.replaceAll('_', ' ')} locally.`
-  }
-  const cleanup = async (fallbackState?: 'failed' | 'cancelled'): Promise<void> => {
-    if (cleanedUp) return
-    cleanedUp = true
-    runningJobs.delete(jobId)
-    try {
-      await unlink(requestPath)
-    } catch {
-      /* idempotent cleanup */
-    }
-    if (!terminal && fallbackState) {
+  const finish = async (exitCode: number | null): Promise<void> => {
+    if (finished) return
+    finished = true
+    if (job.cancellationTimer) clearTimeout(job.cancellationTimer)
+    if (job.cancelling) signalTrainingProcessTree(child, true)
+    await unlink(requestPath).catch(() => undefined)
+    const sequence = job.sequence + 1
+    if (job.cancelling || terminal?.state === 'cancelled') {
       broadcast({
         jobId,
-        sequence: job.sequence + 1,
+        sequence,
         stage: 'complete',
-        state: fallbackState,
-        code: fallbackState === 'cancelled' ? 'cancelled' : 'worker_terminated',
-        message:
-          fallbackState === 'cancelled'
-            ? 'The STRUM training job was cancelled.'
-            : 'The STRUM training job ended unexpectedly.'
+        state: 'cancelled',
+        code: 'cancelled',
+        message: 'The STRUM training job was cancelled.'
       })
+      return
+    }
+    // A claimed success is only evidence after the worker exits successfully.
+    // Registration must not race a worker still writing its artifacts.
+    if (
+      exitCode === 0 &&
+      !protocolFailed &&
+      terminal?.state === 'succeeded' &&
+      isRecord(terminal.result)
+    ) {
+      try {
+        const result = await onSucceeded(terminal.result)
+        broadcast({
+          jobId,
+          sequence,
+          stage: 'complete',
+          progress: 1,
+          state: 'succeeded',
+          message: 'Completed locally.',
+          result
+        })
+      } catch {
+        broadcast({
+          jobId,
+          sequence,
+          stage: 'complete',
+          state: 'failed',
+          code: 'result_unavailable',
+          message: 'The completed job could not be registered.'
+        })
+      }
+      return
+    }
+    broadcast({
+      jobId,
+      sequence,
+      stage: 'complete',
+      state: 'failed',
+      code: protocolFailed
+        ? 'invalid_worker_event'
+        : (safeCode(terminal?.code) ?? 'worker_terminated'),
+      message: 'STRUM rejected or could not complete this local job.'
+    })
+  }
+  const consumeLine = (line: string): void => {
+    if (terminal || finished || protocolFailed) return
+    try {
+      const event: unknown = JSON.parse(line)
+      if (!isRecord(event)) return
+      const legacyProgress = event.event === 'progress'
+      const state = legacyProgress ? 'running' : event.state
+      if (
+        !['running', 'succeeded', 'failed', 'cancelled', 'validating', 'provisioning'].includes(
+          String(state)
+        )
+      )
+        return
+      const sequence = event.sequence
+      if (
+        typeof sequence !== 'number' ||
+        !Number.isSafeInteger(sequence) ||
+        sequence <= job.sequence
+      )
+        return
+      job.sequence = sequence
+      if (state === 'succeeded' || state === 'failed' || state === 'cancelled') {
+        terminal = { ...event, state }
+        return
+      }
+      if (job.cancelling) return
+      const stage = safeStage(event.stage)
+      const progress =
+        typeof event.progress === 'number' && Number.isFinite(event.progress)
+          ? Math.max(0, Math.min(1, event.progress))
+          : 0
+      broadcast({
+        jobId,
+        sequence,
+        stage,
+        progress,
+        state: state as 'running' | 'validating' | 'provisioning',
+        code: safeCode(event.code),
+        message: `STRUM is processing ${stage.replaceAll('_', ' ')} locally.`
+      })
+    } catch {
+      // Human diagnostics never cross into renderer state.
     }
   }
-  const consume = (chunk: Buffer): void => {
+  child.stdout?.on('data', (chunk: Buffer) => {
+    if (finished || protocolFailed || terminal) return
     remainder += chunk.toString('utf8')
     const lines = remainder.split(/\r?\n/)
     remainder = lines.pop() ?? ''
-    for (const line of lines) {
-      try {
-        const event = JSON.parse(line) as Record<string, unknown>
-        // A worker terminal record is final even when its process buffers a
-        // duplicate line before close. Never invoke registration twice.
-        if (terminal) continue
-        const legacyEvent = event.event
-        const isLegacyProgress = legacyEvent === 'progress'
-        const isLegacyTerminal = legacyEvent === 'terminal'
-        const state = typeof event.state === 'string' ? event.state : ''
-        const isCurrentState = ['running', 'succeeded', 'failed', 'cancelled'].includes(state)
-        if (!isLegacyProgress && !isLegacyTerminal && !isCurrentState) continue
-        const sequence = Number(event.sequence)
-        if (!Number.isInteger(sequence) || sequence <= job.sequence) continue
-        job.sequence = sequence
-        const stage = safeStage(event.stage)
-        const code = safeCode(event.code)
-        const normalizedState = isLegacyProgress ? 'running' : state
-        if (isLegacyProgress || normalizedState === 'running') {
-          broadcast({
-            jobId,
-            sequence,
-            stage,
-            progress: Number(event.progress ?? 0),
-            state: 'running',
-            code,
-            message: localMessage('running', stage)
-          })
-          continue
-        }
-        terminal = true
-        if (!job.cancelling && normalizedState === 'succeeded' && isRecord(event.result)) {
-          void onSucceeded(event.result)
-            .then((result) => {
-              broadcast({
-                jobId,
-                sequence,
-                stage: 'complete',
-                progress: 1,
-                state: 'succeeded',
-                message: 'Completed locally.',
-                result
-              })
-            })
-            .catch(() => {
-              broadcast({
-                jobId,
-                sequence,
-                stage: 'complete',
-                state: 'failed',
-                code: 'result_unavailable',
-                message: 'The completed job could not be registered.'
-              })
-            })
-        } else {
-          broadcast({
-            jobId,
-            sequence,
-            stage: 'complete',
-            state: job.cancelling || normalizedState === 'cancelled' ? 'cancelled' : 'failed',
-            code,
-            message: localMessage(normalizedState, stage)
-          })
-        }
-      } catch {
-        // The protocol declares stdout machine-readable. Ignore anything else
-        // rather than exposing it to the renderer or user-visible logs.
-      }
+    // Bound malformed or unterminated output from a worker.
+    if (remainder.length > 1_048_576 || lines.some((line) => line.length > 1_048_576)) {
+      protocolFailed = true
+      remainder = ''
+      signalTrainingProcessTree(child, true)
+      return
     }
-  }
-  child.stdout?.on('data', consume)
-  child.stderr?.on('data', consume)
-  child.once('error', () => void cleanup(job.cancelling ? 'cancelled' : 'failed'))
-  child.once('close', () => void cleanup(job.cancelling ? 'cancelled' : 'failed'))
+    for (const line of lines) consumeLine(line)
+  })
+  // stderr is diagnostic only, never a second event stream.
+  child.stderr?.on('data', () => undefined)
+  child.once('error', () => {
+    protocolFailed = true
+    // Node emits close after error, including spawn failures. Cleanup waits for it.
+  })
+  child.once('close', (code: number | null) => {
+    if (remainder.trim()) consumeLine(remainder)
+    void finish(code).finally(() => runningJobs.delete(jobId))
+  })
 }
 
 export async function startTrainingPrepare(options: {
@@ -3164,7 +3290,6 @@ export async function startTrainingPrepare(options: {
       ) {
         throw new Error('STRUM returned an invalid prepared task result.')
       }
-      const registry = await readRegistry()
       const task: TrainingTask & { taskRoot: string; catalogRoot: string } = {
         taskViewId,
         catalogId: options.catalogId,
@@ -3178,8 +3303,12 @@ export async function startTrainingPrepare(options: {
         taskRoot,
         catalogRoot: options.catalogRoot
       }
-      registry.tasks = [...registry.tasks.filter((entry) => entry.taskViewId !== taskViewId), task]
-      await writeRegistry(registry)
+      await updateRegistry((registry) => {
+        registry.tasks = [
+          ...registry.tasks.filter((entry) => entry.taskViewId !== taskViewId),
+          task
+        ]
+      })
       return { taskViewId, eligibleCount: task.eligibleCount, contentHash: task.contentHash }
     }
   )
@@ -3206,6 +3335,24 @@ export async function startTrainingRun(options: {
   const pipeline = await resolveTrainingPipeline(options.pipelineId)
   if (!pipeline.train_schema) throw new Error('This STRUM pipeline has no training schema.')
   const train = sanitizeTrainingSchemaValues(pipeline.train_schema, options.train, 'train')
+  const privateFields = pipeline.private_request_fields ?? []
+  if (privateFields.some((field) => !['catalog_root', 'parent_bundle'].includes(field))) {
+    throw new Error('This STRUM pipeline requires unsupported private training inputs.')
+  }
+  const privateInputs: Record<string, string> = {}
+  if (privateFields.includes('catalog_root')) privateInputs.catalog_root = task.catalogRoot
+  if (train.checkpoint_mode === 'fine_tune') {
+    if (!privateFields.includes('parent_bundle') || typeof train.parent_artifact_id !== 'string') {
+      throw new Error('Select a registered parent candidate before fine-tuning.')
+    }
+    const parent = await resolveCandidateBinding(train.parent_artifact_id)
+    if (parent.run.pipelineId !== options.pipelineId) {
+      throw new Error('The parent candidate belongs to a different STRUM pipeline.')
+    }
+    privateInputs.parent_bundle = parent.binding.bundleRoot
+  } else if (train.parent_artifact_id !== undefined) {
+    throw new Error('A parent candidate requires fine-tune mode.')
+  }
   const jobId = randomUUID()
   const runId = `run-${randomUUID()}`
   const outputRoot = join(trainingRoot(), 'runs', runId)
@@ -3216,7 +3363,7 @@ export async function startTrainingRun(options: {
     {
       pipeline_id: options.pipelineId,
       task_view: task.taskRoot,
-      catalog_root: task.catalogRoot,
+      ...privateInputs,
       output: outputRoot,
       options: train
     },
@@ -3242,7 +3389,6 @@ export async function startTrainingRun(options: {
       ) {
         throw new Error('STRUM could not re-inspect the trained candidate.')
       }
-      const current = await readRegistry()
       const run: TrainingRun & {
         outputRoot: string
         candidateBinding: {
@@ -3268,8 +3414,9 @@ export async function startTrainingRun(options: {
           catalogRoot: task.catalogRoot
         }
       }
-      current.runs = [...current.runs.filter((entry) => entry.runId !== runId), run]
-      await writeRegistry(current)
+      await updateRegistry((current) => {
+        current.runs = [...current.runs.filter((entry) => entry.runId !== runId), run]
+      })
       return {
         runId,
         artifactId: run.artifactId,
@@ -3285,32 +3432,28 @@ export async function startTrainingRun(options: {
 export async function cancelTrainingJob(jobId: string): Promise<boolean> {
   const job = runningJobs.get(jobId)
   if (!job) return false
+  if (job.cancelling) return true
   job.cancelling = true
+  job.sequence += 1
   broadcast({
     jobId,
-    sequence: job.sequence + 1,
+    sequence: job.sequence,
     stage: 'cancelling',
     state: 'cancelling',
     message: 'Cancelling STRUM and its local child processes…'
   })
-  try {
-    if (job.runId) void runWorkerJson(['train', 'cancel', '--run', job.runId])
-    setTimeout(() => {
-      if (!runningJobs.has(jobId)) return
-      try {
-        if (process.platform !== 'win32' && job.process.pid)
-          process.kill(-job.process.pid, 'SIGKILL')
-        else job.process.kill('SIGKILL')
-      } catch {
-        /* terminal cleanup is idempotent */
-      }
-    }, 5_000).unref()
-    return true
-  } catch {
-    return false
-  }
+  signalTrainingProcessTree(job.process, false)
+  job.cancellationTimer = setTimeout(() => {
+    if (runningJobs.get(jobId) === job) signalTrainingProcessTree(job.process, true)
+  }, 5_000)
+  job.cancellationTimer.unref()
+  return true
 }
 
 export function killAllTrainingJobs(): void {
-  for (const [jobId] of runningJobs) void cancelTrainingJob(jobId)
+  for (const [jobId, job] of runningJobs) {
+    void cancelTrainingJob(jobId)
+    // App shutdown cannot rely on an unref'ed grace timer firing later.
+    signalTrainingProcessTree(job.process, true)
+  }
 }

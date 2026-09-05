@@ -184,6 +184,15 @@ interface ChartEditorAPI {
     }>
   >
   listTrainingArtifacts: () => Promise<{
+    jobs: Array<{
+      jobId: string
+      sequence: number
+      stage: string
+      progress?: number
+      state?: 'queued' | 'running' | 'cancelling' | 'cancelled' | 'succeeded' | 'failed'
+      message: string
+      code?: string
+    }>
     tasks: Array<{
       taskViewId: string
       catalogId: string
@@ -496,9 +505,7 @@ interface ChartEditorAPI {
       }
     }) => void
   ) => () => void
-  onAutoChartError: (
-    callback: (event: { runId: string; message: string }) => void
-  ) => () => void
+  onAutoChartError: (callback: (event: { runId: string; message: string }) => void) => () => void
 
   // Bootstrapped Python runtime (managed in userData on packaged builds)
   getRuntimeStatus: () => Promise<{
