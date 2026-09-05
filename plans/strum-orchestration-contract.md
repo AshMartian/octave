@@ -8,6 +8,14 @@ The boundary supports STRUM as a family of models rather than one model. A user 
 
 The initial proof is complete: OCTAVE created a 58-record allowed catalog; STRUM selected 31 Guitar, 52 Drums, 29 Bass, 18 Keys, and 3 Vocal-eligible records for dedicated workers. That is historical smoke evidence, not the current catalog state. The current locally approved SMB catalog has 212 allowed records and the current readiness counts are recorded below. Catalog-aware smoke preprocessing and bounded CUDA training completed for Guitar, Drums, Bass, Keys, Vocal activity/pitch, observed Vocal lyric alignment, and Talky activity. Exact Pro target decoding and Vocal phrase task preparation also complete against that catalog. These artifacts validate the handoff and worker contracts only; they are not deployable quality models.
 
+## Current review evidence — 2026-09-05
+
+The integrated implementation is documented in the [local training runbook](../docs/reference/strum-training.md), with reproducible worker and Electron checks in [acceptance](../scripts/acceptance/README.md). Earlier dated results below are historical execution evidence. The current companion runtime is pinned in CI to STRUM `b32fa0a0943a75184999edfe87c4ce38225d833f`.
+
+Current hardening covers prepared manifest and sidecar integrity, direct and nested worker bundle layouts, verified fine-tune parents, catalog bindings that preserve candidate modality, typed chart capability gates, exit-confirmed job completion, process-tree cancellation, durable history, and generated-output provenance. OCTAVE owns these orchestration and storage checks; STRUM continues to own labels, task lineage, evaluation and promotion policy.
+
+The approved-catalog one-epoch transform candidate fails the unchanged quality policy (F1 0.4380, precision 0.2993, recall 0.8163) and remains non-deployable. A separately trained synthetic identity fixture passes through packaging and actual OCTAVE MIDI generation; it proves execution only. No production-quality personalized model is promoted. Planned capability composition, optimizer-state resume, generated-chart revision tracking, and a verified official training-runtime release remain explicitly outside the implemented deployment path.
+
 ## Ownership boundary
 
 | Concern                    | OCTAVE owns                                                                     | STRUM owns                                                    |
@@ -80,11 +88,7 @@ Existing `OCTAVE_STRUM_SOURCE_DIR` and `OCTAVE_STRUM_PYTHON` remain development 
   "train_schema": { "type": "object" },
   "private_request_fields": ["catalog_root"],
   "training_requirements": ["profile_evaluation", "profile_packaging"],
-  "catalog_inspection_option_keys": [
-    "audio_role",
-    "fallback_audio_role",
-    "required_difficulty"
-  ],
+  "catalog_inspection_option_keys": ["audio_role", "fallback_audio_role", "required_difficulty"],
   "checkpoint_outputs": ["guitar_onset", "guitar_fret"],
   "inference_capability": "guitar.audio_to_chart/v1"
 }
@@ -214,6 +218,7 @@ Before deployment, STRUM must state for each checkpoint: the inference stage it 
    On the current approved catalog, the stable profile-grade result is Guitar 71 sources (58 / 5 / 8), while Bass 4 (2 / 2 / 0) and Keys 9 (6 / 2 / 1) fail the minimum because dedicated-role source coverage is insufficient. A fresh 30-epoch Guitar run on the 71-source view reached held-out onset F1 `0.789084` but fret F1 `0.401073`, below the canonical `0.50` minimum; no profile package was created. These facts are admission and quality evidence, not permission to lower the policy or promote a raw checkpoint.
 
    The same V2 contract supports catalog-audio conditioning. One bounded RTX 4090 run with `rms_onset_v1`, preferred Guitar audio and Mix fallback used 104 valid records (84 / 10 / 10 sources; 68 preferred / 36 fallback). Calibration selected epoch 30; its Test precision / recall / F1 were 0.313061 / 0.810742 / 0.451701, again failing F1 and precision. The audio subset differs from the chart-only subset, so its positive directional change is evidence of a working modality—not an apples-to-apples quality claim or a deployable profile.
+
 6. **Complete in isolated OCTAVE handoff branches:** OCTAVE dynamic Prepare/Train screens consume worker descriptors, readiness summaries, private request fields, and verified fine-tune-parent selection. Deploy now consumes bounded `checkpoint discover` results, maps opaque artifact IDs to private main-process roots, redacts renderer DTOs, rejects non-deployable selections, and pins saved defaults to a re-inspected artifact/manifest identity. Its typed optional output-contract DTO lets Train display a selected raw candidate without turning it into a deploy control (`ea7d9e0`). The reviewed deploy handoff commits are `036f0ff`, `5d46f49`, and `a17a498`; the reviewed catalog/harmony chain is `dc32825`, `6d7d41e`, `23d7acb`, `eb27da1`, and `48e79b2` (the last bounds stalled SNG extraction without accepting partial packages). The reviewed bounded source-inventory chain is `3fd36df`, `310f1dd`, `b2dc4d8`, `698dbb1`, `1f0a3f1`, and `8999627`: it performs opaque, aggregate-only package inspection in a worker, admits a regular no-follow/non-blocking ≤256 MiB snapshot, bounds ZIP extraction, returns no raw chart buffers or source locations, and has a main-owned resumable cursor. The reviewed `a1f3454` bridge retains per-chart evidence only in the main process, exposes opaque review candidates, and materializes only explicitly approved chart entries from the revalidated package snapshot; it handles multi-song containers and root-level ZIP `notes.mid` without ordinal identities. `d7d971f`, `0b096409`, and `6de96b8` form the reviewed current-worker adapter and promotion UX handoff: OCTAVE passes only descriptor-allowed inspection options, registers trained candidates as opaque private-root bindings, starts STRUM-owned evaluation/package jobs in the main process, emits first-wins sanitized terminal results bound to the opaque candidate artifact, rejects descriptor-supplied policy/threshold overrides, and reinspects a package before it can become a profile-selection candidate. Inventory and review state are advisory and do not change catalog eligibility until an explicit selection is atomically materialized. OCTAVE's primary owner integrates these chains. Deployment remains gated on STRUM profile packaging/evaluation.
 
    `6836b16` and `5cb7bc1` complete the live runtime/candidate boundary handoff. Runtime activation serializes both developer and installed selections in the main process, retries a stale in-flight launch after a selection epoch changes, and emits only a strict path-free runtime DTO while accepting STRUM's numeric protocol version and exact `strum-X.Y.Z+git.<lowerhex>` fallback identity. A completed training run registers its declared nested raw bundle only after realpath containment; later inspect/promotion calls recheck that containment, including after a symlink swap. The renderer receives only an opaque raw candidate, and a raw `not_deployable` bundle remains unavailable as an Auto Chart default.
@@ -221,6 +226,7 @@ Before deployment, STRUM must state for each checkpoint: the inference stage it 
    **2026-08-25 live acceptance matrix:** Against the approved 212-record catalog, bounded CUDA runs completed for Drums onset classification and learned Expert-to-Hard transforms. Task counts were Drums 199 and Guitar/Drums/Bass/Keys transform 123/186/129/20. Test-only transform policy evidence was respectively Guitar F1/precision/recall `0.3731/0.2311/0.9675`, Drums `0.4545/0.3068/0.8761`, Bass `0.3755/0.2419/0.8389`, and Keys `0.2720/0.1574/1.0`; every bundle correctly failed the immutable F1 ≥ 0.50 and precision/recall ≥ 0.45 promotion policy, so no profile was packaged. The Drums smoke yielded test F1 `0.09010` and remains a raw checkpoint. OCTAVE's live Electron flow inspected the same approved Guitar catalog (145 eligible), prepared an immutable task view, submitted a real training job, and discovered a raw transform bundle as verified but `Not deployable` with zero profiles and no enabled default action. Screenshots are retained outside source control as acceptance evidence.
 
    `c67ba6a` extends the same boundary with clone-only, explicit audio-enrichment revisions for an already-cataloged MIDI chart. It revalidates the selected package snapshot and locator, changes only named audio assets, preserves record rights/chart identity, rejects case-colliding ZIP entries and ambiguous RB3CON MOGGs, and cannot publish a partial revision. It is not an approval mechanism: enrichment still requires an approved candidate and a new catalog revision.
+
 7. **Pending external release authority:** opt-in managed pinned-release acquisition, verification, locking, update/rollback, and offline behavior. Implement only once STRUM publishes an immutable revision plus verification hash/signature; OCTAVE must not clone or update arbitrary source at runtime. Until then, a packaged build fails closed when no validated Deploy profile is active rather than downloading a mutable STRUM source fallback.
 8. **Planned learned models:** quality-grade (not smoke-grade) held-out evaluation and promotion of the Guitar/Bass/Keys and chart-transform profile paths; OCTAVE materialization of the isolated Harmony sidecar/assets, then Vocal harmony composition, evaluation, and profile; mapper evaluation plus safe composed runtime; Section chart-impact ablation and composed runtime; and Pro-instrument evaluated free-running sequence models, packaging, and deployable profiles on the unchanged catalog boundary.
 
@@ -270,7 +276,7 @@ the inventory's opaque cursor to completion: all 280 packages settled, with
 MIDI-backed charts, 66 chart-only packages, and 143 exact canonical
 `PART VOCALS` sources. Ten bounded package decodes timed out and two failed;
 there were no duplicate MIDI/container identities, unavailable identities, or
-inventory-limit hits. This identifies a sufficient *review pool* for a
+inventory-limit hits. This identifies a sufficient _review pool_ for a
 consent-controlled, MIDI-only Vocal catalog expansion. It remains inventory
 evidence—not automatic approval, materialization, training, or deployment.
 
