@@ -44,6 +44,8 @@ const api = {
     groupId: string
     groupName: string
     strumGeneratedCount: number
+    packageLimitReached: boolean
+    directoryLimitReached: boolean
     candidates: Array<{
       candidateId: string
       groupId: string
@@ -61,8 +63,78 @@ const api = {
     }>
   } | null> => ipcRenderer.invoke('dataset:choosePackageFolder'),
 
-  removeDatasetPackageGroup: (candidateIds: string[]): Promise<void> =>
-    ipcRenderer.invoke('dataset:removePackageGroup', candidateIds),
+  cancelDatasetPackageDiscovery: (): Promise<boolean> =>
+    ipcRenderer.invoke('dataset:cancelPackageDiscovery'),
+
+  removeDatasetPackageGroup: (candidateIds: string[], groupId?: string): Promise<void> =>
+    ipcRenderer.invoke('dataset:removePackageGroup', candidateIds, groupId),
+
+  inspectDatasetPackageGroup: (
+    groupId: string,
+    resumeCursor?: string
+  ): Promise<{
+    inventory: {
+      selectedPackageCount: number
+      inspectedPackageCount: number
+      packageLimitReachedCount: number
+      cancelled: boolean
+      readablePackageCount: number
+      readableHeaderCount: number
+      unreadablePackageCount: number
+      inspectedChartCount: number
+      validNotesMidiCount: number
+      invalidOrMissingNotesMidiCount: number
+      chartOnlyCount: number
+      exactExpertPartVocalsCount: number
+      duplicateMidiCount: number
+      duplicateContainerCount: number
+      containerIdentityUnavailableCount: number
+      decodeTimeoutCount: number
+      decodeFailureCount: number
+    } | null
+    /** Opaque main-owned resume capability, not a source identifier. */
+    resumeCursor: string | null
+    cursorRejected: boolean
+    reviewCandidates: Array<{
+      candidateId: string
+      groupId: string
+      kind: 'sng' | 'rb3con' | 'zip'
+      songCount: number
+      metadata: Record<string, string>
+      midiValid: true
+      instruments: Record<
+        string,
+        { status: 'present'; difficulties: string[]; trackNames: string[] }
+      >
+      trainingUse: 'review_required'
+      warnings: Array<{ code: string }>
+      isStrumGenerated: false
+      canonicalVocalMidi: boolean
+      duplicateMidi: boolean
+    }> | null
+  } | null> => ipcRenderer.invoke('dataset:inspectPackageGroup', groupId, resumeCursor),
+
+  cancelDatasetPackageInventory: (groupId: string): Promise<boolean> =>
+    ipcRenderer.invoke('dataset:cancelPackageInventory', groupId),
+
+  onDatasetPackageInventoryProgress: (
+    callback: (progress: {
+      processedPackageCount: number
+      completedPackageCount: number
+      totalPackageCount: number
+    }) => void
+  ): (() => void) => {
+    const listener = (
+      _event: Electron.IpcRendererEvent,
+      progress: {
+        processedPackageCount: number
+        completedPackageCount: number
+        totalPackageCount: number
+      }
+    ): void => callback(progress)
+    ipcRenderer.on('dataset:packageInventoryProgress', listener)
+    return () => ipcRenderer.removeListener('dataset:packageInventoryProgress', listener)
+  },
 
   onDatasetScanProgress: (
     callback: (progress: {
@@ -101,18 +173,16 @@ const api = {
   chooseDatasetCatalogParent: (): Promise<{
     parentId: string
     name: string
-    path: string
   } | null> => ipcRenderer.invoke('dataset:chooseCatalogParent'),
 
   useDefaultDatasetCatalogParent: (): Promise<{
     parentId: string
     name: string
-    path: string
   } | null> => ipcRenderer.invoke('dataset:useDefaultCatalogParent'),
 
   restoreDatasetCatalogParent: (
     parentId: string
-  ): Promise<{ parentId: string; name: string; path: string } | null> =>
+  ): Promise<{ parentId: string; name: string } | null> =>
     ipcRenderer.invoke('dataset:restoreCatalogParent', parentId),
 
   listDatasetCatalogs: (
@@ -128,6 +198,44 @@ const api = {
       externalRecordCount: number
     }>
   > => ipcRenderer.invoke('dataset:listCatalogs', parentId),
+
+  listDatasetCatalogHarmonyTargets: (
+    parentId: string,
+    catalogName: string
+  ): Promise<
+    Array<{
+      sourceId: string
+      label: string
+      tracks: Array<'HARM1' | 'HARM2' | 'HARM3'>
+      configuredTracks: Array<'HARM1' | 'HARM2' | 'HARM3'>
+    }>
+  > => ipcRenderer.invoke('dataset:listHarmonyTargets', parentId, catalogName),
+
+  chooseDatasetHarmonyAudio: (): Promise<{ selectionId: string; displayName: string } | null> =>
+    ipcRenderer.invoke('dataset:chooseHarmonyAudio'),
+
+  materializeDatasetHarmonySource: (options: {
+    parentId: string
+    catalogName: string
+    sourceId: string
+    trackName: 'HARM1' | 'HARM2' | 'HARM3'
+    sourceSelectionId: string
+    provenance:
+      | { kind: 'isolated_source_stem/v1'; attestationId: string }
+      | {
+          kind: 'isolated_separation_output/v1'
+          separator: {
+            id: string
+            version: string
+            modelSha256: string
+            configurationSha256: string
+          }
+        }
+  }): Promise<{
+    sourceId: string
+    trackName: 'HARM1' | 'HARM2' | 'HARM3'
+    configuredTracks: Array<'HARM1' | 'HARM2' | 'HARM3'>
+  }> => ipcRenderer.invoke('dataset:materializeHarmonySource', options),
 
   scanDatasetLibrary: (): Promise<
     Array<{
@@ -168,6 +276,22 @@ const api = {
     recordCount: number
     skipped: Array<{ reason: string }>
   }> => ipcRenderer.invoke('dataset:export', options),
+
+  /**
+   * Creates a new catalog revision from one already-reviewed package chart.
+   * The candidate ID is opaque; the renderer never receives package paths,
+   * hashes, entry locators, or asset bytes.
+   */
+  enrichSongSourceCatalogAudio: (options: {
+    candidateId: string
+    parentId: string
+    catalogName: string
+    catalogId: string
+    sourceCatalogName: string
+  }): Promise<{
+    recordCount: number
+    skipped: Array<{ reason: string }>
+  }> => ipcRenderer.invoke('dataset:enrichCatalogAudio', options),
 
   getTrainingRuntime: (): Promise<{
     runtimeId: string

@@ -591,6 +591,19 @@
   margin-top: 2px;
   color: var(--text-secondary);
 }
+.dataset-package-actions {
+  display: flex;
+  gap: 8px;
+}
+.dataset-package-inventory {
+  padding: 7px 11px;
+  margin: 0;
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--bg-secondary) 68%, var(--bg-tertiary));
+  border-bottom: 1px solid var(--border-color);
+  font-size: 11px;
+  line-height: 1.45;
+}
 .dataset-song-list label.disabled {
   opacity: 0.55;
   cursor: not-allowed;
@@ -643,6 +656,37 @@
   background: var(--bg-tertiary);
   border: 1px solid var(--border-color);
   border-radius: 5px;
+}
+.dataset-harmony-sources {
+  display: grid;
+  grid-column: 1 / -1;
+  gap: 10px;
+  margin-top: 0;
+  padding: 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 7px;
+  background: var(--bg-secondary);
+}
+.dataset-harmony-sources label,
+.dataset-harmony-provenance label {
+  display: grid;
+  gap: 5px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+.dataset-harmony-sources input,
+.dataset-harmony-sources select {
+  min-width: 0;
+  padding: 8px 9px;
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+}
+.dataset-harmony-provenance {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
 }
 .dataset-output {
   display: flex;
@@ -892,6 +936,9 @@
   .dataset-details,
   .dataset-editor-fields,
   .training-learn-path {
+    grid-template-columns: 1fr;
+  }
+  .dataset-harmony-provenance {
     grid-template-columns: 1fr;
   }
   .dataset-curation-modal footer {

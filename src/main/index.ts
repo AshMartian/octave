@@ -58,15 +58,26 @@ import { packRb3con } from './conPacker'
 import { importSng } from './import/sngImporter'
 import { importCon } from './import/conImporter'
 import {
+  buildSongSourceCatalogAudioEnrichmentRevision,
   buildSongSourceCatalog,
+  listCatalogHarmonyTargets,
   listDatasetLibrarySongs,
   listSongSourceCatalogs,
+  materializeCatalogHarmonySource,
   summarizeDatasetSource,
-  summarizeDatasetSourceEntries,
   type DatasetCatalogSource,
   type DatasetSourceSummary,
   type SongSourceCatalogWriteMode
 } from './import/sngTrainingExporter'
+import {
+  getDatasetPackageInventorySessionReviewEntries,
+  getDatasetPackageInventorySessionResult,
+  isDatasetPackageInventorySessionComplete,
+  MAX_DATASET_PACKAGE_INVENTORY_DEADLINE_MS,
+  runDatasetPackageInventorySession
+} from './import/packageSourceInventory'
+import { discoverDatasetPackageSources } from './import/packageSourceDiscovery'
+import { PackageInventoryCursorStore } from './import/packageInventoryCursor'
 import {
   ImportCancelledError,
   PartialImportError,
@@ -129,14 +140,105 @@ app.on('before-quit', () => {
 // Track the currently opened project folder for path validation
 let allowedProjectPath: string | null = null
 const datasetSources = new Map<string, DatasetCatalogSource>()
+const datasetHarmonyAudioSources = new Map<string, { sourcePath: string }>()
+// Source locations remain private to main. A renderer holds only this opaque
+// group ID and can request an aggregate preparation inventory for it.
+const datasetPackageGroups = new Map<string, DatasetCatalogSource[]>()
+const datasetPackageCandidateGroups = new Map<string, string>()
+const completedDatasetPackageInventories = new Set<string>()
+const datasetPackageDiscoveryControllers = new Map<number, AbortController>()
+const datasetPackageInventoryControllers = new Map<string, AbortController>()
+const datasetPackageInventoryCursors = new PackageInventoryCursorStore()
 const datasetCatalogParents = new Map<string, string>()
 const approvedDatasetPackageIds = new Set<string>()
 const DATASET_CATALOG_PARENT_KEY = 'dataset-catalog-parent.json'
+
+function redactDatasetDisplayName(value: string): string {
+  const withoutControls = Array.from(value.normalize('NFKC'), (character) => {
+    const codePoint = character.codePointAt(0) ?? 0
+    return codePoint <= 0x1f || codePoint === 0x7f ? ' ' : character
+  }).join('')
+  const normalized = withoutControls
+    .replace(/(?:https?|smb|file):\/\/\S+/gi, '[redacted]')
+    .replace(/[\\/]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 128)
+  return normalized || 'Selected audio'
+}
 
 type DatasetCatalogParentBookmark = {
   parentId: string
   name: string
   path: string
+}
+
+type PackageReviewCandidateDto = {
+  candidateId: string
+  groupId: string
+  kind: 'sng' | 'rb3con' | 'zip'
+  songCount: number
+  metadata: Record<string, string>
+  midiValid: true
+  instruments: Record<string, { status: 'present'; difficulties: string[]; trackNames: string[] }>
+  trainingUse: 'review_required'
+  warnings: Array<{ code: string }>
+  isStrumGenerated: false
+  /** Safe filter only; actual track names, hashes, and locations stay private. */
+  canonicalVocalMidi: boolean
+  duplicateMidi: boolean
+}
+
+function clearPackageReviewCandidates(groupId: string): void {
+  for (const [candidateId, candidateGroupId] of datasetPackageCandidateGroups) {
+    if (candidateGroupId !== groupId) continue
+    datasetSources.delete(candidateId)
+    datasetPackageCandidateGroups.delete(candidateId)
+    approvedDatasetPackageIds.delete(candidateId)
+  }
+  completedDatasetPackageInventories.delete(groupId)
+}
+
+function createPackageReviewCandidates(
+  groupId: string,
+  entries: ReturnType<typeof getDatasetPackageInventorySessionReviewEntries>
+): PackageReviewCandidateDto[] {
+  clearPackageReviewCandidates(groupId)
+  return entries.map((entry) => {
+    const candidateId = randomUUID()
+    datasetSources.set(candidateId, {
+      ...entry.source,
+      entryId: entry.entryId,
+      packageReview: {
+        containerSha256: entry.containerSha256,
+        midiSha256: entry.midiSha256,
+        entryLocator: entry.entryLocator
+      }
+    })
+    datasetPackageCandidateGroups.set(candidateId, groupId)
+    return {
+      candidateId,
+      groupId,
+      kind: entry.source.kind as 'sng' | 'rb3con' | 'zip',
+      songCount: 1,
+      metadata: {},
+      midiValid: true,
+      instruments: (entry.exactExpertPartVocals
+        ? {
+            vocals: {
+              status: 'present',
+              difficulties: ['expert'],
+              trackNames: ['Canonical lead vocals']
+            }
+          }
+        : {}) as PackageReviewCandidateDto['instruments'],
+      trainingUse: 'review_required',
+      warnings: entry.duplicateMidi ? [{ code: 'duplicate_notes_midi' }] : [],
+      isStrumGenerated: false,
+      canonicalVocalMidi: entry.exactExpertPartVocals,
+      duplicateMidi: entry.duplicateMidi
+    }
+  })
 }
 
 function datasetCatalogParentBookmarkPath(): string {
@@ -149,18 +251,16 @@ async function rememberDatasetCatalogParent(
 ): Promise<{
   parentId: string
   name: string
-  path: string
 }> {
   const bookmark = { parentId: randomUUID(), name, path: parentPath }
   datasetCatalogParents.set(bookmark.parentId, bookmark.path)
   await writeFile(datasetCatalogParentBookmarkPath(), JSON.stringify(bookmark), 'utf8')
-  return { parentId: bookmark.parentId, name: bookmark.name, path: bookmark.path }
+  return { parentId: bookmark.parentId, name: bookmark.name }
 }
 
 async function restoreDatasetCatalogParent(parentId: string): Promise<{
   parentId: string
   name: string
-  path: string
 } | null> {
   try {
     const bookmark = JSON.parse(
@@ -169,7 +269,7 @@ async function restoreDatasetCatalogParent(parentId: string): Promise<{
     if (bookmark.parentId !== parentId) return null
     if (!(await stat(bookmark.path)).isDirectory()) return null
     datasetCatalogParents.set(bookmark.parentId, bookmark.path)
-    return { parentId: bookmark.parentId, name: bookmark.name, path: bookmark.path }
+    return { parentId: bookmark.parentId, name: bookmark.name }
   } catch {
     return null
   }
@@ -830,39 +930,6 @@ ipcMain.handle('dialog:openOutputFolder', async () => {
   return result.filePaths[0]
 })
 
-async function findDatasetPackages(
-  folderPath: string,
-  onDirectoryScanned: (directoryCount: number) => void
-): Promise<string[]> {
-  const packages: string[] = []
-  const pending = [resolve(folderPath)]
-  let directoryCount = 0
-  while (pending.length > 0) {
-    const current = pending.pop()!
-    const entries = await readdir(current, { withFileTypes: true })
-    directoryCount += 1
-    onDirectoryScanned(directoryCount)
-    await new Promise<void>((resolve) => setImmediate(resolve))
-    for (const entry of entries) {
-      const entryPath = join(current, entry.name)
-      if (entry.isDirectory()) {
-        pending.push(entryPath)
-        continue
-      }
-      if (!entry.isFile()) continue
-      const extension = pathExtname(entry.name)
-      if (
-        extension === '.sng' ||
-        extension === '.con' ||
-        extension === '.rb3con' ||
-        extension === '.zip'
-      )
-        packages.push(entryPath)
-    }
-  }
-  return packages.sort((left, right) => left.localeCompare(right))
-}
-
 function pathExtname(fileName: string): string {
   const index = fileName.lastIndexOf('.')
   return index === -1 ? '' : fileName.slice(index).toLowerCase()
@@ -874,22 +941,29 @@ ipcMain.handle('dataset:choosePackageFolder', async (event) => {
     title: 'Select Folder of .sng / .rb3con / .zip Packages'
   })
   if (result.canceled || result.filePaths.length === 0) return null
+  const controller = new AbortController()
+  datasetPackageDiscoveryControllers.set(event.sender.id, controller)
+  const abort = (): void => controller.abort()
+  event.sender.once('destroyed', abort)
   try {
-    const packagePaths = await findDatasetPackages(result.filePaths[0], (directoryCount) => {
-      event.sender.send('dataset:scanProgress', {
-        phase: 'discovering',
-        completed: directoryCount,
-        total: 0
-      })
+    const discovery = await discoverDatasetPackageSources(result.filePaths[0], {
+      signal: controller.signal,
+      onDirectoryScanned: (directoryCount) => {
+        event.sender.send('dataset:scanProgress', {
+          phase: 'discovering',
+          completed: directoryCount,
+          total: 0
+        })
+      }
     })
     const groupId = randomUUID()
+    const groupSources: DatasetCatalogSource[] = []
     const candidates: Array<{ candidateId: string; groupId: string } & DatasetSourceSummary> = []
-    let strumGeneratedCount = 0
-    for (const [index, packagePath] of packagePaths.entries()) {
+    for (const [index, packagePath] of discovery.packagePaths.entries()) {
       event.sender.send('dataset:scanProgress', {
         phase: 'inspecting',
         completed: index,
-        total: packagePaths.length
+        total: discovery.packagePaths.length
       })
       const source: DatasetCatalogSource = {
         kind:
@@ -900,36 +974,174 @@ ipcMain.handle('dataset:choosePackageFolder', async (event) => {
               : 'rb3con',
         sourcePath: resolve(packagePath)
       }
-      const summaries = await summarizeDatasetSourceEntries(source)
-      for (const summary of summaries) {
-        const candidateId = randomUUID()
-        datasetSources.set(candidateId, { ...source, entryId: summary.entryId })
-        candidates.push({ candidateId, groupId, ...summary })
-        if (summary.isStrumGenerated) strumGeneratedCount += 1
-      }
+      groupSources.push(source)
+      // Selecting a folder is deliberately stat-only discovery. Do not parse
+      // an arbitrary ZIP/SNG/STFS package merely to render a group. This
+      // opaque package candidate may be inventoried before the user opts in.
+      const candidateId = randomUUID()
+      datasetSources.set(candidateId, source)
+      datasetPackageCandidateGroups.set(candidateId, groupId)
+      candidates.push({
+        candidateId,
+        groupId,
+        kind: source.kind,
+        songCount: 0,
+        metadata: {},
+        midiValid: false,
+        instruments: {},
+        trainingUse: 'review_required',
+        warnings: [{ code: 'source_inventory_required' }],
+        isStrumGenerated: false
+      })
     }
     event.sender.send('dataset:scanProgress', {
       phase: 'inspecting',
-      completed: packagePaths.length,
-      total: packagePaths.length
+      completed: discovery.packagePaths.length,
+      total: discovery.packagePaths.length
     })
+    datasetPackageGroups.set(groupId, groupSources)
     return {
       groupId,
       groupName: basename(resolve(result.filePaths[0])),
       candidates,
-      strumGeneratedCount
+      strumGeneratedCount: 0,
+      packageLimitReached: discovery.packageLimitReached,
+      directoryLimitReached: discovery.directoryLimitReached
     }
   } catch {
     console.error('Dataset package scan failed.')
     return null
+  } finally {
+    event.sender.removeListener('destroyed', abort)
+    datasetPackageDiscoveryControllers.delete(event.sender.id)
   }
 })
 
-ipcMain.handle('dataset:removePackageGroup', (_event, groupCandidateIds: string[]) => {
-  for (const candidateId of groupCandidateIds) {
-    datasetSources.delete(candidateId)
-    approvedDatasetPackageIds.delete(candidateId)
+ipcMain.handle('dataset:cancelPackageDiscovery', (event) => {
+  const controller = datasetPackageDiscoveryControllers.get(event.sender.id)
+  if (!controller) return false
+  controller.abort()
+  return true
+})
+
+ipcMain.handle(
+  'dataset:removePackageGroup',
+  (_event, groupCandidateIds: string[], groupId?: string) => {
+    for (const candidateId of groupCandidateIds) {
+      datasetSources.delete(candidateId)
+      approvedDatasetPackageIds.delete(candidateId)
+      datasetPackageCandidateGroups.delete(candidateId)
+    }
+    if (groupId) {
+      datasetPackageInventoryControllers.get(groupId)?.abort()
+      datasetPackageGroups.delete(groupId)
+      clearPackageReviewCandidates(groupId)
+      datasetPackageInventoryCursors.clearGroup(groupId)
+      return
+    }
+    // Compatibility path for callers from an older preload: only forget a
+    // group when every one of its sources has lost all candidate references.
+    for (const [knownGroupId, sources] of datasetPackageGroups) {
+      const stillReferenced = sources.some((source) =>
+        [...datasetSources.values()].some(
+          (candidate) =>
+            candidate.sourcePath === source.sourcePath && candidate.kind === source.kind
+        )
+      )
+      if (!stillReferenced) {
+        datasetPackageInventoryControllers.get(knownGroupId)?.abort()
+        datasetPackageGroups.delete(knownGroupId)
+        clearPackageReviewCandidates(knownGroupId)
+        datasetPackageInventoryCursors.clearGroup(knownGroupId)
+      }
+    }
   }
+)
+
+ipcMain.handle(
+  'dataset:inspectPackageGroup',
+  async (_event, groupId: string, resumeCursor?: string) => {
+    const sources = datasetPackageGroups.get(groupId)
+    if (!sources || datasetPackageInventoryControllers.has(groupId)) return null
+    const cursorResolution = resumeCursor
+      ? datasetPackageInventoryCursors.resume(groupId, sources, resumeCursor)
+      : null
+    if (cursorResolution?.cursorRejected) {
+      // A token never selects a path. An absent, cross-group, or stale token is
+      // rejected generically and the renderer can start a fresh bounded run.
+      return { inventory: null, resumeCursor: null, cursorRejected: true }
+    }
+    const started = cursorResolution
+      ? { cursor: resumeCursor as string, session: cursorResolution.session }
+      : datasetPackageInventoryCursors.begin(groupId, sources)
+    if (!started.session) return { inventory: null, resumeCursor: null, cursorRejected: true }
+    // Starting a new inventory invalidates all review capabilities and any
+    // approval made from the prior snapshot. A resume retains its same session.
+    if (!cursorResolution) clearPackageReviewCandidates(groupId)
+    const controller = new AbortController()
+    datasetPackageInventoryControllers.set(groupId, controller)
+    const abort = (): void => controller.abort()
+    _event.sender.once('destroyed', abort)
+    try {
+      const inventory = await runDatasetPackageInventorySession(started.session, {
+        signal: controller.signal,
+        deadlineMs: MAX_DATASET_PACKAGE_INVENTORY_DEADLINE_MS,
+        onProgress: (progress) => {
+          // This event intentionally contains only aggregate counts. The
+          // renderer already owns the active opaque group; locations, source
+          // identifiers, entry names, hashes, buffers, and errors remain main/
+          // worker-local.
+          if (!_event.sender.isDestroyed()) {
+            _event.sender.send('dataset:packageInventoryProgress', progress)
+          }
+        }
+      })
+      // Group removal revokes both its cursor and active controller. Do not
+      // resurrect a removed group by writing completion state or returning a
+      // resume capability after its in-flight worker settles.
+      if (datasetPackageGroups.get(groupId) !== sources) {
+        datasetPackageInventoryCursors.complete(started.cursor)
+        return null
+      }
+      if (isDatasetPackageInventorySessionComplete(started.session)) {
+        const reviewCandidates = createPackageReviewCandidates(
+          groupId,
+          getDatasetPackageInventorySessionReviewEntries(started.session)
+        )
+        datasetPackageInventoryCursors.complete(started.cursor)
+        completedDatasetPackageInventories.add(groupId)
+        return {
+          inventory: getDatasetPackageInventorySessionResult(started.session),
+          resumeCursor: null,
+          cursorRejected: false,
+          reviewCandidates
+        }
+      }
+      return {
+        inventory,
+        resumeCursor: started.cursor,
+        cursorRejected: false,
+        reviewCandidates: null
+      }
+    } catch {
+      // The service is already aggregate-only. Keep IPC failures generic so a
+      // renderer never receives source paths or parser error details.
+      datasetPackageInventoryCursors.complete(started.cursor)
+      return null
+    } finally {
+      _event.sender.removeListener('destroyed', abort)
+      if (datasetPackageInventoryControllers.get(groupId) === controller) {
+        datasetPackageInventoryControllers.delete(groupId)
+      }
+    }
+  }
+)
+
+ipcMain.handle('dataset:cancelPackageInventory', (_event, groupId: string) => {
+  const controller = datasetPackageInventoryControllers.get(groupId)
+  if (!controller) return false
+  controller.abort()
+  return true
 })
 
 ipcMain.handle('dataset:chooseCatalogParent', async () => {
@@ -968,6 +1180,73 @@ ipcMain.handle('dataset:listCatalogs', async (_event, parentId: string) => {
     return []
   }
 })
+
+ipcMain.handle(
+  'dataset:listHarmonyTargets',
+  async (_event, parentId: string, catalogName: string) => {
+    const parentDir = datasetCatalogParents.get(parentId)
+    if (!parentDir) return []
+    try {
+      return await listCatalogHarmonyTargets(parentDir, catalogName)
+    } catch {
+      console.error('Catalog Harmony targets could not be listed.')
+      return []
+    }
+  }
+)
+
+ipcMain.handle('dataset:chooseHarmonyAudio', async () => {
+  const result = await dialog.showOpenDialog({
+    title: 'Select Isolated Harmony Stem or Pinned Separation Output',
+    properties: ['openFile'],
+    filters: [{ name: 'Audio', extensions: ['ogg', 'mp3', 'opus', 'wav', 'flac'] }]
+  })
+  if (result.canceled || result.filePaths.length === 0) return null
+  const sourcePath = resolve(result.filePaths[0])
+  const selectionId = randomUUID()
+  datasetHarmonyAudioSources.set(selectionId, { sourcePath })
+  return { selectionId, displayName: redactDatasetDisplayName(basename(sourcePath)) }
+})
+
+ipcMain.handle(
+  'dataset:materializeHarmonySource',
+  async (
+    _event,
+    options: {
+      parentId: string
+      catalogName: string
+      sourceId: string
+      trackName: 'HARM1' | 'HARM2' | 'HARM3'
+      sourceSelectionId: string
+      provenance:
+        | { kind: 'isolated_source_stem/v1'; attestationId: string }
+        | {
+            kind: 'isolated_separation_output/v1'
+            separator: {
+              id: string
+              version: string
+              modelSha256: string
+              configurationSha256: string
+            }
+          }
+    }
+  ) => {
+    const parentDir = datasetCatalogParents.get(options.parentId)
+    const source = datasetHarmonyAudioSources.get(options.sourceSelectionId)
+    if (!parentDir || !source)
+      throw new Error('Choose a Harmony audio source through Dataset Curation.')
+    const result = await materializeCatalogHarmonySource({
+      parentDir,
+      catalogName: options.catalogName,
+      sourceId: options.sourceId,
+      trackName: options.trackName,
+      sourceAudioPath: source.sourcePath,
+      provenance: options.provenance
+    })
+    datasetHarmonyAudioSources.delete(options.sourceSelectionId)
+    return result
+  }
+)
 
 ipcMain.handle('dataset:scanLibrary', async () => {
   if (!allowedProjectPath) return []
@@ -1008,7 +1287,9 @@ ipcMain.handle('dataset:setSongOptIn', async (_event, candidateId: string, opted
 
 ipcMain.handle('dataset:setPackageApproved', (_event, candidateId: string, approved: boolean) => {
   const source = datasetSources.get(candidateId)
-  if (!source || source.kind === 'octave-library') return false
+  if (!source || source.kind === 'octave-library' || !source.packageReview) return false
+  const groupId = datasetPackageCandidateGroups.get(candidateId)
+  if (!groupId || !completedDatasetPackageInventories.has(groupId)) return false
   if (approved) approvedDatasetPackageIds.add(candidateId)
   else approvedDatasetPackageIds.delete(candidateId)
   return true
@@ -1089,6 +1370,43 @@ ipcMain.handle(
       recordCount: result.recordCount,
       skipped: result.skipped
     }
+  }
+)
+
+ipcMain.handle(
+  'dataset:enrichCatalogAudio',
+  async (
+    event,
+    options: {
+      candidateId: string
+      parentId: string
+      catalogName: string
+      catalogId: string
+      sourceCatalogName: string
+    }
+  ) => {
+    const parentDir = datasetCatalogParents.get(options.parentId)
+    const source = datasetSources.get(options.candidateId)
+    if (!parentDir) throw new Error('Choose a catalog parent directory through Dataset Curation.')
+    if (
+      !source ||
+      source.kind === 'octave-library' ||
+      !source.packageReview ||
+      !approvedDatasetPackageIds.has(options.candidateId)
+    ) {
+      throw new Error('Review and explicitly approve one package chart before audio enrichment.')
+    }
+    event.sender.send('dataset:saveProgress', { phase: 'checking', completed: 0, total: 1 })
+    const result = await buildSongSourceCatalogAudioEnrichmentRevision({
+      source,
+      parentDir,
+      catalogName: options.catalogName,
+      catalogId: options.catalogId,
+      sourceCatalogName: options.sourceCatalogName,
+      octaveVersion: app.getVersion(),
+      onProgress: (progress) => event.sender.send('dataset:saveProgress', progress)
+    })
+    return { recordCount: result.recordCount, skipped: result.skipped }
   }
 )
 
@@ -2269,86 +2587,89 @@ ipcMain.handle('video:download-url', async (event, songPath: string, url: string
   // still rejected, force a refresh and retry once with the newer build.
   await ensureFreshYtDlp(pythonCmd)
 
-  const attemptDownload = (): Promise<{ success: boolean; filePath?: string; error?: string }> => new Promise((resolvePromise) => {
-    console.log('[yt-dlp] Starting download:', url)
-    const proc = execFile(
-      pythonCmd.command,
-      args,
-      { maxBuffer: 10 * 1024 * 1024 },
-      (error, stdout, stderr) => {
-        if (error) {
-          console.error('[yt-dlp] Error:', error.message)
-          console.error('[yt-dlp] stderr:', stderr)
-          resolvePromise({ success: false, error: error.message })
-          return
-        }
-        console.log('[yt-dlp] Done:', stdout.slice(-200))
-        // Locate the downloaded file, then (on Linux) transcode it to VP8/webm so
-        // YARG can actually decode it.
-        const finalize = async (downloadedPath: string): Promise<void> => {
-          if (!isLinux) {
-            resolvePromise({ success: true, filePath: downloadedPath })
+  const attemptDownload = (): Promise<{ success: boolean; filePath?: string; error?: string }> =>
+    new Promise((resolvePromise) => {
+      console.log('[yt-dlp] Starting download:', url)
+      const proc = execFile(
+        pythonCmd.command,
+        args,
+        { maxBuffer: 10 * 1024 * 1024 },
+        (error, stdout, stderr) => {
+          if (error) {
+            console.error('[yt-dlp] Error:', error.message)
+            console.error('[yt-dlp] stderr:', stderr)
+            resolvePromise({ success: false, error: error.message })
             return
           }
-          try {
-            event.sender.send('video:download-progress', 99)
-            const webmPath = await transcodeVideoToVp8Webm(downloadedPath, songPath)
-            resolvePromise({ success: true, filePath: webmPath })
-          } catch (err) {
-            console.error('[yt-dlp] Linux VP8 transcode failed:', err)
-            resolvePromise({
-              success: false,
-              error: `Video downloaded but could not be converted for Linux playback: ${err instanceof Error ? err.message : String(err)}`
-            })
+          console.log('[yt-dlp] Done:', stdout.slice(-200))
+          // Locate the downloaded file, then (on Linux) transcode it to VP8/webm so
+          // YARG can actually decode it.
+          const finalize = async (downloadedPath: string): Promise<void> => {
+            if (!isLinux) {
+              resolvePromise({ success: true, filePath: downloadedPath })
+              return
+            }
+            try {
+              event.sender.send('video:download-progress', 99)
+              const webmPath = await transcodeVideoToVp8Webm(downloadedPath, songPath)
+              resolvePromise({ success: true, filePath: webmPath })
+            } catch (err) {
+              console.error('[yt-dlp] Linux VP8 transcode failed:', err)
+              resolvePromise({
+                success: false,
+                error: `Video downloaded but could not be converted for Linux playback: ${err instanceof Error ? err.message : String(err)}`
+              })
+            }
+          }
+          // Find the output file (video.mp4 or similar)
+          const expectedPath = join(songPath, 'video.mp4')
+          if (existsSync(expectedPath)) {
+            void finalize(expectedPath)
+          } else {
+            // Look for any video.* file
+            readdir(songPath)
+              .then((entries) => {
+                const videoFile = entries.find(
+                  (e) => e.startsWith('video.') && !e.endsWith('.part')
+                )
+                if (videoFile) {
+                  void finalize(join(songPath, videoFile))
+                } else {
+                  resolvePromise({
+                    success: false,
+                    error: 'Download completed but output file not found'
+                  })
+                }
+              })
+              .catch(() =>
+                resolvePromise({ success: false, error: 'Could not read output directory' })
+              )
           }
         }
-        // Find the output file (video.mp4 or similar)
-        const expectedPath = join(songPath, 'video.mp4')
-        if (existsSync(expectedPath)) {
-          void finalize(expectedPath)
-        } else {
-          // Look for any video.* file
-          readdir(songPath)
-            .then((entries) => {
-              const videoFile = entries.find((e) => e.startsWith('video.') && !e.endsWith('.part'))
-              if (videoFile) {
-                void finalize(join(songPath, videoFile))
-              } else {
-                resolvePromise({
-                  success: false,
-                  error: 'Download completed but output file not found'
-                })
-              }
-            })
-            .catch(() =>
-              resolvePromise({ success: false, error: 'Could not read output directory' })
-            )
-        }
-      }
-    )
+      )
 
-    // Forward progress to renderer
-    if (proc.stderr) {
-      proc.stderr.on('data', (data: Buffer) => {
-        const line = data.toString()
-        const match = line.match(/(\d+\.?\d*)%/)
-        if (match) {
-          const percent = parseFloat(match[1])
-          event.sender.send('video:download-progress', percent)
-        }
-      })
-    }
-    if (proc.stdout) {
-      proc.stdout.on('data', (data: Buffer) => {
-        const line = data.toString()
-        const match = line.match(/(\d+\.?\d*)%/)
-        if (match) {
-          const percent = parseFloat(match[1])
-          event.sender.send('video:download-progress', percent)
-        }
-      })
-    }
-  })
+      // Forward progress to renderer
+      if (proc.stderr) {
+        proc.stderr.on('data', (data: Buffer) => {
+          const line = data.toString()
+          const match = line.match(/(\d+\.?\d*)%/)
+          if (match) {
+            const percent = parseFloat(match[1])
+            event.sender.send('video:download-progress', percent)
+          }
+        })
+      }
+      if (proc.stdout) {
+        proc.stdout.on('data', (data: Buffer) => {
+          const line = data.toString()
+          const match = line.match(/(\d+\.?\d*)%/)
+          if (match) {
+            const percent = parseFloat(match[1])
+            event.sender.send('video:download-progress', percent)
+          }
+        })
+      }
+    })
 
   let result = await attemptDownload()
   if (!result.success && result.error && isYtDlpBlockedError(result.error)) {
@@ -2361,8 +2682,9 @@ ipcMain.handle('video:download-url', async (event, songPath: string, url: string
       const versionNote = refresh.version ? ` (yt-dlp ${refresh.version})` : ''
       result = {
         ...result,
-        error: `${result.error}\n\nyt-dlp is already the newest available build${versionNote}. `
-          + 'YouTube may have changed something upstream has not fixed yet — try again later.'
+        error:
+          `${result.error}\n\nyt-dlp is already the newest available build${versionNote}. ` +
+          'YouTube may have changed something upstream has not fixed yet — try again later.'
       }
     }
   }

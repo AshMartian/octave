@@ -26,6 +26,9 @@ type SourceCandidate = {
   trainingUse: 'allowed' | 'review_required'
   warnings: Array<{ code: string }>
   isStrumGenerated?: boolean
+  /** A safe filter flag; original track names and package details stay private. */
+  canonicalVocalMidi?: boolean
+  duplicateMidi?: boolean
 }
 
 type CatalogSaveMode = 'create' | 'update' | 'clone'
@@ -50,11 +53,36 @@ type ExistingCatalog = {
 
 type PackageCandidate = SourceCandidate & { groupId: string }
 
+type PackageInventory = {
+  selectedPackageCount: number
+  inspectedPackageCount: number
+  packageLimitReachedCount: number
+  cancelled: boolean
+  readablePackageCount: number
+  readableHeaderCount: number
+  unreadablePackageCount: number
+  inspectedChartCount: number
+  validNotesMidiCount: number
+  invalidOrMissingNotesMidiCount: number
+  chartOnlyCount: number
+  exactExpertPartVocalsCount: number
+  duplicateMidiCount: number
+  duplicateContainerCount: number
+  containerIdentityUnavailableCount: number
+  decodeTimeoutCount: number
+  decodeFailureCount: number
+}
+
 type PackageGroup = {
   groupId: string
   groupName: string
   strumGeneratedCount: number
+  packageLimitReached: boolean
+  directoryLimitReached: boolean
   candidates: PackageCandidate[]
+  inventory?: PackageInventory
+  /** Opaque main-owned token returned only for a partial inventory. */
+  resumeCursor?: string
 }
 
 type TrainingRuntime = {
@@ -187,6 +215,17 @@ type TrainingPromotionResult = StrumPromotionJobResult & {
   artifactId?: string
   deploymentStatus?: 'ready' | 'not_deployable'
 }
+
+type HarmonyTrackName = 'HARM1' | 'HARM2' | 'HARM3'
+
+type HarmonyTarget = {
+  sourceId: string
+  label: string
+  tracks: HarmonyTrackName[]
+  configuredTracks: HarmonyTrackName[]
+}
+
+type HarmonyAudioSelection = { selectionId: string; displayName: string }
 
 const CATALOG_PARENT_STORAGE_KEY = 'octave.datasetCatalogParent'
 const TRAINING_LEARN_SEEN_STORAGE_KEY = 'octave.trainingLearnSeen'
@@ -492,11 +531,12 @@ export function TrainingModal({
   const [catalogParent, setCatalogParent] = useState<{
     parentId: string
     name: string
-    path: string
   } | null>(null)
   const [existingCatalogs, setExistingCatalogs] = useState<ExistingCatalog[]>([])
   const [selectedCatalog, setSelectedCatalog] = useState<ExistingCatalog | null>(null)
   const [saveMode, setSaveMode] = useState<CatalogSaveMode>('create')
+  /** Opaque reviewed-package capability used only for one audio revision. */
+  const [audioEnrichmentCandidateId, setAudioEnrichmentCandidateId] = useState<string | null>(null)
   const [activeStep, setActiveStep] = useState<TrainingStep>('learn')
   const [hasSeenLearn, setHasSeenLearn] = useState(
     () => localStorage.getItem(TRAINING_LEARN_SEEN_STORAGE_KEY) === 'true'
@@ -548,6 +588,13 @@ export function TrainingModal({
   const [discoveringCheckpoints, setDiscoveringCheckpoints] = useState(false)
   const [savingAutoChartProfile, setSavingAutoChartProfile] = useState(false)
   const [trainingJob, setTrainingJob] = useState<TrainingJob | null>(null)
+  const [inventoryingGroupId, setInventoryingGroupId] = useState<string | null>(null)
+  const [inventoryProgress, setInventoryProgress] = useState<{
+    processedPackageCount: number
+    completedPackageCount: number
+    totalPackageCount: number
+  } | null>(null)
+  const [showCanonicalVocalMidiOnly, setShowCanonicalVocalMidiOnly] = useState(false)
   const [prepareConfig, setPrepareConfig] = useState<Record<string, TrainingControlValue>>({})
   const [trainConfig, setTrainConfig] = useState<Record<string, TrainingControlValue>>({})
   const [parentArtifactId, setParentArtifactId] = useState('')
@@ -609,6 +656,22 @@ export function TrainingModal({
     [trainingRuns]
   )
 
+  const [harmonyTargets, setHarmonyTargets] = useState<HarmonyTarget[]>([])
+  const [harmonyTargetId, setHarmonyTargetId] = useState('')
+  const [harmonyTrackName, setHarmonyTrackName] = useState<HarmonyTrackName>('HARM1')
+  const [harmonyAudio, setHarmonyAudio] = useState<HarmonyAudioSelection | null>(null)
+  const [harmonyKind, setHarmonyKind] = useState<
+    'isolated_source_stem/v1' | 'isolated_separation_output/v1'
+  >('isolated_source_stem/v1')
+  const [harmonyAttestationId, setHarmonyAttestationId] = useState('')
+  const [separatorId, setSeparatorId] = useState('')
+  const [separatorVersion, setSeparatorVersion] = useState('')
+  const [separatorModelSha256, setSeparatorModelSha256] = useState('')
+  const [separatorConfigurationSha256, setSeparatorConfigurationSha256] = useState('')
+  const [harmonyLoading, setHarmonyLoading] = useState(false)
+  const [harmonySaving, setHarmonySaving] = useState(false)
+  const [harmonyMessage, setHarmonyMessage] = useState<string | null>(null)
+
   const refreshLibrary = useCallback(async (): Promise<void> => {
     setLoading(true)
     setError(null)
@@ -626,7 +689,7 @@ export function TrainingModal({
   }, [isOpen, refreshLibrary])
 
   useEffect(() => {
-    if (!isOpen || catalogParent?.path) return
+    if (!isOpen || catalogParent?.parentId) return
     const storedParentId = localStorage.getItem(CATALOG_PARENT_STORAGE_KEY)
     const restore = storedParentId
       ? window.api.restoreDatasetCatalogParent(storedParentId)
@@ -694,9 +757,11 @@ export function TrainingModal({
   useEffect(() => {
     const unsubscribeScan = window.api.onDatasetScanProgress(setScanProgress)
     const unsubscribeSave = window.api.onDatasetSaveProgress(setSaveProgress)
+    const unsubscribeInventory = window.api.onDatasetPackageInventoryProgress(setInventoryProgress)
     return () => {
       unsubscribeScan()
       unsubscribeSave()
+      unsubscribeInventory()
     }
   }, [])
 
@@ -864,6 +929,15 @@ export function TrainingModal({
       })
       return
     }
+    if (inventoryingGroupId) {
+      onActivityChange({
+        step: 'curate',
+        phase: 'Inventorying source packages',
+        completed: inventoryProgress?.processedPackageCount ?? 0,
+        total: inventoryProgress?.totalPackageCount ?? 0
+      })
+      return
+    }
     if (exporting) {
       onActivityChange({
         step: 'curate',
@@ -883,7 +957,47 @@ export function TrainingModal({
       return
     }
     onActivityChange(null)
-  }, [exporting, onActivityChange, saveProgress, scanProgress, scanningPackages, trainingJob])
+  }, [
+    exporting,
+    inventoryingGroupId,
+    inventoryProgress,
+    onActivityChange,
+    saveProgress,
+    scanProgress,
+    scanningPackages,
+    trainingJob
+  ])
+
+  useEffect(() => {
+    if (!catalogParent || !selectedCatalog) {
+      setHarmonyTargets([])
+      setHarmonyTargetId('')
+      return
+    }
+    let active = true
+    setHarmonyLoading(true)
+    setHarmonyMessage(null)
+    void window.api
+      .listDatasetCatalogHarmonyTargets(catalogParent.parentId, selectedCatalog.catalogName)
+      .then((targets) => {
+        if (!active) return
+        setHarmonyTargets(targets)
+        setHarmonyTargetId((current) =>
+          targets.some((target) => target.sourceId === current)
+            ? current
+            : (targets[0]?.sourceId ?? '')
+        )
+      })
+      .catch(() => {
+        if (active) setHarmonyMessage('Could not validate this catalog’s Harmony targets.')
+      })
+      .finally(() => {
+        if (active) setHarmonyLoading(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [catalogParent, selectedCatalog])
 
   const allowedLibrarySongs = useMemo(
     () => songs.filter((song) => song.trainingUse === 'allowed' && song.midiValid),
@@ -894,6 +1008,10 @@ export function TrainingModal({
   const packageCandidates = useMemo(
     () => packageGroups.flatMap((group) => group.candidates),
     [packageGroups]
+  )
+  const selectedPackageCandidates = useMemo(
+    () => packageCandidates.filter((candidate) => selectedPackages.has(candidate.candidateId)),
+    [packageCandidates, selectedPackages]
   )
   const allLibrarySongsSelected =
     selectableLibrarySongs.length > 0 &&
@@ -973,9 +1091,14 @@ export function TrainingModal({
     }
   }
 
+  const cancelPackageFolderScan = async (): Promise<void> => {
+    await window.api.cancelDatasetPackageDiscovery()
+  }
+
   const removePackageGroup = async (group: PackageGroup): Promise<void> => {
     await window.api.removeDatasetPackageGroup(
-      group.candidates.map((candidate) => candidate.candidateId)
+      group.candidates.map((candidate) => candidate.candidateId),
+      group.groupId
     )
     setPackageGroups((current) => current.filter((entry) => entry.groupId !== group.groupId))
     setSelectedPackages((current) => {
@@ -983,6 +1106,63 @@ export function TrainingModal({
       for (const candidate of group.candidates) next.delete(candidate.candidateId)
       return next
     })
+  }
+
+  const inventoryPackageGroup = async (group: PackageGroup): Promise<void> => {
+    setInventoryingGroupId(group.groupId)
+    setInventoryProgress({
+      processedPackageCount: 0,
+      completedPackageCount: 0,
+      totalPackageCount: group.candidates.length
+    })
+    setError(null)
+    try {
+      const response = await window.api.inspectDatasetPackageGroup(
+        group.groupId,
+        group.resumeCursor
+      )
+      if (!response) throw new Error('Package inventory unavailable')
+      if (response.cursorRejected) {
+        setPackageGroups((current) =>
+          current.map((entry) =>
+            entry.groupId === group.groupId ? { ...entry, resumeCursor: undefined } : entry
+          )
+        )
+        setError('The previous inventory cursor is no longer valid. Start a new inventory.')
+        return
+      }
+      const inventory = response.inventory
+      if (!inventory) throw new Error('Package inventory unavailable')
+      const resumeCursor = response.resumeCursor ?? undefined
+      setPackageGroups((current) =>
+        current.map((entry) =>
+          entry.groupId === group.groupId
+            ? {
+                ...entry,
+                inventory,
+                resumeCursor,
+                candidates: response.reviewCandidates ?? entry.candidates
+              }
+            : entry
+        )
+      )
+      if (response.reviewCandidates) {
+        setSelectedPackages((current) => {
+          const next = new Set(current)
+          for (const candidate of group.candidates) next.delete(candidate.candidateId)
+          return next
+        })
+      }
+    } catch {
+      setError('Could not inventory the selected package sources.')
+    } finally {
+      setInventoryingGroupId(null)
+      setInventoryProgress(null)
+    }
+  }
+
+  const cancelPackageInventory = async (groupId: string): Promise<void> => {
+    await window.api.cancelDatasetPackageInventory(groupId)
   }
 
   const togglePackage = async (candidate: SourceCandidate): Promise<void> => {
@@ -1019,6 +1199,7 @@ export function TrainingModal({
   const chooseExistingCatalog = (catalog: ExistingCatalog): void => {
     setSelectedCatalog(catalog)
     setSaveMode('update')
+    setAudioEnrichmentCandidateId(null)
     setCatalogName(catalog.catalogName)
     setCatalogId(catalog.catalogId)
     setProvenance(catalog.provenance)
@@ -1028,13 +1209,71 @@ export function TrainingModal({
   const startNewCatalog = (): void => {
     setSelectedCatalog(null)
     setSaveMode('create')
+    setAudioEnrichmentCandidateId(null)
   }
 
   const cloneCatalogRevision = (): void => {
     if (!selectedCatalog) return
     setSaveMode('clone')
+    setAudioEnrichmentCandidateId(null)
     setCatalogName(`${selectedCatalog.catalogName}-revision`)
     setCatalogId(`${selectedCatalog.catalogId}-revision`)
+  }
+
+  const beginAudioEnrichmentRevision = (): void => {
+    if (!selectedCatalog || selectedPackageCandidates.length !== 1) {
+      setError('Select exactly one reviewed package chart to create an audio-enriched revision.')
+      return
+    }
+    setError(null)
+    setSaveMode('clone')
+    setAudioEnrichmentCandidateId(selectedPackageCandidates[0].candidateId)
+    setCatalogName(`${selectedCatalog.catalogName}-audio-revision`)
+    setCatalogId(`${selectedCatalog.catalogId}-audio-revision`)
+  }
+
+  const buildAudioEnrichmentRevision = async (): Promise<void> => {
+    if (!catalogParent || !selectedCatalog || !audioEnrichmentCandidateId) {
+      setError('Select a catalog and one reviewed package chart before audio enrichment.')
+      return
+    }
+    const effectiveCatalogName = catalogName.trim()
+    const effectiveCatalogId = catalogId.trim()
+    if (!effectiveCatalogName || !effectiveCatalogId) {
+      setError('Catalog ID and revision name are required.')
+      return
+    }
+    setExporting(true)
+    setSaveProgress({ phase: 'checking', completed: 0, total: 1 })
+    setError(null)
+    setResult(null)
+    try {
+      const response = await window.api.enrichSongSourceCatalogAudio({
+        candidateId: audioEnrichmentCandidateId,
+        parentId: catalogParent.parentId,
+        catalogName: effectiveCatalogName,
+        catalogId: effectiveCatalogId,
+        sourceCatalogName: selectedCatalog.catalogName
+      })
+      const refreshedCatalogs = await window.api.listDatasetCatalogs(catalogParent.parentId)
+      setExistingCatalogs(refreshedCatalogs)
+      const savedCatalog = refreshedCatalogs.find(
+        (catalog) => catalog.catalogName === effectiveCatalogName
+      )
+      if (!savedCatalog) throw new Error('Audio revision was not published.')
+      setResult({ records: response.recordCount, skipped: response.skipped.length })
+      setSelectedCatalog(savedCatalog)
+      setAudioEnrichmentCandidateId(null)
+      setSaveMode('update')
+      setActiveStep('prepare')
+    } catch {
+      setError(
+        'Audio revision was not published. The selected chart may have changed, not match this catalog, or have unsupported audio.'
+      )
+    } finally {
+      setExporting(false)
+      setSaveProgress(null)
+    }
   }
 
   const buildCatalog = async (catalogToUpdate?: ExistingCatalog): Promise<void> => {
@@ -1286,47 +1525,120 @@ export function TrainingModal({
     return null
   }
 
-  const renderCandidate = (candidate: SourceCandidate, selectable: boolean): React.JSX.Element => (
-    <label className={!candidate.midiValid ? 'disabled' : ''} key={candidate.candidateId}>
-      <input
-        type="checkbox"
-        checked={
-          selectable
-            ? selectedPackages.has(candidate.candidateId)
-            : candidate.trainingUse === 'allowed'
-        }
-        disabled={!candidate.midiValid || exporting}
-        onChange={() => {
-          if (selectable) {
-            void togglePackage(candidate)
-          } else {
-            void toggleSong(candidate)
+  const selectedHarmonyTarget = harmonyTargets.find((target) => target.sourceId === harmonyTargetId)
+
+  const chooseHarmonyAudio = async (): Promise<void> => {
+    const selected = await window.api.chooseDatasetHarmonyAudio()
+    if (selected) setHarmonyAudio(selected)
+  }
+
+  const materializeHarmonySource = async (): Promise<void> => {
+    if (!catalogParent || !selectedCatalog || !selectedHarmonyTarget || !harmonyAudio) {
+      setHarmonyMessage('Select a catalog HARM track and an explicit isolated audio source.')
+      return
+    }
+    if (!selectedHarmonyTarget.tracks.includes(harmonyTrackName)) {
+      setHarmonyMessage('The selected catalog source does not contain that exact HARM track.')
+      return
+    }
+    const provenance =
+      harmonyKind === 'isolated_source_stem/v1'
+        ? { kind: harmonyKind, attestationId: harmonyAttestationId.trim() }
+        : {
+            kind: harmonyKind,
+            separator: {
+              id: separatorId.trim(),
+              version: separatorVersion.trim(),
+              modelSha256: separatorModelSha256.trim(),
+              configurationSha256: separatorConfigurationSha256.trim()
+            }
           }
-        }}
-      />
-      {!selectable && (
-        <DatasetArtwork candidateId={candidate.candidateId} label={candidateLabel(candidate)} />
-      )}
-      <span>
-        <strong>{candidateLabel(candidate)}</strong>
-        <small>
-          {candidate.kind} · {candidate.midiValid ? 'valid MIDI' : 'invalid MIDI'} ·{' '}
-          {selectable
-            ? candidate.isStrumGenerated
-              ? 'STRUM charted · select to explicitly include'
-              : 'available for review'
-            : candidate.trainingUse.replace('_', ' ')}
-          {!selectable && candidate.isStrumGenerated ? ' · STRUM generated' : ''}
-          {Object.entries(candidate.instruments)
-            .map(([instrument, coverage]) => `${instrument}: ${coverage.difficulties.join('/')}`)
-            .join(', ')}
-          {candidate.warnings.length
-            ? ` · ${candidate.warnings.map((warning) => warning.code).join(', ')}`
-            : ''}
-        </small>
-      </span>
-    </label>
-  )
+    setHarmonySaving(true)
+    setHarmonyMessage(null)
+    try {
+      const response = await window.api.materializeDatasetHarmonySource({
+        parentId: catalogParent.parentId,
+        catalogName: selectedCatalog.catalogName,
+        sourceId: selectedHarmonyTarget.sourceId,
+        trackName: harmonyTrackName,
+        sourceSelectionId: harmonyAudio.selectionId,
+        provenance
+      })
+      setHarmonyTargets((current) =>
+        current.map((target) =>
+          target.sourceId === response.sourceId
+            ? { ...target, configuredTracks: response.configuredTracks }
+            : target
+        )
+      )
+      setHarmonyAudio(null)
+      setHarmonyMessage(`${response.trackName} was materialized with explicit provenance.`)
+    } catch {
+      setHarmonyMessage('Harmony materialization failed. Verify the selected asset and provenance.')
+    } finally {
+      setHarmonySaving(false)
+    }
+  }
+
+  const renderCandidate = (candidate: SourceCandidate, selectable: boolean): React.JSX.Element => {
+    const packageCandidate = candidate as Partial<PackageCandidate>
+    const packageInventory = packageCandidate.groupId
+      ? packageGroups.find((group) => group.groupId === packageCandidate.groupId)?.inventory
+      : undefined
+    const packageReady = Boolean(packageInventory && !packageInventory.cancelled)
+    const disabled = selectable ? !packageReady : !candidate.midiValid
+    return (
+      <label className={disabled ? 'disabled' : ''} key={candidate.candidateId}>
+        <input
+          type="checkbox"
+          checked={
+            selectable
+              ? selectedPackages.has(candidate.candidateId)
+              : candidate.trainingUse === 'allowed'
+          }
+          disabled={disabled || exporting}
+          onChange={() => {
+            if (selectable) {
+              void togglePackage(candidate)
+            } else {
+              void toggleSong(candidate)
+            }
+          }}
+        />
+        {!selectable && (
+          <DatasetArtwork candidateId={candidate.candidateId} label={candidateLabel(candidate)} />
+        )}
+        <span>
+          <strong>{candidateLabel(candidate)}</strong>
+          <small>
+            {candidate.kind} ·{' '}
+            {selectable
+              ? packageReady
+                ? 'inventory complete'
+                : 'inventory required'
+              : candidate.midiValid
+                ? 'valid MIDI'
+                : 'invalid MIDI'}{' '}
+            ·{' '}
+            {selectable
+              ? candidate.isStrumGenerated
+                ? 'STRUM charted · select to explicitly include'
+                : candidate.canonicalVocalMidi
+                  ? 'canonical Vocal MIDI · select to explicitly include'
+                  : 'MIDI-backed · select to explicitly include'
+              : candidate.trainingUse.replace('_', ' ')}
+            {!selectable && candidate.isStrumGenerated ? ' · STRUM generated' : ''}
+            {Object.entries(candidate.instruments)
+              .map(([instrument, coverage]) => `${instrument}: ${coverage.difficulties.join('/')}`)
+              .join(', ')}
+            {candidate.warnings.length
+              ? ` · ${candidate.warnings.map((warning) => warning.code).join(', ')}`
+              : ''}
+          </small>
+        </span>
+      </label>
+    )
+  }
 
   return (
     <div className="dataset-curation-overlay" onClick={onClose}>
@@ -1460,7 +1772,7 @@ export function TrainingModal({
                   Catalog parent
                   <div className="dataset-output">
                     <input
-                      value={catalogParent?.path ?? catalogParent?.name ?? ''}
+                      value={catalogParent?.name ?? ''}
                       readOnly
                       placeholder="Preparing Catalog Parent"
                     />
@@ -1480,14 +1792,35 @@ export function TrainingModal({
                       </button>
                     )}
                     {saveMode === 'clone' && (
-                      <button onClick={() => void buildCatalog()} disabled={exporting}>
-                        <span aria-hidden="true">⎇</span> Create revision
-                      </button>
+                      <>
+                        {!audioEnrichmentCandidateId && (
+                          <button onClick={() => void buildCatalog()} disabled={exporting}>
+                            <span aria-hidden="true">⎇</span> Create revision
+                          </button>
+                        )}
+                        {audioEnrichmentCandidateId && (
+                          <button
+                            onClick={() => void buildAudioEnrichmentRevision()}
+                            disabled={exporting}
+                          >
+                            <span aria-hidden="true">♫</span> Create audio revision
+                          </button>
+                        )}
+                      </>
                     )}
                     {selectedCatalog && (
-                      <button onClick={cloneCatalogRevision} disabled={exporting}>
-                        <span aria-hidden="true">⎇</span> Clone as revision
-                      </button>
+                      <>
+                        <button onClick={cloneCatalogRevision} disabled={exporting}>
+                          <span aria-hidden="true">⎇</span> Clone as revision
+                        </button>
+                        <button
+                          onClick={beginAudioEnrichmentRevision}
+                          disabled={exporting || selectedPackageCandidates.length !== 1}
+                          title="Select exactly one reviewed package chart, then create a new revision with only its matching audio roles."
+                        >
+                          <span aria-hidden="true">♫</span> Audio-enrich revision
+                        </button>
+                      </>
                     )}
                   </div>
                   {existingCatalogs.map((catalog) => {
@@ -1529,7 +1862,177 @@ export function TrainingModal({
                     action.
                   </p>
                 ) : null}
+                {audioEnrichmentCandidateId ? (
+                  <p className="dataset-message">
+                    This creates a new revision only. OCTAVE verifies the reviewed chart’s MIDI hash
+                    and snapshot, then replaces or adds matching audio roles without changing the
+                    chart, source ID, or record-level rights.
+                  </p>
+                ) : null}
                 <div className="dataset-editor-fields">
+                  {selectedCatalog && (
+                    <section className="dataset-section dataset-harmony-sources">
+                      <div className="dataset-section-heading">
+                        <div>
+                          <h3>Vocal Harmony sources</h3>
+                          <p>
+                            Add only an explicit isolated <code>HARM1</code>, <code>HARM2</code>, or{' '}
+                            <code>HARM3</code> source. OCTAVE never substitutes shared vocals or the
+                            mix.
+                          </p>
+                        </div>
+                      </div>
+                      {harmonyLoading ? (
+                        <p className="dataset-empty">Validating catalog HARM tracks…</p>
+                      ) : harmonyTargets.length === 0 ? (
+                        <p className="dataset-empty">
+                          No allowed catalog records with exact HARM1, HARM2, or HARM3 MIDI tracks
+                          are available.
+                        </p>
+                      ) : (
+                        <>
+                          <label>
+                            Catalog source
+                            <select
+                              value={harmonyTargetId}
+                              disabled={harmonySaving || exporting}
+                              onChange={(event) => {
+                                const sourceId = event.target.value
+                                const target = harmonyTargets.find(
+                                  (entry) => entry.sourceId === sourceId
+                                )
+                                setHarmonyTargetId(sourceId)
+                                if (target && !target.tracks.includes(harmonyTrackName)) {
+                                  setHarmonyTrackName(target.tracks[0])
+                                }
+                              }}
+                            >
+                              {harmonyTargets.map((target) => (
+                                <option key={target.sourceId} value={target.sourceId}>
+                                  {target.label}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <label>
+                            Exact MIDI target
+                            <select
+                              value={harmonyTrackName}
+                              disabled={harmonySaving || exporting}
+                              onChange={(event) =>
+                                setHarmonyTrackName(event.target.value as HarmonyTrackName)
+                              }
+                            >
+                              {(selectedHarmonyTarget?.tracks ?? []).map((track) => (
+                                <option key={track} value={track}>
+                                  {track}
+                                  {selectedHarmonyTarget?.configuredTracks.includes(track)
+                                    ? ' (configured)'
+                                    : ''}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <label>
+                            Isolation provenance
+                            <select
+                              value={harmonyKind}
+                              disabled={harmonySaving || exporting}
+                              onChange={(event) =>
+                                setHarmonyKind(
+                                  event.target.value as
+                                    | 'isolated_source_stem/v1'
+                                    | 'isolated_separation_output/v1'
+                                )
+                              }
+                            >
+                              <option value="isolated_source_stem/v1">
+                                Original isolated source stem
+                              </option>
+                              <option value="isolated_separation_output/v1">
+                                Pinned separation output
+                              </option>
+                            </select>
+                          </label>
+                          {harmonyKind === 'isolated_source_stem/v1' ? (
+                            <label>
+                              Stem attestation ID
+                              <input
+                                value={harmonyAttestationId}
+                                disabled={harmonySaving || exporting}
+                                onChange={(event) => setHarmonyAttestationId(event.target.value)}
+                                placeholder="licensed-stem-001"
+                              />
+                            </label>
+                          ) : (
+                            <div className="dataset-harmony-provenance">
+                              <label>
+                                Separator ID
+                                <input
+                                  value={separatorId}
+                                  disabled={harmonySaving || exporting}
+                                  onChange={(event) => setSeparatorId(event.target.value)}
+                                  placeholder="demucs"
+                                />
+                              </label>
+                              <label>
+                                Separator version
+                                <input
+                                  value={separatorVersion}
+                                  disabled={harmonySaving || exporting}
+                                  onChange={(event) => setSeparatorVersion(event.target.value)}
+                                  placeholder="v4"
+                                />
+                              </label>
+                              <label>
+                                Model SHA-256
+                                <input
+                                  value={separatorModelSha256}
+                                  disabled={harmonySaving || exporting}
+                                  onChange={(event) => setSeparatorModelSha256(event.target.value)}
+                                  placeholder="64-character SHA-256"
+                                />
+                              </label>
+                              <label>
+                                Configuration SHA-256
+                                <input
+                                  value={separatorConfigurationSha256}
+                                  disabled={harmonySaving || exporting}
+                                  onChange={(event) =>
+                                    setSeparatorConfigurationSha256(event.target.value)
+                                  }
+                                  placeholder="64-character SHA-256"
+                                />
+                              </label>
+                            </div>
+                          )}
+                          <div className="dataset-output">
+                            <input
+                              value={harmonyAudio?.displayName ?? ''}
+                              readOnly
+                              placeholder="No audio selected"
+                            />
+                            <button
+                              onClick={() => void chooseHarmonyAudio()}
+                              disabled={harmonySaving || exporting}
+                            >
+                              Choose audio
+                            </button>
+                          </div>
+                          <button
+                            onClick={() => void materializeHarmonySource()}
+                            disabled={harmonySaving || exporting || !harmonyAudio}
+                          >
+                            {harmonySaving
+                              ? 'Materializing…'
+                              : 'Materialize explicit Harmony source'}
+                          </button>
+                        </>
+                      )}
+                      {harmonyMessage && <p className="dataset-message">{harmonyMessage}</p>}
+                    </section>
+                  )}
+
                   <label>
                     Catalog ID
                     <input
@@ -1628,15 +2131,27 @@ export function TrainingModal({
                     </p>
                   </div>
                   <button
-                    aria-label={scanningPackages ? 'Scanning package folder' : 'Add package folder'}
+                    aria-label={
+                      scanningPackages ? 'Cancel package folder scan' : 'Add package folder'
+                    }
                     className="dataset-icon-button"
-                    onClick={() => void addPackageFolder()}
-                    disabled={exporting || scanningPackages}
-                    title={scanningPackages ? 'Scanning package folder' : 'Add package folder'}
+                    onClick={() =>
+                      void (scanningPackages ? cancelPackageFolderScan() : addPackageFolder())
+                    }
+                    disabled={exporting}
+                    title={scanningPackages ? 'Cancel package folder scan' : 'Add package folder'}
                   >
                     <span className={scanningPackages ? 'dataset-spin' : ''} aria-hidden="true">
-                      {scanningPackages ? '↻' : '＋'}
+                      {scanningPackages ? '×' : '＋'}
                     </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowCanonicalVocalMidiOnly((current) => !current)}
+                    disabled={exporting || packageCandidates.length === 0}
+                    aria-pressed={showCanonicalVocalMidiOnly}
+                  >
+                    {showCanonicalVocalMidiOnly ? 'Show all MIDI' : 'Canonical Vocal MIDI'}
                   </button>
                 </div>
                 <div className="dataset-package-list">
@@ -1646,20 +2161,73 @@ export function TrainingModal({
                         <div>
                           <strong>{group.groupName}</strong>
                           <small>
-                            {group.candidates.length} songs
+                            {group.candidates.length} package sources · inventory before approval
                             {group.strumGeneratedCount
                               ? ` · ${group.strumGeneratedCount} STRUM-charted; select individually to include`
                               : ''}
+                            {group.packageLimitReached ? ' · package discovery limit reached' : ''}
+                            {group.directoryLimitReached
+                              ? ' · directory discovery limit reached'
+                              : ''}
                           </small>
                         </div>
-                        <button
-                          onClick={() => void removePackageGroup(group)}
-                          disabled={exporting || scanningPackages}
-                        >
-                          Remove
-                        </button>
+                        <div className="dataset-package-actions">
+                          <button
+                            className="dataset-secondary"
+                            onClick={() =>
+                              void (inventoryingGroupId === group.groupId
+                                ? cancelPackageInventory(group.groupId)
+                                : inventoryPackageGroup(group))
+                            }
+                            disabled={
+                              exporting ||
+                              scanningPackages ||
+                              (inventoryingGroupId !== null &&
+                                inventoryingGroupId !== group.groupId)
+                            }
+                          >
+                            {inventoryingGroupId === group.groupId
+                              ? 'Cancel inventory'
+                              : group.resumeCursor
+                                ? 'Resume inventory'
+                                : 'Inventory'}
+                          </button>
+                          <button
+                            onClick={() => void removePackageGroup(group)}
+                            disabled={
+                              exporting || scanningPackages || inventoryingGroupId === group.groupId
+                            }
+                          >
+                            Remove
+                          </button>
+                        </div>
                       </header>
-                      {group.candidates.map((entry) => renderCandidate(entry, true))}
+                      {group.inventory && (
+                        <p className="dataset-package-inventory" aria-live="polite">
+                          {group.inventory.inspectedPackageCount}/
+                          {group.inventory.selectedPackageCount} completed ·{' '}
+                          {group.inventory.validNotesMidiCount} valid MIDI ·{' '}
+                          {group.inventory.chartOnlyCount} chart-only ·{' '}
+                          {group.inventory.invalidOrMissingNotesMidiCount} invalid/missing MIDI ·{' '}
+                          {group.inventory.exactExpertPartVocalsCount} exact Expert Vocals ·{' '}
+                          {group.inventory.duplicateMidiCount} duplicate MIDI ·{' '}
+                          {group.inventory.duplicateContainerCount} duplicate containers
+                          {group.inventory.cancelled ? ' · cancelled; counts are partial' : ''}
+                          {group.inventory.decodeTimeoutCount || group.inventory.decodeFailureCount
+                            ? ` · ${group.inventory.decodeTimeoutCount} timed out · ${group.inventory.decodeFailureCount} failed`
+                            : ''}
+                        </p>
+                      )}
+                      {inventoryingGroupId === group.groupId && (
+                        <p className="dataset-package-inventory" aria-live="polite">
+                          Inventorying — {inventoryProgress?.processedPackageCount ?? 0}/{' '}
+                          {inventoryProgress?.totalPackageCount ?? group.candidates.length} settled
+                          · {inventoryProgress?.completedPackageCount ?? 0} completed
+                        </p>
+                      )}
+                      {group.candidates
+                        .filter((entry) => !showCanonicalVocalMidiOnly || entry.canonicalVocalMidi)
+                        .map((entry) => renderCandidate(entry, true))}
                     </section>
                   ))}
                   {!scanningPackages && packageGroups.length === 0 && (

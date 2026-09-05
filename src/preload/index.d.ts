@@ -31,6 +31,8 @@ interface ChartEditorAPI {
     groupId: string
     groupName: string
     strumGeneratedCount: number
+    packageLimitReached: boolean
+    directoryLimitReached: boolean
     candidates: Array<{
       candidateId: string
       groupId: string
@@ -47,7 +49,59 @@ interface ChartEditorAPI {
       isStrumGenerated: boolean
     }>
   } | null>
-  removeDatasetPackageGroup: (candidateIds: string[]) => Promise<void>
+  cancelDatasetPackageDiscovery: () => Promise<boolean>
+  removeDatasetPackageGroup: (candidateIds: string[], groupId?: string) => Promise<void>
+  inspectDatasetPackageGroup: (
+    groupId: string,
+    resumeCursor?: string
+  ) => Promise<{
+    inventory: {
+      selectedPackageCount: number
+      inspectedPackageCount: number
+      packageLimitReachedCount: number
+      cancelled: boolean
+      readablePackageCount: number
+      readableHeaderCount: number
+      unreadablePackageCount: number
+      inspectedChartCount: number
+      validNotesMidiCount: number
+      invalidOrMissingNotesMidiCount: number
+      chartOnlyCount: number
+      exactExpertPartVocalsCount: number
+      duplicateMidiCount: number
+      duplicateContainerCount: number
+      containerIdentityUnavailableCount: number
+      decodeTimeoutCount: number
+      decodeFailureCount: number
+    } | null
+    resumeCursor: string | null
+    cursorRejected: boolean
+    reviewCandidates: Array<{
+      candidateId: string
+      groupId: string
+      kind: 'sng' | 'rb3con' | 'zip'
+      songCount: number
+      metadata: Record<string, string>
+      midiValid: true
+      instruments: Record<
+        string,
+        { status: 'present'; difficulties: string[]; trackNames: string[] }
+      >
+      trainingUse: 'review_required'
+      warnings: Array<{ code: string }>
+      isStrumGenerated: false
+      canonicalVocalMidi: boolean
+      duplicateMidi: boolean
+    }> | null
+  } | null>
+  cancelDatasetPackageInventory: (groupId: string) => Promise<boolean>
+  onDatasetPackageInventoryProgress: (
+    callback: (progress: {
+      processedPackageCount: number
+      completedPackageCount: number
+      totalPackageCount: number
+    }) => void
+  ) => () => void
   onDatasetScanProgress: (
     callback: (progress: {
       phase: 'discovering' | 'inspecting'
@@ -62,15 +116,14 @@ interface ChartEditorAPI {
       total: number
     }) => void
   ) => () => void
-  chooseDatasetCatalogParent: () => Promise<{ parentId: string; name: string; path: string } | null>
+  chooseDatasetCatalogParent: () => Promise<{ parentId: string; name: string } | null>
   useDefaultDatasetCatalogParent: () => Promise<{
     parentId: string
     name: string
-    path: string
   } | null>
   restoreDatasetCatalogParent: (
     parentId: string
-  ) => Promise<{ parentId: string; name: string; path: string } | null>
+  ) => Promise<{ parentId: string; name: string } | null>
   listDatasetCatalogs: (parentId: string) => Promise<
     Array<{
       catalogName: string
@@ -82,6 +135,40 @@ interface ChartEditorAPI {
       externalRecordCount: number
     }>
   >
+  listDatasetCatalogHarmonyTargets: (
+    parentId: string,
+    catalogName: string
+  ) => Promise<
+    Array<{
+      sourceId: string
+      label: string
+      tracks: Array<'HARM1' | 'HARM2' | 'HARM3'>
+      configuredTracks: Array<'HARM1' | 'HARM2' | 'HARM3'>
+    }>
+  >
+  chooseDatasetHarmonyAudio: () => Promise<{ selectionId: string; displayName: string } | null>
+  materializeDatasetHarmonySource: (options: {
+    parentId: string
+    catalogName: string
+    sourceId: string
+    trackName: 'HARM1' | 'HARM2' | 'HARM3'
+    sourceSelectionId: string
+    provenance:
+      | { kind: 'isolated_source_stem/v1'; attestationId: string }
+      | {
+          kind: 'isolated_separation_output/v1'
+          separator: {
+            id: string
+            version: string
+            modelSha256: string
+            configurationSha256: string
+          }
+        }
+  }) => Promise<{
+    sourceId: string
+    trackName: 'HARM1' | 'HARM2' | 'HARM3'
+    configuredTracks: Array<'HARM1' | 'HARM2' | 'HARM3'>
+  }>
   scanDatasetLibrary: () => Promise<
     Array<{
       candidateId: string
@@ -110,6 +197,17 @@ interface ChartEditorAPI {
     license: string
     mode: 'create' | 'update' | 'clone'
     sourceCatalogName?: string
+  }) => Promise<{
+    recordCount: number
+    skipped: Array<{ reason: string }>
+  }>
+  /** Opaque reviewed package candidate only; source details remain in main. */
+  enrichSongSourceCatalogAudio: (options: {
+    candidateId: string
+    parentId: string
+    catalogName: string
+    catalogId: string
+    sourceCatalogName: string
   }) => Promise<{
     recordCount: number
     skipped: Array<{ reason: string }>

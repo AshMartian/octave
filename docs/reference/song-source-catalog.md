@@ -14,6 +14,7 @@ The normative schema is [song-source-catalog.schema.json](./song-source-catalog.
 my-catalog/
 ├── catalog.json             # `octave-song-source-catalog/v1` manifest
 ├── records.jsonl            # one validated source record per song
+├── vocal-harmony-sources.json # optional HARM1/2/3 source-policy sidecar
 └── assets/
     └── sha256/<hash>/...    # OCTAVE-managed materialized MIDI/audio assets
 ```
@@ -123,6 +124,9 @@ perform these semantic checks before writing a record or returning a UI result:
 - Treat `audio` as a keyed role map. A record has at most one asset for each
   role, so STRUM can deterministically choose `audio.guitar`, `audio.vocals`,
   or `audio.mix`.
+- `audio.harm1`, `audio.harm2`, and `audio.harm3` are optional, explicitly
+  materialized isolated-source roles. They are never inferred from a file
+  name, `audio.vocals`, or `audio.mix`.
 - Require coverage consistency: `present` has non-empty difficulties and track
   names; `absent` and `unsupported` have neither. Display violations to the
   curator as a safe validation code, never as a raw source path.
@@ -156,6 +160,96 @@ importer or tokenization layer.
    marker at the destination.
 5. Hand STRUM the catalog directory. Do not hand it the original package paths
    or put those paths in renderer state, exported manifests, logs, or errors.
+
+### Vocal Harmony source policy
+
+Harmony is deliberately a separate curation operation on an existing allowed
+catalog record. The editor first decodes the managed `notes.mid` and offers
+only exact `HARM1`, `HARM2`, or `HARM3` tracks. The user selects an audio file
+through a trusted main-process dialog; the renderer receives only an opaque
+selection ID and a safe display name. OCTAVE materializes it as the matching
+`harm1`, `harm2`, or `harm3` asset and atomically writes
+`vocal-harmony-sources.json`.
+
+The sidecar is `octave-vocal-harmony-source-policy/v1`, path-free, and binds
+each `(source_id, HARM track)` to its matching asset identity. It requires one
+of two truthful provenance forms:
+
+- `isolated_source_stem/v1`: a same-master-timeline original-stem attestation
+  ID supplied by the curator.
+- `isolated_separation_output/v1`: the catalog's exact `audio.mix` asset ID
+  and hash plus separator ID, version, model SHA-256, and configuration
+  SHA-256.
+
+The sidecar includes the SHA-256 of canonical `catalog.json` plus the exact
+`records.jsonl` text. Any subsequent catalog change therefore invalidates a
+stale sidecar until OCTAVE rebuilds it. Existing rows are retained only after
+their assets, roles, provenance, source IDs, and current control hash validate
+again. OCTAVE rejects a selected Harmony file whose content hash equals the
+record's `mix` or shared `vocals` asset; it never performs separation, labels
+an unproven source as isolated, or falls back to shared vocals/mix.
+### Audio-enrichment revisions
+
+Audio enrichment is a separate, clone-only curation action for a reviewed
+package chart whose `notes.mid` already exists in a selected catalog. It is not
+an ordinary catalog update and cannot add a second record for the duplicate
+MIDI. The renderer submits one opaque reviewed candidate ID; OCTAVE's main
+process reopens a capped, no-follow package snapshot and verifies its container
+hash, selected entry locator, entry ID, and MIDI hash before any catalog work.
+
+OCTAVE then clones the selected catalog to a new destination on the same
+volume, finds exactly one record with that MIDI asset hash, and changes only
+the audio roles supplied by the reviewed candidate. The existing chart asset,
+source ID, import data, metadata, and record-level rights/provenance/license
+are preserved as values; only the matching record's audio role map is changed.
+The new manifest identifies itself as an `Audio enrichment revision in OCTAVE`
+while retaining the existing catalog license basis.
+
+Every alternate audio asset must have a supported extension and container
+signature, is materialized by content hash, and is revalidated before publish.
+Duplicate role filenames, an already-present same-role asset, an absent or
+invalid alternate asset, an ambiguous MIDI match, source replacement, and a
+mix/vocal pair that refers to the same bytes all fail the whole operation.
+Failures remove the staging revision and leave both the original catalog and
+the requested destination unchanged. STRUM still receives only the published
+catalog revision; it does not receive a package location or an enrichment API.
+
+### Preparation inventory
+
+Before selecting package-backed songs, Dataset Curation can run a bounded,
+main-process-only package inventory for the opaque folder selection. This is a
+preparation aid, not a converter or a curation decision. It returns aggregate
+counts only: readable package/header containers, valid and invalid/missing
+`notes.mid`, `notes.chart`-only inputs, exact canonical Expert Vocal lead
+availability, duplicate MIDI/container identities when a bounded hash was
+available, and timeout/failure totals. It never returns source locations,
+package entry names, metadata, hashes, parser errors, or candidate IDs.
+
+The inventory accepts only the package group selected through OCTAVE's trusted
+dialog. Folder discovery is an incremental, cancellable directory walk with
+package and directory limits; it does not open package contents. Each selected
+SNG, ZIP, or RB3CON is then inspected in a dedicated worker with a hard timeout.
+The worker itself opens one descriptor with no-follow and non-blocking guards,
+fstats it as a regular file, validates a 256 MiB cap, reads a stable bounded
+snapshot, hashes that snapshot, and parses only those bytes. Stable identity
+starts at worker open: a path may change after discovery but final symlinks,
+devices, and oversized containers fail closed, and later replacement cannot
+change the opened snapshot. ZIP and RB3CON inspection reads chart metadata
+only; it does not decrypt audio, transcode charts, materialize a catalog, or
+change rights, consent, selection, or catalog eligibility.
+
+ZIP inspection also caps both chart candidates and their aggregate decompressed
+`notes.mid` bytes. The worker parses that bounded data and returns only
+normalized chart validity, Vocal availability, and internal content-dedup
+signals to the main process; raw MIDI buffers never cross the worker boundary.
+
+Inventory counts are completed-result counts. `inspected`, `readable`, chart,
+identity, and duplicate totals advance only after a worker result; a completed
+safe refusal is reported as unreadable/failed. A cancellation or timeout is
+reported separately and does not inflate the completed package totals. “Exact
+Expert Vocals” means one literal `PART VOCALS` track with observed Vocal note
+labels; Vocal tracks do not use the five-lane difficulty bands, but catalog
+coverage records a present Vocal part as Expert.
 
 STRUM rejects a catalog without both root files, with a staging marker, or with
 any asset/hash validation failure. It never tries to repair an incomplete

@@ -1,18 +1,41 @@
+import { createHash } from 'crypto'
 import { existsSync } from 'fs'
-import { mkdir, readFile, readdir, rm, writeFile } from 'fs/promises'
+import {
+  chmod,
+  mkdir,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  symlink,
+  unlink,
+  utimes,
+  writeFile
+} from 'fs/promises'
+import { hostname } from 'os'
 import { join } from 'path'
 import AdmZip from 'adm-zip'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { packRb3con } from '../conPacker'
 import { packSng } from '../sngPacker'
 import {
+  buildSongSourceCatalogAudioEnrichmentRevision,
   buildSongSourceCatalog,
   exportSngTrainingMidi,
+  listCatalogHarmonyTargets,
   listDatasetLibrarySongs,
   listSongSourceCatalogs,
+  materializeCatalogHarmonySource,
+  setCatalogMutationTestHooksForTesting,
   summarizeDatasetSource,
   summarizeDatasetSourceEntries
 } from './sngTrainingExporter'
+import {
+  createDatasetPackageInventorySession,
+  getDatasetPackageInventorySessionReviewEntries,
+  runDatasetPackageInventorySession
+} from './packageSourceInventory'
+import { packageEntryIdentity } from './packageSourceIdentity'
 
 describe('exportSngTrainingMidi', () => {
   const testDir = join(__dirname, '../../../out/sng_training_exporter_test_temp')
@@ -39,6 +62,57 @@ describe('exportSngTrainingMidi', () => {
     track.writeUInt32BE(events.length, 4)
     events.copy(track, 8)
     return Buffer.concat([header, track])
+  }
+
+  function namedTracksMidi(trackNames: string[]): Buffer {
+    const tracks = trackNames.map((trackName) => {
+      const events = Buffer.concat([
+        Buffer.from([0x00, 0xff, 0x03, trackName.length]),
+        Buffer.from(trackName),
+        Buffer.from([0x00, 0x90, 0x3c, 0x40, 0x83, 0x60, 0x80, 0x3c, 0x00, 0x00, 0xff, 0x2f, 0x00])
+      ])
+      const track = Buffer.alloc(8 + events.length)
+      track.write('MTrk', 0)
+      track.writeUInt32BE(events.length, 4)
+      events.copy(track, 8)
+      return track
+    })
+    const header = Buffer.alloc(14)
+    header.write('MThd', 0)
+    header.writeUInt32BE(6, 4)
+    header.writeUInt16BE(1, 8)
+    header.writeUInt16BE(tracks.length, 10)
+    header.writeUInt16BE(480, 12)
+    return Buffer.concat([header, ...tracks])
+  }
+
+  async function localMutationOwnerInstance(): Promise<string> {
+    const bootId = (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim().toLowerCase()
+    return `boot:${bootId}`
+  }
+
+  async function writeMutationReservation(
+    path: string,
+    options: { ageMs?: number; ownerPid?: number; ownerInstance?: string } = {}
+  ): Promise<void> {
+    const ageMs = options.ageMs ?? 0
+    const ownerPid = options.ownerPid ?? process.pid
+    const ownerInstance = options.ownerInstance ?? (await localMutationOwnerInstance())
+    await writeFile(
+      path,
+      `${JSON.stringify({
+        format: 'octave-catalog-mutation-reservation/v2',
+        owner_id: 'test-mutation-owner',
+        owner_host: hostname(),
+        owner_instance: ownerInstance,
+        owner_pid: ownerPid,
+        created_at_ms: Date.now() - ageMs,
+        lease_duration_ms: 10 * 60 * 1000
+      })}\n`,
+      'utf8'
+    )
+    const timestamp = new Date(Date.now() - ageMs)
+    await utimes(path, timestamp, timestamp)
   }
 
   function emptySngPackage(): Buffer {
@@ -476,6 +550,120 @@ describe('exportSngTrainingMidi', () => {
     })
   })
 
+  it('materializes only a review-selected ZIP chart from its exact snapshot', async () => {
+    const archivePath = join(testDir, 'reviewed-shifted-order.zip')
+    const archive = new AdmZip()
+    // The inventory sees `z` when this chart-only entry appears first, while
+    // the legacy exporter used to enumerate MIDI entries in a different order.
+    archive.addFile('z/notes.chart', Buffer.from('[Song]\n{\n  Resolution = 192\n}\n'))
+    archive.addFile('a/notes.mid', guitarMidi('PART GUITAR'))
+    archive.addFile('a/song.ini', Buffer.from('[song]\nname = First MIDI\n'))
+    archive.addFile('z/notes.mid', guitarMidi('PART VOCALS'))
+    archive.addFile('z/song.ini', Buffer.from('[song]\nname = Reviewed Vocal\n'))
+    archive.writeZip(archivePath)
+
+    const session = createDatasetPackageInventorySession([{ kind: 'zip', sourcePath: archivePath }])
+    await runDatasetPackageInventorySession(session, {
+      inspectInIsolation: async () => {
+        const bytes = await readFile(archivePath)
+        const zip = new AdmZip(bytes)
+        // Use the real worker path in production; this focused seam verifies
+        // only the review-to-catalog identity binding below.
+        const entries = zip.getEntries()
+        const zMidi = entries.find((entry) => entry.entryName === 'z/notes.mid')?.getData()
+        const aMidi = entries.find((entry) => entry.entryName === 'a/notes.mid')?.getData()
+        if (!zMidi || !aMidi) throw new Error('fixture missing MIDI')
+        return {
+          outcome: 'inspected' as const,
+          containerHash: createHash('sha256').update(bytes).digest('hex'),
+          inspection: {
+            headerReadable: true,
+            charts: [
+              {
+                validNotesMidi: true,
+                hasChart: true,
+                exactExpertPartVocals: true,
+                midiHash: createHash('sha256').update(zMidi).digest('hex'),
+                entryLocator: 'z/'
+              },
+              {
+                validNotesMidi: true,
+                hasChart: false,
+                exactExpertPartVocals: false,
+                midiHash: createHash('sha256').update(aMidi).digest('hex'),
+                entryLocator: 'a/'
+              }
+            ]
+          }
+        }
+      }
+    })
+    const reviewed = getDatasetPackageInventorySessionReviewEntries(session).find(
+      (entry) => entry.entryLocator === 'z/'
+    )
+    if (!reviewed) throw new Error('Expected reviewed Vocal entry')
+    const parentDir = join(testDir, 'reviewed-shifted-parent')
+    await mkdir(parentDir, { recursive: true })
+    await buildSongSourceCatalog({
+      sources: [
+        {
+          ...reviewed.source,
+          entryId: reviewed.entryId,
+          packageReview: {
+            containerSha256: reviewed.containerSha256,
+            midiSha256: reviewed.midiSha256,
+            entryLocator: reviewed.entryLocator
+          }
+        }
+      ],
+      parentDir,
+      catalogName: 'reviewed-shifted',
+      catalogId: 'reviewed-shifted',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    const record = JSON.parse(
+      await readFile(join(parentDir, 'reviewed-shifted', 'records.jsonl'), 'utf8')
+    ) as { metadata: { name: string }; import: { container_sha256: string } }
+    expect(record.metadata.name).toBe('Reviewed Vocal')
+    expect(record.import.container_sha256).toBe(reviewed.containerSha256)
+
+    const replacementPath = join(testDir, 'reviewed-replacement.zip')
+    const replacement = new AdmZip()
+    replacement.addFile('z/notes.mid', guitarMidi('PART GUITAR'))
+    replacement.writeZip(replacementPath)
+    await unlink(archivePath)
+    await symlink(replacementPath, archivePath)
+    await expect(
+      buildSongSourceCatalog({
+        sources: [
+          {
+            ...reviewed.source,
+            entryId: reviewed.entryId,
+            packageReview: {
+              containerSha256: reviewed.containerSha256,
+              midiSha256: reviewed.midiSha256,
+              entryLocator: reviewed.entryLocator
+            }
+          }
+        ],
+        parentDir,
+        catalogName: 'reviewed-replaced',
+        catalogId: 'reviewed-replaced',
+        provenance: 'Reviewed',
+        license: 'test-only',
+        octaveVersion: 'test',
+        mode: 'clone',
+        sourceCatalogName: 'reviewed-shifted'
+      })
+    ).rejects.toThrow('reviewed package')
+    expect(existsSync(join(parentDir, 'reviewed-replaced'))).toBe(false)
+    expect(
+      JSON.parse(await readFile(join(parentDir, 'reviewed-shifted', 'records.jsonl'), 'utf8'))
+    ).toMatchObject({ metadata: { name: 'Reviewed Vocal' } })
+  })
+
   it('returns only a safe code for parser failures and cleans failed staging directories', async () => {
     const packagePath = join(testDir, 'private-broken-package.sng')
     const parentDir = join(testDir, 'catalog-failure-parent')
@@ -497,6 +685,270 @@ describe('exportSngTrainingMidi', () => {
       })
     ).rejects.toThrow('No valid source records')
     expect(await readdir(parentDir)).toEqual([])
+  })
+
+  it('creates a path-free audio-enrichment revision for a reviewed duplicate MIDI', async () => {
+    const parentDir = join(testDir, 'audio-enrichment-parent')
+    const catalogSong = join(testDir, 'audio-enrichment-catalog-song')
+    const packagePath = join(testDir, 'private-audio-enrichment-source.zip')
+    await mkdir(parentDir, { recursive: true })
+    await mkdir(catalogSong, { recursive: true })
+    const midi = guitarMidi()
+    await writeFile(join(catalogSong, 'notes.mid'), midi)
+    await writeFile(join(catalogSong, 'song.ogg'), Buffer.from('OggS original catalog mix'))
+    await writeFile(join(catalogSong, 'song.ini'), '[song]\ndataset_opt_in = true\n')
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: catalogSong }],
+      parentDir,
+      catalogName: 'base-catalog',
+      catalogId: 'base-catalog',
+      provenance: 'Original curator',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    const archive = new AdmZip()
+    archive.addFile('notes.mid', midi)
+    archive.addFile('song.ogg', Buffer.from('OggS alternate reviewed mix'))
+    archive.writeZip(packagePath)
+    const packageBytes = await readFile(packagePath)
+    const containerSha256 = createHash('sha256').update(packageBytes).digest('hex')
+    const midiSha256 = createHash('sha256').update(midi).digest('hex')
+    const source = {
+      kind: 'zip' as const,
+      sourcePath: packagePath,
+      entryId: packageEntryIdentity('zip', containerSha256, '', midiSha256),
+      packageReview: { containerSha256, midiSha256, entryLocator: '' }
+    }
+
+    const baseRecord = JSON.parse(
+      await readFile(join(parentDir, 'base-catalog', 'records.jsonl'), 'utf8')
+    ) as Record<string, unknown>
+    const result = await buildSongSourceCatalogAudioEnrichmentRevision({
+      source,
+      parentDir,
+      catalogName: 'base-catalog-audio-revision',
+      catalogId: 'base-catalog-audio-revision',
+      sourceCatalogName: 'base-catalog',
+      octaveVersion: 'test'
+    })
+    expect(result).toMatchObject({ recordCount: 1, skipped: [] })
+    const revisionPath = join(parentDir, 'base-catalog-audio-revision')
+    const revisionRecord = JSON.parse(
+      await readFile(join(revisionPath, 'records.jsonl'), 'utf8')
+    ) as Record<string, unknown>
+    const baseChart = baseRecord.chart as { notes_midi: { sha256: string } }
+    const revisionChart = revisionRecord.chart as { notes_midi: { sha256: string } }
+    const baseRights = baseRecord.rights
+    expect(revisionChart.notes_midi.sha256).toBe(baseChart.notes_midi.sha256)
+    expect(revisionRecord.rights).toEqual(baseRights)
+    expect(revisionRecord.source_id).toBe(baseRecord.source_id)
+    expect(revisionRecord.audio).not.toEqual(baseRecord.audio)
+    const baseMix = (baseRecord.audio as { mix: { relative_path: string } }).mix
+    expect(await readFile(join(parentDir, 'base-catalog', baseMix.relative_path), 'utf8')).toBe(
+      'OggS original catalog mix'
+    )
+    const serializedRevision = await readFile(join(revisionPath, 'records.jsonl'), 'utf8')
+    expect(serializedRevision).not.toContain(packagePath)
+    expect(serializedRevision).not.toContain(containerSha256)
+    expect(serializedRevision).not.toContain('private-audio-enrichment-source')
+    expect(JSON.parse(await readFile(join(revisionPath, 'catalog.json'), 'utf8'))).toMatchObject({
+      curation: { provenance: 'Audio enrichment revision in OCTAVE', license: 'test-only' }
+    })
+    await expect(
+      buildSongSourceCatalogAudioEnrichmentRevision({
+        source,
+        parentDir,
+        catalogName: 'duplicate-audio-revision',
+        catalogId: 'duplicate-audio-revision',
+        sourceCatalogName: 'base-catalog-audio-revision',
+        octaveVersion: 'test'
+      })
+    ).rejects.toThrow('duplicate audio already present')
+    expect(existsSync(join(parentDir, 'duplicate-audio-revision'))).toBe(false)
+  })
+
+  it('keeps an ordinary clone audio-identical when duplicate MIDI is skipped', async () => {
+    const parentDir = join(testDir, 'ordinary-clone-parent')
+    const songDir = join(testDir, 'ordinary-clone-song')
+    await mkdir(parentDir, { recursive: true })
+    await mkdir(songDir, { recursive: true })
+    await writeFile(join(songDir, 'notes.mid'), guitarMidi())
+    await writeFile(join(songDir, 'song.ogg'), Buffer.from('OggS unchanged base mix'))
+    await writeFile(join(songDir, 'song.ini'), '[song]\ndataset_opt_in = true\n')
+    const source = { kind: 'octave-library' as const, sourcePath: songDir }
+    await buildSongSourceCatalog({
+      sources: [source],
+      parentDir,
+      catalogName: 'ordinary-base',
+      catalogId: 'ordinary-base',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    await buildSongSourceCatalog({
+      sources: [source],
+      parentDir,
+      catalogName: 'ordinary-clone',
+      catalogId: 'ordinary-clone',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test',
+      mode: 'clone',
+      sourceCatalogName: 'ordinary-base'
+    })
+    const base = JSON.parse(
+      await readFile(join(parentDir, 'ordinary-base', 'records.jsonl'), 'utf8')
+    ) as { audio: unknown; chart: unknown }
+    const clone = JSON.parse(
+      await readFile(join(parentDir, 'ordinary-clone', 'records.jsonl'), 'utf8')
+    ) as { audio: unknown; chart: unknown }
+    expect(clone.audio).toEqual(base.audio)
+    expect(clone.chart).toEqual(base.chart)
+  })
+
+  it('fails closed for reviewed-source replacement, invalid alternate audio, and staged revision rollback', async () => {
+    const parentDir = join(testDir, 'audio-enrichment-rollback-parent')
+    const catalogSong = join(testDir, 'audio-enrichment-rollback-song')
+    const packagePath = join(testDir, 'audio-enrichment-rollback-source.zip')
+    await mkdir(parentDir, { recursive: true })
+    await mkdir(catalogSong, { recursive: true })
+    const midi = guitarMidi()
+    await writeFile(join(catalogSong, 'notes.mid'), midi)
+    await writeFile(join(catalogSong, 'song.ogg'), Buffer.from('OggS protected base mix'))
+    await writeFile(join(catalogSong, 'song.ini'), '[song]\ndataset_opt_in = true\n')
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: catalogSong }],
+      parentDir,
+      catalogName: 'rollback-base',
+      catalogId: 'rollback-base',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    const archive = new AdmZip()
+    archive.addFile('notes.mid', midi)
+    archive.addFile('song.ogg', Buffer.from('not a valid audio container'))
+    archive.writeZip(packagePath)
+    const packageBytes = await readFile(packagePath)
+    const containerSha256 = createHash('sha256').update(packageBytes).digest('hex')
+    const midiSha256 = createHash('sha256').update(midi).digest('hex')
+    const source = {
+      kind: 'zip' as const,
+      sourcePath: packagePath,
+      entryId: packageEntryIdentity('zip', containerSha256, '', midiSha256),
+      packageReview: { containerSha256, midiSha256, entryLocator: '' }
+    }
+    await expect(
+      buildSongSourceCatalogAudioEnrichmentRevision({
+        source,
+        parentDir,
+        catalogName: 'invalid-audio-revision',
+        catalogId: 'invalid-audio-revision',
+        sourceCatalogName: 'rollback-base',
+        octaveVersion: 'test'
+      })
+    ).rejects.toThrow('invalid alternate audio')
+    expect(existsSync(join(parentDir, 'invalid-audio-revision'))).toBe(false)
+    expect((await readdir(parentDir)).some((entry) => entry.includes('.staging-'))).toBe(false)
+
+    const replacement = new AdmZip()
+    replacement.addFile('notes.mid', guitarMidi('PART BASS'))
+    replacement.addFile('song.ogg', Buffer.from('OggS replacement'))
+    replacement.writeZip(packagePath)
+    await expect(
+      buildSongSourceCatalogAudioEnrichmentRevision({
+        source,
+        parentDir,
+        catalogName: 'replaced-source-revision',
+        catalogId: 'replaced-source-revision',
+        sourceCatalogName: 'rollback-base',
+        octaveVersion: 'test'
+      })
+    ).rejects.toThrow('Reviewed package changed')
+    expect(existsSync(join(parentDir, 'replaced-source-revision'))).toBe(false)
+    const rollbackRecord = JSON.parse(
+      await readFile(join(parentDir, 'rollback-base', 'records.jsonl'), 'utf8')
+    ) as { audio: { mix: { relative_path: string } } }
+    expect(
+      await readFile(
+        join(parentDir, 'rollback-base', rollbackRecord.audio.mix.relative_path),
+        'utf8'
+      )
+    ).toBe('OggS protected base mix')
+  })
+
+  it('rejects one reviewed alternate asset reused as both mix and vocals', async () => {
+    const parentDir = join(testDir, 'audio-enrichment-role-parent')
+    const catalogSong = join(testDir, 'audio-enrichment-role-song')
+    const packagePath = join(testDir, 'audio-enrichment-role-source.zip')
+    await mkdir(parentDir, { recursive: true })
+    await mkdir(catalogSong, { recursive: true })
+    const midi = guitarMidi()
+    await writeFile(join(catalogSong, 'notes.mid'), midi)
+    await writeFile(join(catalogSong, 'song.ini'), '[song]\ndataset_opt_in = true\n')
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: catalogSong }],
+      parentDir,
+      catalogName: 'role-base',
+      catalogId: 'role-base',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    const sharedAudio = Buffer.from('OggS shared role bytes')
+    const archive = new AdmZip()
+    archive.addFile('notes.mid', midi)
+    archive.addFile('song.ogg', sharedAudio)
+    archive.addFile('vocals.ogg', sharedAudio)
+    archive.writeZip(packagePath)
+    const packageBytes = await readFile(packagePath)
+    const containerSha256 = createHash('sha256').update(packageBytes).digest('hex')
+    const midiSha256 = createHash('sha256').update(midi).digest('hex')
+    await expect(
+      buildSongSourceCatalogAudioEnrichmentRevision({
+        source: {
+          kind: 'zip',
+          sourcePath: packagePath,
+          entryId: packageEntryIdentity('zip', containerSha256, '', midiSha256),
+          packageReview: { containerSha256, midiSha256, entryLocator: '' }
+        },
+        parentDir,
+        catalogName: 'role-revision',
+        catalogId: 'role-revision',
+        sourceCatalogName: 'role-base',
+        octaveVersion: 'test'
+      })
+    ).rejects.toThrow('reuses one audio asset for mix and vocals')
+    expect(existsSync(join(parentDir, 'role-revision'))).toBe(false)
+
+    const caseCollisionPath = join(testDir, 'audio-enrichment-case-collision.zip')
+    const caseCollision = new AdmZip()
+    caseCollision.addFile('notes.mid', midi)
+    caseCollision.addFile('song.ogg', Buffer.from('OggS lower-case mix'))
+    caseCollision.addFile('SONG.ogg', Buffer.from('OggS upper-case mix'))
+    caseCollision.writeZip(caseCollisionPath)
+    const caseCollisionBytes = await readFile(caseCollisionPath)
+    const caseCollisionHash = createHash('sha256').update(caseCollisionBytes).digest('hex')
+    await expect(
+      buildSongSourceCatalogAudioEnrichmentRevision({
+        source: {
+          kind: 'zip',
+          sourcePath: caseCollisionPath,
+          entryId: packageEntryIdentity('zip', caseCollisionHash, '', midiSha256),
+          packageReview: {
+            containerSha256: caseCollisionHash,
+            midiSha256,
+            entryLocator: ''
+          }
+        },
+        parentDir,
+        catalogName: 'case-collision-revision',
+        catalogId: 'case-collision-revision',
+        sourceCatalogName: 'role-base',
+        octaveVersion: 'test'
+      })
+    ).rejects.toThrow('Reviewed package changed')
+    expect(existsSync(join(parentDir, 'case-collision-revision'))).toBe(false)
   })
 
   it('refuses an existing empty catalog destination', async () => {
@@ -579,5 +1031,635 @@ describe('exportSngTrainingMidi', () => {
       sourceCatalogName: 'editable-catalog'
     })
     expect(clone).toMatchObject({ recordCount: 2 })
+  })
+
+  it('materializes only an explicit isolated HARM stem into a hash-bound policy sidecar', async () => {
+    const parentDir = join(testDir, 'harmony-stem-parent')
+    const songDir = join(testDir, 'harmony-stem-song')
+    const explicitStem = join(testDir, 'private-source-harm1.wav')
+    await mkdir(parentDir, { recursive: true })
+    await mkdir(songDir, { recursive: true })
+    await writeFile(join(songDir, 'notes.mid'), namedTracksMidi(['PART VOCALS', 'HARM1']))
+    await writeFile(join(songDir, 'song.ogg'), Buffer.from('catalog mix'))
+    await writeFile(join(songDir, 'vocals.ogg'), Buffer.from('catalog shared vocals'))
+    await writeFile(
+      join(songDir, 'song.ini'),
+      '[song]\nname = Harmony Song\nartist = Tester\ndataset_opt_in = true\n'
+    )
+    await writeFile(explicitStem, Buffer.from('isolated harm one'))
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: songDir }],
+      parentDir,
+      catalogName: 'harmony-stem-catalog',
+      catalogId: 'harmony-stem-catalog',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+
+    const initialTargets = await listCatalogHarmonyTargets(parentDir, 'harmony-stem-catalog')
+    expect(initialTargets).toEqual([
+      expect.objectContaining({ tracks: ['HARM1'], configuredTracks: [] })
+    ])
+    const sourceId = initialTargets[0].sourceId
+    await expect(
+      materializeCatalogHarmonySource({
+        parentDir,
+        catalogName: 'harmony-stem-catalog',
+        sourceId,
+        trackName: 'HARM1',
+        sourceAudioPath: explicitStem,
+        provenance: { kind: 'isolated_source_stem/v1', attestationId: 'licensed-stem-001' }
+      })
+    ).resolves.toEqual({ sourceId, trackName: 'HARM1', configuredTracks: ['HARM1'] })
+
+    const catalogRoot = join(parentDir, 'harmony-stem-catalog')
+    const record = JSON.parse(await readFile(join(catalogRoot, 'records.jsonl'), 'utf8')) as {
+      audio: { harm1: { relative_path: string; sha256: string; asset_id: string } }
+    }
+    expect(await readFile(join(catalogRoot, record.audio.harm1.relative_path))).toEqual(
+      Buffer.from('isolated harm one')
+    )
+    const policyText = await readFile(join(catalogRoot, 'vocal-harmony-sources.json'), 'utf8')
+    const policy = JSON.parse(policyText) as {
+      catalog_control_sha256: string
+      records: Array<{
+        track_name: string
+        audio: { role: string; sha256: string }
+        provenance: { kind: string }
+      }>
+    }
+    expect(policy.catalog_control_sha256).toMatch(/^[a-f0-9]{64}$/)
+    expect(policy.records).toEqual([
+      expect.objectContaining({
+        source_id: sourceId,
+        track_name: 'HARM1',
+        audio: expect.objectContaining({ role: 'harm1', sha256: record.audio.harm1.sha256 }),
+        provenance: expect.objectContaining({ kind: 'isolated_source_stem/v1' })
+      })
+    ])
+    expect(policyText).not.toContain(explicitStem)
+    expect((await listCatalogHarmonyTargets(parentDir, 'harmony-stem-catalog'))[0]).toMatchObject({
+      configuredTracks: ['HARM1']
+    })
+    await buildSongSourceCatalog({
+      sources: [],
+      parentDir,
+      catalogName: 'harmony-stem-catalog',
+      catalogId: 'ignored-for-update',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test',
+      mode: 'update'
+    })
+    await expect(
+      readFile(join(catalogRoot, 'vocal-harmony-sources.json'), 'utf8')
+    ).rejects.toThrow()
+  })
+
+  it('requires pinned catalog mix and separator identities for a separation output', async () => {
+    const parentDir = join(testDir, 'harmony-separation-parent')
+    const songDir = join(testDir, 'harmony-separation-song')
+    const separatedOutput = join(testDir, 'private-separated-harm2.flac')
+    await mkdir(parentDir, { recursive: true })
+    await mkdir(songDir, { recursive: true })
+    await writeFile(join(songDir, 'notes.mid'), namedTracksMidi(['PART VOCALS', 'HARM2']))
+    await writeFile(join(songDir, 'song.ogg'), Buffer.from('catalog separation mix'))
+    await writeFile(
+      join(songDir, 'song.ini'),
+      '[song]\nname = Separation Song\ndataset_opt_in = true\n'
+    )
+    await writeFile(separatedOutput, Buffer.from('isolated harm two'))
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: songDir }],
+      parentDir,
+      catalogName: 'harmony-separation-catalog',
+      catalogId: 'harmony-separation-catalog',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    const sourceId = (await listCatalogHarmonyTargets(parentDir, 'harmony-separation-catalog'))[0]
+      .sourceId
+    await materializeCatalogHarmonySource({
+      parentDir,
+      catalogName: 'harmony-separation-catalog',
+      sourceId,
+      trackName: 'HARM2',
+      sourceAudioPath: separatedOutput,
+      provenance: {
+        kind: 'isolated_separation_output/v1',
+        separator: {
+          id: 'demucs',
+          version: 'v4',
+          modelSha256: 'a'.repeat(64),
+          configurationSha256: 'b'.repeat(64)
+        }
+      }
+    })
+    const catalogRoot = join(parentDir, 'harmony-separation-catalog')
+    const record = JSON.parse(await readFile(join(catalogRoot, 'records.jsonl'), 'utf8')) as {
+      audio: { mix: { asset_id: string; sha256: string } }
+    }
+    const policy = JSON.parse(
+      await readFile(join(catalogRoot, 'vocal-harmony-sources.json'), 'utf8')
+    ) as {
+      records: Array<{
+        provenance: {
+          input: { asset_id: string; sha256: string }
+          separator: { model_sha256: string }
+        }
+      }>
+    }
+    expect(policy.records[0].provenance.input).toEqual({
+      asset_id: record.audio.mix.asset_id,
+      sha256: record.audio.mix.sha256
+    })
+    expect(policy.records[0].provenance.separator.model_sha256).toBe('a'.repeat(64))
+  })
+
+  it('refuses shared catalog mix or vocals as a Harmony source and leaves the catalog untouched', async () => {
+    const parentDir = join(testDir, 'harmony-no-fallback-parent')
+    const songDir = join(testDir, 'harmony-no-fallback-song')
+    await mkdir(parentDir, { recursive: true })
+    await mkdir(songDir, { recursive: true })
+    const sharedMix = Buffer.from('shared catalog mix')
+    await writeFile(join(songDir, 'notes.mid'), namedTracksMidi(['PART VOCALS', 'HARM3']))
+    await writeFile(join(songDir, 'song.ogg'), sharedMix)
+    await writeFile(join(songDir, 'vocals.ogg'), Buffer.from('shared catalog vocals'))
+    await writeFile(
+      join(songDir, 'song.ini'),
+      '[song]\nname = No Fallback\ndataset_opt_in = true\n'
+    )
+    const sharedSource = join(testDir, 'private-copy-of-mix.wav')
+    await writeFile(sharedSource, sharedMix)
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: songDir }],
+      parentDir,
+      catalogName: 'harmony-no-fallback-catalog',
+      catalogId: 'harmony-no-fallback-catalog',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    const catalogRoot = join(parentDir, 'harmony-no-fallback-catalog')
+    const before = await readFile(join(catalogRoot, 'records.jsonl'), 'utf8')
+    const sourceId = (await listCatalogHarmonyTargets(parentDir, 'harmony-no-fallback-catalog'))[0]
+      .sourceId
+    await expect(
+      materializeCatalogHarmonySource({
+        parentDir,
+        catalogName: 'harmony-no-fallback-catalog',
+        sourceId,
+        trackName: 'HARM3',
+        sourceAudioPath: sharedSource,
+        provenance: { kind: 'isolated_source_stem/v1', attestationId: 'not-a-fallback' }
+      })
+    ).rejects.toThrow('must not duplicate')
+    expect(await readFile(join(catalogRoot, 'records.jsonl'), 'utf8')).toBe(before)
+    await expect(
+      readFile(join(catalogRoot, 'vocal-harmony-sources.json'), 'utf8')
+    ).rejects.toThrow()
+  })
+
+  it('keeps moved, deleted, and unreadable Harmony selections path-safe', async () => {
+    const parentDir = join(testDir, 'harmony-private-source-errors-parent')
+    const songDir = join(testDir, 'harmony-private-source-errors-song')
+    await mkdir(parentDir, { recursive: true })
+    await mkdir(songDir, { recursive: true })
+    await writeFile(join(songDir, 'notes.mid'), namedTracksMidi(['PART VOCALS', 'HARM1']))
+    await writeFile(
+      join(songDir, 'song.ini'),
+      '[song]\nname = Private source test\ndataset_opt_in = true\n'
+    )
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: songDir }],
+      parentDir,
+      catalogName: 'harmony-private-source-errors',
+      catalogId: 'harmony-private-source-errors',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    const sourceId = (
+      await listCatalogHarmonyTargets(parentDir, 'harmony-private-source-errors')
+    )[0].sourceId
+    const materialize = async (sourceAudioPath: string): Promise<Error> => {
+      try {
+        await materializeCatalogHarmonySource({
+          parentDir,
+          catalogName: 'harmony-private-source-errors',
+          sourceId,
+          trackName: 'HARM1',
+          sourceAudioPath,
+          provenance: { kind: 'isolated_source_stem/v1', attestationId: 'private-source-test' }
+        })
+      } catch (error) {
+        expect(error).toBeInstanceOf(Error)
+        return error as Error
+      }
+      throw new Error('Expected Harmony materialization to reject the selected source.')
+    }
+    const expectUnavailable = async (sourceAudioPath: string): Promise<void> => {
+      const error = await materialize(sourceAudioPath)
+      expect(error.message).toBe('Selected Harmony audio is unavailable or unsupported.')
+      expect(error.message).not.toContain(sourceAudioPath)
+      expect(error.message).not.toContain('private-harmony-source')
+    }
+
+    const deleted = join(testDir, 'private-harmony-source-deleted.wav')
+    await writeFile(deleted, 'deleted audio')
+    await rm(deleted)
+    await expectUnavailable(deleted)
+
+    const moved = join(testDir, 'private-harmony-source-moved.wav')
+    await writeFile(moved, 'moved audio')
+    await rename(moved, join(testDir, 'moved-private-harmony-source.wav'))
+    await expectUnavailable(moved)
+
+    const unreadable = join(testDir, 'private-harmony-source-unreadable.wav')
+    await writeFile(unreadable, 'unreadable audio')
+    await chmod(unreadable, 0o000)
+    try {
+      await expectUnavailable(unreadable)
+    } finally {
+      await chmod(unreadable, 0o600)
+    }
+  })
+
+  it('rejects a selected Harmony symlink without revealing its private target', async () => {
+    const parentDir = join(testDir, 'harmony-symlink-parent')
+    const songDir = join(testDir, 'harmony-symlink-song')
+    const privateTarget = join(testDir, 'private-harmony-target.wav')
+    const selectedLink = join(testDir, 'selected-harmony-link.wav')
+    await mkdir(parentDir, { recursive: true })
+    await mkdir(songDir, { recursive: true })
+    await writeFile(join(songDir, 'notes.mid'), namedTracksMidi(['PART VOCALS', 'HARM1']))
+    await writeFile(
+      join(songDir, 'song.ini'),
+      '[song]\nname = Symlink source\ndataset_opt_in = true\n'
+    )
+    await writeFile(privateTarget, 'isolated but private harmony')
+    await symlink(privateTarget, selectedLink)
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: songDir }],
+      parentDir,
+      catalogName: 'harmony-symlink-catalog',
+      catalogId: 'harmony-symlink-catalog',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    const sourceId = (await listCatalogHarmonyTargets(parentDir, 'harmony-symlink-catalog'))[0]
+      .sourceId
+    let error: Error | undefined
+    try {
+      await materializeCatalogHarmonySource({
+        parentDir,
+        catalogName: 'harmony-symlink-catalog',
+        sourceId,
+        trackName: 'HARM1',
+        sourceAudioPath: selectedLink,
+        provenance: { kind: 'isolated_source_stem/v1', attestationId: 'symlink-test' }
+      })
+    } catch (reason) {
+      error = reason as Error
+    }
+    expect(error?.message).toBe('Selected Harmony audio is unavailable or unsupported.')
+    expect(error?.message).not.toContain(privateTarget)
+    expect(error?.message).not.toContain(selectedLink)
+  })
+
+  it('recovers an expired valid mutation lease while preserving a live lease', async () => {
+    const parentDir = join(testDir, 'harmony-lease-parent')
+    const songDir = join(testDir, 'harmony-lease-song')
+    const harmonySource = join(testDir, 'private-harmony-lease.wav')
+    await mkdir(parentDir, { recursive: true })
+    await mkdir(songDir, { recursive: true })
+    await writeFile(join(songDir, 'notes.mid'), namedTracksMidi(['PART VOCALS', 'HARM1']))
+    await writeFile(join(songDir, 'song.ini'), '[song]\nname = Lease\ndataset_opt_in = true\n')
+    await writeFile(harmonySource, 'isolated harmony lease')
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: songDir }],
+      parentDir,
+      catalogName: 'harmony-lease-catalog',
+      catalogId: 'harmony-lease-catalog',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    const sourceId = (await listCatalogHarmonyTargets(parentDir, 'harmony-lease-catalog'))[0]
+      .sourceId
+    const reservationPath = join(parentDir, '.harmony-lease-catalog.mutation-reservation')
+    await writeMutationReservation(reservationPath)
+    await expect(
+      materializeCatalogHarmonySource({
+        parentDir,
+        catalogName: 'harmony-lease-catalog',
+        sourceId,
+        trackName: 'HARM1',
+        sourceAudioPath: harmonySource,
+        provenance: { kind: 'isolated_source_stem/v1', attestationId: 'live-lease' }
+      })
+    ).rejects.toThrow('A catalog mutation with that name is already in progress.')
+    await rm(reservationPath, { force: true })
+
+    await writeMutationReservation(reservationPath, {
+      ageMs: 11 * 60 * 1000,
+      // Linux PID values are bounded well below this and kill(..., 0) reports
+      // ESRCH, proving this is a crash-stale lease rather than a live owner.
+      ownerPid: 2 ** 31 - 1
+    })
+    await expect(
+      materializeCatalogHarmonySource({
+        parentDir,
+        catalogName: 'harmony-lease-catalog',
+        sourceId,
+        trackName: 'HARM1',
+        sourceAudioPath: harmonySource,
+        provenance: { kind: 'isolated_source_stem/v1', attestationId: 'expired-lease' }
+      })
+    ).resolves.toMatchObject({ sourceId, trackName: 'HARM1', configuredTracks: ['HARM1'] })
+  })
+
+  it('does not reclaim an expired lease when its hostname matches but its boot instance differs', async () => {
+    const parentDir = join(testDir, 'harmony-remote-owner-parent')
+    const songDir = join(testDir, 'harmony-remote-owner-song')
+    const harmonySource = join(testDir, 'private-harmony-remote-owner.wav')
+    await mkdir(parentDir, { recursive: true })
+    await mkdir(songDir, { recursive: true })
+    await writeFile(join(songDir, 'notes.mid'), namedTracksMidi(['PART VOCALS', 'HARM1']))
+    await writeFile(
+      join(songDir, 'song.ini'),
+      '[song]\nname = Remote owner\ndataset_opt_in = true\n'
+    )
+    await writeFile(harmonySource, 'isolated harmony remote owner')
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: songDir }],
+      parentDir,
+      catalogName: 'harmony-remote-owner-catalog',
+      catalogId: 'harmony-remote-owner-catalog',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    const sourceId = (await listCatalogHarmonyTargets(parentDir, 'harmony-remote-owner-catalog'))[0]
+      .sourceId
+    const reservationPath = join(parentDir, '.harmony-remote-owner-catalog.mutation-reservation')
+    await writeMutationReservation(reservationPath, {
+      ageMs: 11 * 60 * 1000,
+      ownerPid: 2 ** 31 - 1,
+      ownerInstance: 'boot:00000000-0000-0000-0000-000000000000'
+    })
+    try {
+      await expect(
+        materializeCatalogHarmonySource({
+          parentDir,
+          catalogName: 'harmony-remote-owner-catalog',
+          sourceId,
+          trackName: 'HARM1',
+          sourceAudioPath: harmonySource,
+          provenance: { kind: 'isolated_source_stem/v1', attestationId: 'remote-owner' }
+        })
+      ).rejects.toThrow('A catalog mutation with that name is already in progress.')
+    } finally {
+      await rm(reservationPath, { force: true })
+    }
+  })
+
+  it('serializes competing stale recovery until the new owner has acquired its reservation', async () => {
+    const parentDir = join(testDir, 'harmony-recovery-race-parent')
+    const songDir = join(testDir, 'harmony-recovery-race-song')
+    const harmonySource = join(testDir, 'private-harmony-recovery-race.wav')
+    await mkdir(parentDir, { recursive: true })
+    await mkdir(songDir, { recursive: true })
+    await writeFile(join(songDir, 'notes.mid'), namedTracksMidi(['PART VOCALS', 'HARM1']))
+    await writeFile(
+      join(songDir, 'song.ini'),
+      '[song]\nname = Recovery race\ndataset_opt_in = true\n'
+    )
+    await writeFile(harmonySource, 'isolated harmony recovery race')
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: songDir }],
+      parentDir,
+      catalogName: 'harmony-recovery-race-catalog',
+      catalogId: 'harmony-recovery-race-catalog',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    const sourceId = (
+      await listCatalogHarmonyTargets(parentDir, 'harmony-recovery-race-catalog')
+    )[0].sourceId
+    const reservationPath = join(parentDir, '.harmony-recovery-race-catalog.mutation-reservation')
+    await writeMutationReservation(reservationPath, {
+      ageMs: 11 * 60 * 1000,
+      ownerPid: 2 ** 31 - 1
+    })
+
+    let resumeRecovery: (() => void) | undefined
+    let notifyStaleRemoved: (() => void) | undefined
+    const staleRemoved = new Promise<void>((resolve) => {
+      notifyStaleRemoved = resolve
+    })
+    const recoveryCanContinue = new Promise<void>((resolve) => {
+      resumeRecovery = resolve
+    })
+    setCatalogMutationTestHooksForTesting({
+      afterStaleReservationRemoved: async () => {
+        notifyStaleRemoved?.()
+        await recoveryCanContinue
+      }
+    })
+
+    const materialize = (
+      attestationId: string
+    ): ReturnType<typeof materializeCatalogHarmonySource> =>
+      materializeCatalogHarmonySource({
+        parentDir,
+        catalogName: 'harmony-recovery-race-catalog',
+        sourceId,
+        trackName: 'HARM1',
+        sourceAudioPath: harmonySource,
+        provenance: { kind: 'isolated_source_stem/v1', attestationId }
+      })
+
+    const first = materialize('recovery-owner')
+    try {
+      await staleRemoved
+      // This contender observed the recovery-to-owner interval in the old
+      // protocol. It must be stopped by the coordination inode before it can
+      // read, rename, or remove either reservation.
+      await expect(materialize('competing-reclaimer')).rejects.toThrow(
+        'A catalog mutation with that name is already in progress.'
+      )
+      resumeRecovery?.()
+      await expect(first).resolves.toMatchObject({
+        sourceId,
+        trackName: 'HARM1',
+        configuredTracks: ['HARM1']
+      })
+      expect(
+        await readFile(join(parentDir, 'harmony-recovery-race-catalog', 'records.jsonl'), 'utf8')
+      ).toContain(sourceId)
+    } finally {
+      resumeRecovery?.()
+      setCatalogMutationTestHooksForTesting(undefined)
+      await first.catch(() => undefined)
+    }
+  })
+
+  it('serializes real concurrent Harmony and catalog clone mutations', async () => {
+    const parentDir = join(testDir, 'harmony-concurrency-parent')
+    const songDir = join(testDir, 'harmony-concurrency-song')
+    const harmonySource = join(testDir, 'private-harmony-concurrency.wav')
+    await mkdir(parentDir, { recursive: true })
+    await mkdir(songDir, { recursive: true })
+    await writeFile(join(songDir, 'notes.mid'), namedTracksMidi(['PART VOCALS', 'HARM1']))
+    await writeFile(
+      join(songDir, 'song.ini'),
+      '[song]\nname = Concurrency\ndataset_opt_in = true\n'
+    )
+    await writeFile(harmonySource, 'isolated harmony concurrency')
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: songDir }],
+      parentDir,
+      catalogName: 'harmony-concurrency-catalog',
+      catalogId: 'harmony-concurrency-catalog',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    const sourceId = (await listCatalogHarmonyTargets(parentDir, 'harmony-concurrency-catalog'))[0]
+      .sourceId
+    const results = await Promise.allSettled([
+      materializeCatalogHarmonySource({
+        parentDir,
+        catalogName: 'harmony-concurrency-catalog',
+        sourceId,
+        trackName: 'HARM1',
+        sourceAudioPath: harmonySource,
+        provenance: { kind: 'isolated_source_stem/v1', attestationId: 'concurrency-stem' }
+      }),
+      buildSongSourceCatalog({
+        sources: [{ kind: 'octave-library', sourcePath: songDir }],
+        parentDir,
+        catalogName: 'harmony-concurrency-clone',
+        catalogId: 'harmony-concurrency-clone',
+        provenance: 'Reviewed',
+        license: 'test-only',
+        octaveVersion: 'test',
+        mode: 'clone',
+        sourceCatalogName: 'harmony-concurrency-catalog'
+      })
+    ])
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
+    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1)
+    const rejected = results.find((result) => result.status === 'rejected')
+    expect((rejected as PromiseRejectedResult).reason).toEqual(
+      expect.objectContaining({
+        message: 'A catalog mutation with that name is already in progress.'
+      })
+    )
+  })
+
+  it('shares one catalog mutation reservation across Harmony and generic catalog updates/clones', async () => {
+    const parentDir = join(testDir, 'harmony-mutation-reservation-parent')
+    const songDir = join(testDir, 'harmony-mutation-reservation-song')
+    const harmonySource = join(testDir, 'private-harmony-mutation.wav')
+    await mkdir(parentDir, { recursive: true })
+    await mkdir(songDir, { recursive: true })
+    await writeFile(join(songDir, 'notes.mid'), namedTracksMidi(['PART VOCALS', 'HARM1']))
+    await writeFile(
+      join(songDir, 'song.ini'),
+      '[song]\nname = Reservation\ndataset_opt_in = true\n'
+    )
+    await writeFile(harmonySource, 'isolated harmony')
+    await buildSongSourceCatalog({
+      sources: [{ kind: 'octave-library', sourcePath: songDir }],
+      parentDir,
+      catalogName: 'harmony-mutation-reservation',
+      catalogId: 'harmony-mutation-reservation',
+      provenance: 'Reviewed',
+      license: 'test-only',
+      octaveVersion: 'test'
+    })
+    const sourceId = (await listCatalogHarmonyTargets(parentDir, 'harmony-mutation-reservation'))[0]
+      .sourceId
+    const catalogRoot = join(parentDir, 'harmony-mutation-reservation')
+    const beforeRecords = await readFile(join(catalogRoot, 'records.jsonl'), 'utf8')
+    const reservationPath = join(parentDir, '.harmony-mutation-reservation.mutation-reservation')
+    await writeFile(reservationPath, 'active mutation')
+    try {
+      const results = await Promise.allSettled([
+        materializeCatalogHarmonySource({
+          parentDir,
+          catalogName: 'harmony-mutation-reservation',
+          sourceId,
+          trackName: 'HARM1',
+          sourceAudioPath: harmonySource,
+          provenance: { kind: 'isolated_source_stem/v1', attestationId: 'reservation-stem' }
+        }),
+        buildSongSourceCatalog({
+          sources: [],
+          parentDir,
+          catalogName: 'harmony-mutation-reservation',
+          catalogId: 'ignored-update-id',
+          provenance: 'Reviewed',
+          license: 'test-only',
+          octaveVersion: 'test',
+          mode: 'update'
+        }),
+        buildSongSourceCatalog({
+          sources: [{ kind: 'octave-library', sourcePath: songDir }],
+          parentDir,
+          catalogName: 'harmony-mutation-reservation-clone',
+          catalogId: 'harmony-mutation-reservation-clone',
+          provenance: 'Reviewed',
+          license: 'test-only',
+          octaveVersion: 'test',
+          mode: 'clone',
+          sourceCatalogName: 'harmony-mutation-reservation'
+        })
+      ])
+      for (const result of results) {
+        expect(result.status).toBe('rejected')
+        if (result.status === 'rejected') {
+          expect((result.reason as Error).message).toBe(
+            'A catalog mutation with that name is already in progress.'
+          )
+        }
+      }
+      expect(await readFile(join(catalogRoot, 'records.jsonl'), 'utf8')).toBe(beforeRecords)
+      await expect(
+        readFile(join(catalogRoot, 'vocal-harmony-sources.json'), 'utf8')
+      ).rejects.toThrow()
+    } finally {
+      await rm(reservationPath, { force: true })
+    }
+
+    const cloneReservationPath = join(
+      parentDir,
+      '.harmony-mutation-reservation-clone.mutation-reservation'
+    )
+    await writeFile(cloneReservationPath, 'active mutation')
+    try {
+      await expect(
+        buildSongSourceCatalog({
+          sources: [{ kind: 'octave-library', sourcePath: songDir }],
+          parentDir,
+          catalogName: 'harmony-mutation-reservation-clone',
+          catalogId: 'harmony-mutation-reservation-clone',
+          provenance: 'Reviewed',
+          license: 'test-only',
+          octaveVersion: 'test',
+          mode: 'clone',
+          sourceCatalogName: 'harmony-mutation-reservation'
+        })
+      ).rejects.toThrow('A catalog mutation with that name is already in progress.')
+      expect(await readFile(join(catalogRoot, 'records.jsonl'), 'utf8')).toBe(beforeRecords)
+    } finally {
+      await rm(cloneReservationPath, { force: true })
+    }
   })
 })
