@@ -74,6 +74,10 @@ let openedDialogs = 0
 const inspections = new Map<string, Record<string, unknown>>()
 const preflightRequests: Record<string, unknown>[] = []
 const chartRunRequests: Record<string, unknown>[] = []
+const compositionRequests: Array<{
+  output: string
+  profiles: Array<{ model_root: string; profile_id: string }>
+}> = []
 const materializedUrls: string[] = []
 const materializedAudioPath = join(scratch, 'materialized-url.wav')
 let preflightManifestOverride: string | null = null
@@ -83,6 +87,7 @@ const midiNoteOverrides = new Map<string, number>()
 let holdPreflight = false
 let heldPreflightChild: EventEmitter | undefined
 let heldPreflightRequest = ''
+let compositionResultInstruments: string[] | null = null
 
 const MIDI_TRACK_NAMES: Record<string, string[]> = {
   drums: ['PART DRUMS'],
@@ -250,6 +255,7 @@ vi.mock('child_process', () => ({
           output: string
           profiles: Array<{ model_root: string; profile_id: string }>
         }
+        compositionRequests.push(request)
         const instruments = request.profiles.map((profile) => {
           const inspection = inspections.get(profile.model_root)
           const declared = inspection?.profiles?.[0] as Record<string, unknown> | undefined
@@ -279,7 +285,7 @@ vi.mock('child_process', () => ({
                 status: 'packaged',
                 profile_id: 'five-lane-composition',
                 capability: 'five-lane.composition/v1',
-                instruments,
+                instruments: compositionResultInstruments ?? instruments,
                 manifest_sha256: manifestC
               }
             })}\n`
@@ -415,12 +421,14 @@ beforeEach(async () => {
   openedDialogs = 0
   preflightRequests.length = 0
   chartRunRequests.length = 0
+  compositionRequests.length = 0
   materializedUrls.length = 0
   preflightManifestOverride = null
   omittedMidiInstrument = null
   midiTrackNameOverrides.clear()
   midiNoteOverrides.clear()
   holdPreflight = false
+  compositionResultInstruments = null
 })
 
 describe('discovered STRUM profile boundaries', () => {
@@ -498,6 +506,15 @@ describe('discovered STRUM profile boundaries', () => {
     await composeSavedAutoChartProfiles({ profileIds: [guitar.profileId, drums.profileId] })
     await new Promise((resolve) => setTimeout(resolve, 25))
 
+    expect(compositionRequests).toMatchObject([
+      {
+        profiles: [
+          { model_root: guitarRoot, profile_id: 'guitar-hybrid-v2-rule' },
+          { model_root: drumsRoot, profile_id: 'drums-v14-expert' }
+        ]
+      }
+    ])
+
     const persisted = await registry()
     expect(persisted.defaultProfileId).toMatch(/^octave-strum-profile-/)
     expect(persisted.profiles).toMatchObject([
@@ -511,6 +528,56 @@ describe('discovered STRUM profile boundaries', () => {
     ])
     expect(JSON.stringify(persisted)).toContain(guitarRoot)
     expect(JSON.stringify(persisted)).not.toContain('model_root')
+  })
+
+  it('rejects a composed worker result whose instruments do not match the selected profiles', async () => {
+    runtimeCapabilities = [...typedChartCapabilities, 'checkpoint_composition']
+    const guitarRoot = await addBundle(
+      'composition-mismatch-guitar',
+      candidate({ artifactId: artifactA, manifestSha256: manifestA })
+    )
+    const drumsRoot = await addBundle(
+      'composition-mismatch-drums',
+      candidate({
+        artifactId: artifactB,
+        manifestSha256: manifestB,
+        profile: {
+          id: 'drums-v14-expert',
+          capability: 'drums.v14-expert/v1',
+          instrument: 'drums',
+          difficultyPolicy: 'expert_only'
+        }
+      })
+    )
+    selectedDialogPaths.push(guitarRoot, drumsRoot)
+    await chooseCheckpointFolder()
+    const guitar = await saveDiscoveredAutoChartProfile({
+      artifactId: artifactA,
+      profileId: 'guitar-hybrid-v2-rule',
+      difficultyPolicy: 'expert_only'
+    })
+    await chooseCheckpointFolder()
+    const drums = await saveDiscoveredAutoChartProfile({
+      artifactId: artifactB,
+      profileId: 'drums-v14-expert',
+      difficultyPolicy: 'expert_only'
+    })
+
+    compositionResultInstruments = ['guitar']
+    await composeSavedAutoChartProfiles({ profileIds: [guitar.profileId, drums.profileId] })
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    const persisted = await registry()
+    expect(persisted.defaultProfileId).toBe(drums.profileId)
+    expect(persisted.profiles).toHaveLength(2)
+    expect(compositionRequests).toMatchObject([
+      {
+        profiles: [
+          { model_root: guitarRoot, profile_id: 'guitar-hybrid-v2-rule' },
+          { model_root: drumsRoot, profile_id: 'drums-v14-expert' }
+        ]
+      }
+    ])
   })
 
   it.each(['chart_preflight', 'chart_run', 'typed_chart_results', 'legacy-chart-only'])(
