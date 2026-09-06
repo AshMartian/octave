@@ -476,12 +476,22 @@ export function Toolbar(): React.JSX.Element {
       })
 
       const newSongId =
-        event.success && event.songFolders.length > 0
-          ? event.songFolders[0].split(/[\\/]/).pop()
-          : undefined
+        event.success && event.typedArtifacts && event.outputDir
+          ? event.outputDir.split(/[\\/]/).pop()
+          : event.success && event.songFolders.length > 0
+            ? event.songFolders[0].split(/[\\/]/).pop()
+            : undefined
 
-      if (event.outputDir && !event.typedArtifacts) {
+      if (event.outputDir) {
         updateSettings({ autoChartOutputDir: event.outputDir, lastOpenedFolder: event.outputDir })
+        // Typed STRUM profiles write an OCTAVE-readable song.ini and notes.mid
+        // directly in their selected output folder. Load that folder just as
+        // we load legacy song-package output so the generated chart is ready
+        // for review instead of being only an artifact notification.
+        if (event.success && event.typedArtifacts) {
+          loadProjectFolder(event.outputDir, newSongId)
+          return
+        }
         // Optionally pull the source video for any URL inputs into their
         // resulting song folders so it shows up in the timeline / in-game.
         if (
