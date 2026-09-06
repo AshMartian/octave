@@ -27,7 +27,11 @@ await fs.mkdir(ACCEPTANCE_OUTPUT, { mode: 0o700 })
 const report = { format: 'octave-strum-ui-acceptance/v1', quality_claim: false, stages: [] }
 const launchOptions = {
   args: [
-    path.join(repo, 'out/main/index.js'),
+    // Launch the repository application (equivalent to `electron .`) so the
+    // harness runs as a developer build. Passing the compiled main file
+    // directly marks Electron as packaged and wrongly triggers managed-runtime
+    // setup instead of using the explicitly configured local STRUM checkout.
+    repo,
     `--user-data-dir=${path.join(ACCEPTANCE_OUTPUT, 'user-data')}`,
     '--no-sandbox',
     '--disable-gpu-sandbox'
@@ -42,8 +46,20 @@ const launchOptions = {
     WANDB_MODE: 'disabled'
   }
 }
+async function resolveFirstWindow(app) {
+  // Electron can create the initial BrowserWindow before Playwright registers
+  // its `window` event. Prefer the already-known window so the acceptance
+  // harness cannot wait forever for an event that has already happened.
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const [page] = app.windows()
+    if (page) return page
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  return app.firstWindow()
+}
+
 let app = await electron.launch(launchOptions)
-let page = await app.firstWindow()
+let page = await resolveFirstWindow(app)
 page.setDefaultTimeout(60_000)
 async function record(name) {
   report.stages.push({ name, status: 'passed' })
@@ -220,7 +236,7 @@ try {
   }
   await app.close()
   app = await electron.launch(launchOptions)
-  page = await app.firstWindow()
+  page = await resolveFirstWindow(app)
   await page.waitForLoadState('domcontentloaded')
   const restored = await page.evaluate(() => window.api.listTrainingArtifacts())
   if (

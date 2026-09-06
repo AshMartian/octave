@@ -10,6 +10,7 @@ const sends: Array<Record<string, unknown>> = []
 const requests: Array<Record<string, unknown>> = []
 const workerCommands: string[][] = []
 const workerInvocations: Array<{ command: string; args: string[] }> = []
+const workerExecOptions: Array<{ timeout?: number }> = []
 let catalogInspectionPayload: Record<string, unknown> = {
   status: 'ready',
   catalog_id: 'approved_catalog',
@@ -197,11 +198,12 @@ vi.mock('child_process', () => ({
   execFile: (
     command: string,
     args: string[],
-    _options: unknown,
+    options: { timeout?: number },
     callback: (error: Error | null, stdout: string) => void
   ) => {
     workerCommands.push(args)
     workerInvocations.push({ command, args })
+    workerExecOptions.push(options)
     if (args.includes('probe')) {
       const respond = (): void => callback(null, `${JSON.stringify(probePayload)}\n`)
       if (delayProbeResponse) setTimeout(respond, 20)
@@ -428,6 +430,7 @@ afterEach(async () => {
   requests.length = 0
   workerCommands.length = 0
   workerInvocations.length = 0
+  workerExecOptions.length = 0
   catalogInspectionPayload = {
     status: 'ready',
     catalog_id: 'approved_catalog',
@@ -974,6 +977,9 @@ describe('STRUM d8 training adapter', () => {
         JSON.stringify({ instrument: 'guitar', target_difficulty: 'Hard' })
       ])
     )
+    expect(
+      workerExecOptions[workerCommands.findIndex((command) => command.includes('catalog'))]
+    ).toMatchObject({ timeout: 15 * 60_000 })
 
     const prepared = await startTrainingPrepare({
       catalogRoot,

@@ -61,6 +61,11 @@ const SAFE_RUNTIME_PIPELINE_ID =
   /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}(?:\/[A-Za-z0-9][A-Za-z0-9._-]{0,63}){0,3}$/
 const SAFE_RUNTIME_DEVICE = /^[a-z][a-z0-9_]{0,31}$/
 const SAFE_SOURCE_REVISION = /^[a-f0-9]{7,64}$/
+const DEFAULT_WORKER_JSON_TIMEOUT_MS = 20_000
+// Profile-grade catalog inspection fully decodes every candidate's dedicated
+// audio stream.  Its worker-side per-stream admission timeout is intentionally
+// conservative, so the UI must not reuse the short discovery/probe timeout.
+const CATALOG_INSPECTION_TIMEOUT_MS = 15 * 60_000
 
 export type TrainingPipeline = {
   id: string
@@ -780,13 +785,14 @@ function normalizeRuntime(
 
 async function runWorkerJsonWithInvocation(
   worker: WorkerInvocation,
-  args: string[]
+  args: string[],
+  timeoutMs = DEFAULT_WORKER_JSON_TIMEOUT_MS
 ): Promise<Record<string, unknown>> {
   return await new Promise((resolve, reject) => {
     execFile(
       worker.command,
       [...worker.baseArgs, ...args],
-      { env: worker.env, cwd: worker.cwd, timeout: 20_000 },
+      { env: worker.env, cwd: worker.cwd, timeout: timeoutMs },
       (error, stdout) => {
         const line = stdout.split(/\r?\n/).find((entry) => entry.trim())
         if (error || !line) {
@@ -808,13 +814,16 @@ async function runWorkerJsonWithInvocation(
   })
 }
 
-async function runWorkerJson(args: string[]): Promise<Record<string, unknown>> {
+async function runWorkerJson(
+  args: string[],
+  timeoutMs = DEFAULT_WORKER_JSON_TIMEOUT_MS
+): Promise<Record<string, unknown>> {
   for (;;) {
     const resolved = await resolveWorkerInvocation('training-probe')
     if (resolved.runtimeSelectionEpoch !== runtimeSelectionEpoch || runtimeSelectionActivation) {
       continue
     }
-    return await runWorkerJsonWithInvocation(resolved.invocation, args)
+    return await runWorkerJsonWithInvocation(resolved.invocation, args, timeoutMs)
   }
 }
 
@@ -2091,17 +2100,20 @@ export async function inspectTrainingCatalog(
       pipeline.catalog_inspection_option_keys.includes(key)
     )
   )
-  const payload = await runWorkerJson([
-    'catalog',
-    'inspect',
-    '--catalog-root',
-    catalogRoot,
-    '--pipeline',
-    pipelineId,
-    '--options',
-    JSON.stringify(inspectionOptions),
-    '--json'
-  ])
+  const payload = await runWorkerJson(
+    [
+      'catalog',
+      'inspect',
+      '--catalog-root',
+      catalogRoot,
+      '--pipeline',
+      pipelineId,
+      '--options',
+      JSON.stringify(inspectionOptions),
+      '--json'
+    ],
+    CATALOG_INSPECTION_TIMEOUT_MS
+  )
   const expectedKeys = [
     'status',
     'catalog_id',
