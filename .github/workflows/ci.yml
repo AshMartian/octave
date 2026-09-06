@@ -52,7 +52,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: AshMartian/strum
-          ref: b32fa0a0943a75184999edfe87c4ce38225d833f
+          ref: 65bfb3043bdb5ea1e8f98df1c494ba1f3ccba70e
           path: .acceptance-strum
           persist-credentials: false
       - uses: actions/setup-python@v5
