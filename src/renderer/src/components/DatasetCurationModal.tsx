@@ -2438,7 +2438,7 @@ export function TrainingModal({
                     </div>
                     <div>
                       <span>Eligible {selectedInstrument} songs</span>
-                      <strong>{catalogInspection?.eligibleCount ?? 'Checking…'}</strong>
+                      <strong>{catalogInspection?.eligibleCount ?? 'Validating…'}</strong>
                     </div>
                     <div>
                       <span>Audio policy</span>
@@ -2465,11 +2465,18 @@ export function TrainingModal({
                         labels, approved audio, or a verified asset.
                       </p>
                     )}
+                  {!catalogInspection && (
+                    <p className="training-inline-note">
+                      STRUM will finish full asset admission during preparation. This can take a few
+                      minutes for profile-grade audio because every selected stream is decoded
+                      before it is admitted.
+                    </p>
+                  )}
                   <button
                     className="dataset-primary"
                     onClick={() => void prepareDataset()}
                     disabled={
-                      !catalogInspection?.eligibleCount ||
+                      catalogInspection?.eligibleCount === 0 ||
                       enablingTrainingRuntime ||
                       Boolean(
                         trainingJob &&
