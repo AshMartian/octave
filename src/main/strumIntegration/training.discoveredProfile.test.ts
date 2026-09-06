@@ -4,6 +4,8 @@ import { EventEmitter } from 'node:events'
 import { mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { writeMidi } from 'midi-file'
+import type { MidiData } from 'midi-file'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const scratch = mkdtempSync(join(tmpdir(), 'octave-training-profile-test-'))
@@ -20,6 +22,7 @@ type CandidateOptions = {
     id: string
     capability: string
     instrument: 'guitar' | 'drums'
+    instruments?: ReadonlyArray<'drums' | 'guitar' | 'bass' | 'keys' | 'pro_keys' | 'pro_guitar'>
     difficultyPolicy: 'expert_only'
   }
 }
@@ -46,7 +49,7 @@ function candidate({
       {
         profile_id: profile.id,
         capability: profile.capability,
-        instruments: [profile.instrument],
+        instruments: profile.instruments ?? [profile.instrument],
         difficulty_policies: [profile.difficultyPolicy],
         required_components: ['chart_transform'],
         execution: {
@@ -72,11 +75,52 @@ const chartRunRequests: Record<string, unknown>[] = []
 const materializedUrls: string[] = []
 const materializedAudioPath = join(scratch, 'materialized-url.wav')
 let preflightManifestOverride: string | null = null
+let omittedMidiInstrument: string | null = null
+const midiTrackNameOverrides = new Map<string, string>()
+const midiNoteOverrides = new Map<string, number>()
 let holdPreflight = false
 let heldPreflightChild: EventEmitter | undefined
 let heldPreflightRequest = ''
 
-function sha256(value: string): string {
+const MIDI_TRACK_NAMES: Record<string, string[]> = {
+  drums: ['PART DRUMS'],
+  guitar: ['PART GUITAR'],
+  bass: ['PART BASS'],
+  vocals: ['PART VOCALS'],
+  keys: ['PART KEYS'],
+  pro_keys: ['PART REAL_KEYS_X']
+}
+
+function typedMidi(instruments: readonly string[]): Buffer {
+  const tracks = instruments.flatMap((instrument) => {
+    const trackName = midiTrackNameOverrides.get(instrument) ?? MIDI_TRACK_NAMES[instrument]?.[0]
+    return trackName ? [{ instrument, trackName }] : []
+  })
+  const midi: MidiData = {
+    header: { format: 1, numTracks: tracks.length, ticksPerBeat: 480 },
+    tracks: tracks.map(({ instrument, trackName }) => [
+      { deltaTime: 0, meta: true, type: 'trackName', text: trackName },
+      {
+        deltaTime: 0,
+        channel: 0,
+        type: 'noteOn',
+        noteNumber: midiNoteOverrides.get(instrument) ?? (instrument === 'pro_keys' ? 60 : 96),
+        velocity: 100
+      },
+      {
+        deltaTime: 120,
+        channel: 0,
+        type: 'noteOff',
+        noteNumber: midiNoteOverrides.get(instrument) ?? (instrument === 'pro_keys' ? 60 : 96),
+        velocity: 0
+      },
+      { deltaTime: 0, meta: true, type: 'endOfTrack' }
+    ])
+  }
+  return Buffer.from(writeMidi(midi))
+}
+
+function sha256(value: string | Buffer): string {
   return createHash('sha256').update(value).digest('hex')
 }
 
@@ -235,23 +279,38 @@ vi.mock('child_process', () => ({
       const preflight = preflightRequests.at(-1) ?? {}
       const outputDir = String(request.output_dir)
       const manifestSha256 = inspections.get(String(preflight.model_root))?.manifest_sha256
-      const notesHash = sha256('typed-notes')
-      const instrument = Array.isArray(preflight.instruments) ? preflight.instruments[0] : null
+      const instruments = Array.isArray(preflight.instruments) ? preflight.instruments : []
+      const notes = typedMidi(
+        instruments.filter(
+          (instrument): instrument is string => instrument !== omittedMidiInstrument
+        )
+      )
+      const notesHash = sha256(notes)
+      const inspection = inspections.get(String(preflight.model_root))
+      const capability = Array.isArray(inspection?.profiles)
+        ? (inspection.profiles[0] as Record<string, unknown> | undefined)?.capability
+        : undefined
       await mkdir(outputDir, { recursive: true })
-      await writeFile(join(outputDir, 'notes.mid'), 'typed-notes')
+      await writeFile(join(outputDir, 'notes.mid'), notes)
       await writeFile(
         join(outputDir, 'run.json'),
         JSON.stringify({
           format: 'strum-chart-run/v1',
           status: 'completed',
           profile_id: preflight.profile_id,
-          capability: request.source_midi_path
-            ? 'difficulty.transform/v1'
-            : instrument === 'drums'
-              ? 'drums.v14-expert/v1'
-              : 'guitar.hybrid-v2-rule/v1',
+          capability:
+            typeof capability === 'string'
+              ? capability
+              : request.source_midi_path
+                ? 'difficulty.transform/v1'
+                : instruments[0] === 'drums'
+                  ? 'drums.v14-expert/v1'
+                  : 'guitar.hybrid-v2-rule/v1',
           manifest_sha256: manifestSha256,
-          artifacts: { notes_midi: { name: 'notes.mid', sha256: notesHash } }
+          artifacts: { notes_midi: { name: 'notes.mid', sha256: notesHash } },
+          instrument_results: Object.fromEntries(
+            instruments.map((instrument) => [instrument, { status: 'succeeded' }])
+          )
         })
       )
       child.stdout.emit(
@@ -310,6 +369,9 @@ beforeEach(async () => {
   chartRunRequests.length = 0
   materializedUrls.length = 0
   preflightManifestOverride = null
+  omittedMidiInstrument = null
+  midiTrackNameOverrides.clear()
+  midiNoteOverrides.clear()
   holdPreflight = false
 })
 
@@ -510,6 +572,31 @@ describe('discovered STRUM profile boundaries', () => {
     ).rejects.toThrow(/no executable STRUM Auto Chart profile/)
   })
 
+  it('rejects a deployable profile that the Auto Chart GUI cannot select', async () => {
+    selectedFolder = await addBundle(
+      'pro-guitar-bundle',
+      candidate({
+        artifactId: artifactA,
+        manifestSha256: manifestA,
+        profile: {
+          id: 'pro-guitar',
+          capability: 'pro.guitar/v1',
+          instrument: 'guitar',
+          instruments: ['pro_guitar'],
+          difficultyPolicy: 'expert_only'
+        }
+      })
+    )
+    await chooseCheckpointFolder()
+    await expect(
+      saveDiscoveredAutoChartProfile({
+        artifactId: artifactA,
+        profileId: 'pro-guitar',
+        difficultyPolicy: 'expert_only'
+      })
+    ).rejects.toThrow('cannot select')
+  })
+
   it('rejects path-bearing compatibility metadata before checkpoint discovery reaches IPC', async () => {
     const inspection = candidate({ artifactId: artifactA, manifestSha256: manifestA })
     inspection.compatibility = {
@@ -594,7 +681,11 @@ describe('discovered STRUM profile boundaries', () => {
           capability: profile.capability,
           manifestSha256: manifestA,
           artifacts: [
-            { id: 'notes_midi', name: 'notes.mid', sha256: sha256('typed-notes') },
+            {
+              id: 'notes_midi',
+              name: 'notes.mid',
+              sha256: sha256(typedMidi([profile.instrument]))
+            },
             { id: 'run_manifest', name: 'run.json', sha256: expect.any(String) }
           ]
         }
@@ -618,6 +709,233 @@ describe('discovered STRUM profile boundaries', () => {
       expect(JSON.stringify(chartRunRequests[0])).not.toContain(selectedFolder)
     }
   )
+
+  it('forwards the exact user-selected composition tracks in declared profile order', async () => {
+    const profile = {
+      id: 'five-lane-composition',
+      capability: 'five-lane.composition/v1',
+      instrument: 'guitar' as const,
+      instruments: ['drums', 'guitar', 'bass', 'keys'] as const,
+      difficultyPolicy: 'expert_only' as const
+    }
+    selectedFolder = await addBundle(
+      'composition-bundle',
+      candidate({ artifactId: artifactA, manifestSha256: manifestA, profile })
+    )
+    const audioPath = join(scratch, 'composition.wav')
+    const outputDir = join(scratch, 'composition-output')
+    await writeFile(audioPath, 'local-audio')
+    await chooseCheckpointFolder()
+    await saveDiscoveredAutoChartProfile({
+      artifactId: artifactA,
+      profileId: profile.id,
+      difficultyPolicy: profile.difficultyPolicy
+    })
+
+    await expect(
+      runDefaultAutoChartProfile({
+        runId: 'composition-selection',
+        outputDir,
+        files: [audioPath],
+        folders: [],
+        stemFolders: [],
+        urls: [],
+        enabledTracks: {
+          drums: false,
+          guitar: true,
+          bass: false,
+          vocals: false,
+          harmonies: false,
+          keys: true,
+          proKeys: false
+        }
+      })
+    ).resolves.toMatchObject({ success: true, outputDir })
+
+    expect(preflightRequests).toEqual([
+      expect.objectContaining({ instruments: ['guitar', 'keys'] })
+    ])
+    expect(chartRunRequests).toHaveLength(1)
+    await expect(readFile(join(outputDir, 'song.ini'), 'utf8')).resolves.toContain(
+      'strum_generated = true'
+    )
+  })
+
+  it('rejects unsupported or empty typed profile selections before preflight', async () => {
+    const profile = {
+      id: 'five-lane-composition',
+      capability: 'five-lane.composition/v1',
+      instrument: 'guitar' as const,
+      instruments: ['guitar', 'bass'] as const,
+      difficultyPolicy: 'expert_only' as const
+    }
+    selectedFolder = await addBundle(
+      'composition-selection-errors',
+      candidate({ artifactId: artifactA, manifestSha256: manifestA, profile })
+    )
+    const audioPath = join(scratch, 'selection-errors.wav')
+    await writeFile(audioPath, 'local-audio')
+    await chooseCheckpointFolder()
+    await saveDiscoveredAutoChartProfile({
+      artifactId: artifactA,
+      profileId: profile.id,
+      difficultyPolicy: profile.difficultyPolicy
+    })
+
+    await expect(
+      runDefaultAutoChartProfile({
+        runId: 'unsupported-selection',
+        outputDir: join(scratch, 'unsupported-selection-output'),
+        files: [audioPath],
+        folders: [],
+        stemFolders: [],
+        urls: [],
+        enabledTracks: {
+          drums: false,
+          guitar: true,
+          bass: false,
+          vocals: true,
+          harmonies: false,
+          keys: false,
+          proKeys: false
+        }
+      })
+    ).rejects.toThrow('does not support vocals')
+    await expect(
+      runDefaultAutoChartProfile({
+        runId: 'empty-selection',
+        outputDir: join(scratch, 'empty-selection-output'),
+        files: [audioPath],
+        folders: [],
+        stemFolders: [],
+        urls: [],
+        enabledTracks: {
+          drums: false,
+          guitar: false,
+          bass: false,
+          vocals: false,
+          harmonies: false,
+          keys: false,
+          proKeys: false
+        }
+      })
+    ).rejects.toThrow('Choose at least one track')
+    expect(preflightRequests).toEqual([])
+    expect(chartRunRequests).toEqual([])
+  })
+
+  it('rejects a typed result whose MIDI omits a selected instrument track', async () => {
+    const profile = {
+      id: 'five-lane-composition',
+      capability: 'five-lane.composition/v1',
+      instrument: 'guitar' as const,
+      instruments: ['guitar', 'keys'] as const,
+      difficultyPolicy: 'expert_only' as const
+    }
+    selectedFolder = await addBundle(
+      'composition-midi-coverage',
+      candidate({ artifactId: artifactA, manifestSha256: manifestA, profile })
+    )
+    const audioPath = join(scratch, 'composition-midi-coverage.wav')
+    await writeFile(audioPath, 'local-audio')
+    await chooseCheckpointFolder()
+    await saveDiscoveredAutoChartProfile({
+      artifactId: artifactA,
+      profileId: profile.id,
+      difficultyPolicy: profile.difficultyPolicy
+    })
+    omittedMidiInstrument = 'keys'
+
+    await expect(
+      runDefaultAutoChartProfile({
+        runId: 'composition-midi-coverage',
+        outputDir: join(scratch, 'composition-midi-coverage-output'),
+        files: [audioPath],
+        folders: [],
+        stemFolders: [],
+        urls: [],
+        enabledTracks: {
+          drums: false,
+          guitar: true,
+          bass: false,
+          vocals: false,
+          harmonies: false,
+          keys: true,
+          proKeys: false
+        }
+      })
+    ).rejects.toThrow('omitted playable keys chart output')
+  })
+
+  it('rejects a named five-lane track without OCTAVE-playable notes', async () => {
+    selectedFolder = await addBundle(
+      'non-playable-midi-track',
+      candidate({ artifactId: artifactA, manifestSha256: manifestA })
+    )
+    const audioPath = join(scratch, 'non-playable-midi-track.wav')
+    await writeFile(audioPath, 'local-audio')
+    await chooseCheckpointFolder()
+    await saveDiscoveredAutoChartProfile({
+      artifactId: artifactA,
+      profileId: 'guitar-hybrid-v2-rule',
+      difficultyPolicy: 'expert_only'
+    })
+    midiNoteOverrides.set('guitar', 116)
+
+    await expect(
+      runDefaultAutoChartProfile({
+        runId: 'non-playable-midi-track',
+        outputDir: join(scratch, 'non-playable-midi-track-output'),
+        files: [audioPath],
+        folders: [],
+        stemFolders: [],
+        urls: []
+      })
+    ).rejects.toThrow('omitted playable guitar chart output')
+  })
+
+  it('requires Expert Pro Keys notes on the Expert Pro Keys track', async () => {
+    const profile = {
+      id: 'pro-keys-expert',
+      capability: 'pro.keys/v1',
+      instrument: 'guitar' as const,
+      instruments: ['pro_keys'] as const,
+      difficultyPolicy: 'expert_only' as const
+    }
+    selectedFolder = await addBundle(
+      'pro-keys-expert',
+      candidate({ artifactId: artifactA, manifestSha256: manifestA, profile })
+    )
+    const audioPath = join(scratch, 'pro-keys-expert.wav')
+    await writeFile(audioPath, 'local-audio')
+    await chooseCheckpointFolder()
+    await saveDiscoveredAutoChartProfile({
+      artifactId: artifactA,
+      profileId: profile.id,
+      difficultyPolicy: profile.difficultyPolicy
+    })
+    midiTrackNameOverrides.set('pro_keys', 'PART REAL_KEYS_E')
+
+    await expect(
+      runDefaultAutoChartProfile({
+        runId: 'pro-keys-expert',
+        outputDir: join(scratch, 'pro-keys-expert-output'),
+        files: [audioPath],
+        folders: [],
+        stemFolders: [],
+        urls: [],
+        enabledTracks: {
+          drums: false,
+          guitar: false,
+          bass: false,
+          vocals: false,
+          harmonies: false,
+          keys: false,
+          proKeys: true
+        }
+      })
+    ).rejects.toThrow('omitted playable pro_keys chart output')
+  })
 
   it.each([false, true])(
     'uses private MIDI transform inputs with optional audio=%s',

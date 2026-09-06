@@ -12,6 +12,7 @@ import type {
   StrumPromotionJobDescriptor,
   StrumPromotionJobResult
 } from '../../../shared/strumTrainingContracts'
+import { useSettingsStore } from '../stores'
 import './DatasetCurationModal.css'
 
 type SourceCandidate = {
@@ -526,6 +527,7 @@ export function TrainingModal({
   onClose: () => void
   onActivityChange: (activity: TrainingActivity | null) => void
 }): React.JSX.Element | null {
+  const updateSettings = useSettingsStore((state) => state.updateSettings)
   const [songs, setSongs] = useState<SourceCandidate[]>([])
   const [packageGroups, setPackageGroups] = useState<PackageGroup[]>([])
   const [selectedPackages, setSelectedPackages] = useState<Set<string>>(new Set())
@@ -1435,6 +1437,22 @@ export function TrainingModal({
         artifactId: selectedDiscoveredCheckpoint.artifactId,
         profileId: selectedDiscoveredProfile.profileId,
         difficultyPolicy: selectedDifficultyPolicy
+      })
+      const supported = new Set(selectedDiscoveredProfile.instruments)
+      // A typed profile is authoritative about which chart tracks it can
+      // generate. Keep the Auto Chart dialog aligned with the saved default so
+      // its explicit selection reaches STRUM unchanged instead of silently
+      // requesting legacy-only tracks.
+      updateSettings({
+        autoChartEnabledTracks: {
+          drums: supported.has('drums'),
+          guitar: supported.has('guitar'),
+          bass: supported.has('bass'),
+          vocals: supported.has('vocals'),
+          harmonies: false,
+          keys: supported.has('keys'),
+          proKeys: supported.has('pro_keys')
+        }
       })
       await refreshTrainingState()
     } catch {

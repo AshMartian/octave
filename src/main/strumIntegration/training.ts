@@ -16,6 +16,7 @@ import {
   writeFile
 } from 'fs/promises'
 import { basename, dirname, isAbsolute, join, relative } from 'path'
+import { parseMidi } from 'midi-file'
 import type {
   StrumCheckpointCandidateInputContract,
   StrumCheckpointCandidateOutputContract,
@@ -2651,6 +2652,7 @@ export async function saveDiscoveredAutoChartProfile(options: {
   ) {
     throw new Error('The selected STRUM profile is not executable for that difficulty policy.')
   }
+  assertProfileIsSelectableInAutoChart(profile, options.difficultyPolicy)
   const runtime = await probeTrainingRuntime()
   if (!supportsTypedChartExecution(runtime)) {
     throw new Error('The selected STRUM runtime cannot run deployed Auto Chart profiles.')
@@ -2755,6 +2757,7 @@ async function resolveDefaultAutoChartProfile(): Promise<ResolvedAutoChartProfil
       await discardInvalidDefaultProfile(profile.profileId)
       return null
     }
+    assertProfileIsSelectableInAutoChart(declaredProfile, profile.difficultyPolicy ?? 'expert_only')
     const validation = await runWorkerJson([
       'inference',
       'profile',
@@ -2796,6 +2799,122 @@ function profiledChartDevice(runtime: TrainingRuntime): 'cuda' | 'mps' | 'cpu' {
   if (runtime.deviceSupport.includes('cuda')) return 'cuda'
   if (runtime.deviceSupport.includes('mps')) return 'mps'
   return 'cpu'
+}
+
+const AUTO_CHART_PROFILE_TRACKS = {
+  drums: { setting: 'drums', midiTrackNames: ['PART DRUMS'] },
+  guitar: { setting: 'guitar', midiTrackNames: ['PART GUITAR'] },
+  bass: { setting: 'bass', midiTrackNames: ['PART BASS'] },
+  vocals: { setting: 'vocals', midiTrackNames: ['PART VOCALS'] },
+  keys: { setting: 'keys', midiTrackNames: ['PART KEYS'] },
+  pro_keys: {
+    setting: 'proKeys',
+    midiTrackNames: ['PART REAL_KEYS_X', 'PART REAL_KEYS_H', 'PART REAL_KEYS_M', 'PART REAL_KEYS_E']
+  }
+} as const
+
+type AutoChartProfileInstrument = keyof typeof AUTO_CHART_PROFILE_TRACKS
+
+function profileTrackBinding(
+  instrument: string
+): (typeof AUTO_CHART_PROFILE_TRACKS)[AutoChartProfileInstrument] | undefined {
+  return AUTO_CHART_PROFILE_TRACKS[instrument as AutoChartProfileInstrument]
+}
+
+function assertProfileIsSelectableInAutoChart(
+  profile: Pick<ResolvedAutoChartProfile, 'instruments'>,
+  difficultyPolicy = 'expert_only'
+): void {
+  const unsupported = profile.instruments.find((instrument) => !profileTrackBinding(instrument))
+  if (unsupported) {
+    throw new Error(
+      `The selected STRUM profile declares ${unsupported}, which OCTAVE Auto Chart cannot select.`
+    )
+  }
+  if (profile.instruments.includes('pro_keys') && difficultyPolicy !== 'expert_only') {
+    throw new Error(
+      'OCTAVE Auto Chart currently supports Pro Keys only with an expert_only STRUM profile.'
+    )
+  }
+}
+
+function expectedProfileMidiTrackNames(
+  instrument: string,
+  difficultyPolicy: string
+): readonly string[] {
+  const binding = profileTrackBinding(instrument)
+  if (!binding) return []
+  if (instrument === 'pro_keys') {
+    return difficultyPolicy === 'expert_only' ? ['PART REAL_KEYS_X'] : []
+  }
+  return binding.midiTrackNames
+}
+
+function isOctavePlayableProfileNote(
+  instrument: string,
+  midiTrackName: string,
+  noteNumber: number,
+  difficultyPolicy: string
+): boolean {
+  if (instrument === 'pro_keys') {
+    return (
+      difficultyPolicy === 'expert_only' &&
+      midiTrackName === 'PART REAL_KEYS_X' &&
+      noteNumber >= 48 &&
+      noteNumber <= 72
+    )
+  }
+  if (instrument === 'vocals') {
+    return (noteNumber >= 36 && noteNumber <= 84) || noteNumber === 96 || noteNumber === 97
+  }
+  const fiveLaneOffsets = difficultyPolicy === 'expert_only' ? [96] : [60, 72, 84, 96]
+  if (instrument === 'drums') {
+    return fiveLaneOffsets.some((offset) => noteNumber >= offset - 1 && noteNumber <= offset + 4)
+  }
+  return fiveLaneOffsets.some((offset) => noteNumber >= offset && noteNumber <= offset + 4)
+}
+
+/**
+ * Translate OCTAVE's explicit track toggles into the ordered subset a typed
+ * STRUM profile will execute.  This is intentionally strict: a selected
+ * track that the profile cannot produce is an actionable error, never an
+ * implicit fallback to a smaller chart.
+ */
+function requestedProfiledInstruments(
+  profile: ResolvedAutoChartProfile,
+  enabledTracks: AutoChartRunOptions['enabledTracks']
+): string[] {
+  if (!enabledTracks) return profile.instruments
+
+  assertProfileIsSelectableInAutoChart(profile, profile.difficultyPolicy ?? 'expert_only')
+  const profileInstruments = new Set(profile.instruments)
+  const selectedUnsupported = Object.entries(AUTO_CHART_PROFILE_TRACKS).find(
+    ([instrument, binding]) => enabledTracks[binding.setting] && !profileInstruments.has(instrument)
+  )
+  if (selectedUnsupported) {
+    throw new Error(
+      `The selected STRUM profile does not support ${selectedUnsupported[0]}. Choose only profile-supported tracks.`
+    )
+  }
+  if (enabledTracks.harmonies) {
+    throw new Error(
+      'The selected STRUM profile does not declare Vocal Harmonies. Choose only profile-supported tracks.'
+    )
+  }
+
+  const requested = profile.instruments.filter((instrument) => {
+    const binding = profileTrackBinding(instrument)
+    if (!binding) {
+      throw new Error(
+        `The selected STRUM profile declares unsupported Auto Chart track ${instrument}.`
+      )
+    }
+    return enabledTracks[binding.setting] === true
+  })
+  if (requested.length === 0) {
+    throw new Error('Choose at least one track supported by the selected STRUM profile.')
+  }
+  return requested
 }
 
 type ProfiledAudioInput = { kind: 'local'; audioPath: string } | { kind: 'url'; url: string }
@@ -2841,6 +2960,7 @@ function resolveProfiledAudioInput(
 function validateProfiledChartPreflight(
   raw: Record<string, unknown>,
   profile: ResolvedAutoChartProfile,
+  requestedInstruments: readonly string[],
   device: string
 ): void {
   const requestedProfileId = profile.strumProfileId ?? profile.profileId
@@ -2855,8 +2975,8 @@ function validateProfiledChartPreflight(
     raw.difficulty_policy !== requestedPolicy ||
     raw.device !== device ||
     !Array.isArray(rawInstruments) ||
-    rawInstruments.length !== profile.instruments.length ||
-    rawInstruments.some((instrument, index) => instrument !== profile.instruments[index])
+    rawInstruments.length !== requestedInstruments.length ||
+    rawInstruments.some((instrument, index) => instrument !== requestedInstruments[index])
   ) {
     throw new Error('The selected STRUM profile could not be preflighted for this chart run.')
   }
@@ -2872,9 +2992,52 @@ async function fingerprintChartArtifact(path: string): Promise<string> {
   })
 }
 
+async function verifyTypedChartTrackCoverage(
+  outputDir: string,
+  requestedInstruments: readonly string[],
+  difficultyPolicy: string
+): Promise<void> {
+  let tracks: Array<{ name: string; playableNotes: number[] }>
+  try {
+    const midi = parseMidi(await readFile(join(outputDir, 'notes.mid')))
+    tracks = midi.tracks.map((track) => {
+      const nameEvent = track.find(
+        (event) => event.type === 'trackName' && typeof event.text === 'string'
+      )
+      return {
+        name: nameEvent && 'text' in nameEvent ? nameEvent.text.trim().toUpperCase() : '',
+        playableNotes: track.flatMap((event) =>
+          event.type === 'noteOn' &&
+          'noteNumber' in event &&
+          'velocity' in event &&
+          event.velocity > 0
+            ? [event.noteNumber]
+            : []
+        )
+      }
+    })
+  } catch {
+    throw new Error('The validated STRUM profile produced unreadable MIDI chart output.')
+  }
+  const missing = requestedInstruments.find((instrument) => {
+    const expectedTrackNames = expectedProfileMidiTrackNames(instrument, difficultyPolicy)
+    return !tracks.some(
+      (track) =>
+        expectedTrackNames.includes(track.name) &&
+        track.playableNotes.some((noteNumber) =>
+          isOctavePlayableProfileNote(instrument, track.name, noteNumber, difficultyPolicy)
+        )
+    )
+  })
+  if (missing) {
+    throw new Error(`The validated STRUM profile omitted playable ${missing} chart output.`)
+  }
+}
+
 async function inspectTypedChartArtifacts(
   outputDir: string,
-  profile: ResolvedAutoChartProfile
+  profile: ResolvedAutoChartProfile,
+  requestedInstruments: readonly string[]
 ): Promise<TypedChartArtifacts> {
   const manifestSha256 = profile.manifestSha256
   if (!manifestSha256) {
@@ -2889,6 +3052,7 @@ async function inspectTypedChartArtifacts(
     throw new Error('The validated STRUM profile did not produce an inspectable chart artifact.')
   }
   const notes = isRecord(manifest.artifacts) ? manifest.artifacts.notes_midi : null
+  const instrumentResults = manifest.instrument_results
   if (
     manifest.format !== STRUM_CHART_RUN_FORMAT ||
     manifest.status !== 'completed' ||
@@ -2898,7 +3062,14 @@ async function inspectTypedChartArtifacts(
     !isRecord(notes) ||
     notes.name !== 'notes.mid' ||
     typeof notes.sha256 !== 'string' ||
-    !/^[a-f0-9]{64}$/.test(notes.sha256)
+    !/^[a-f0-9]{64}$/.test(notes.sha256) ||
+    !isRecord(instrumentResults) ||
+    Object.keys(instrumentResults).length !== requestedInstruments.length ||
+    requestedInstruments.some(
+      (instrument) =>
+        !isRecord(instrumentResults[instrument]) ||
+        instrumentResults[instrument].status !== 'succeeded'
+    )
   ) {
     throw new Error('The validated STRUM profile produced an invalid chart artifact.')
   }
@@ -2915,6 +3086,11 @@ async function inspectTypedChartArtifacts(
   if (notesHash !== notes.sha256) {
     throw new Error('The validated STRUM profile produced an invalid chart artifact.')
   }
+  await verifyTypedChartTrackCoverage(
+    outputDir,
+    requestedInstruments,
+    profile.difficultyPolicy ?? 'expert_only'
+  )
   return {
     format: 'strum-typed-chart-artifacts/v1',
     profileId: profile.strumProfileId ?? profile.profileId,
@@ -2930,7 +3106,8 @@ async function inspectTypedChartArtifacts(
 async function safeProfiledAutoChartResult(
   raw: Record<string, unknown>,
   outputDir: string,
-  profile: ResolvedAutoChartProfile
+  profile: ResolvedAutoChartProfile,
+  requestedInstruments: readonly string[]
 ): Promise<AutoChartRunResult> {
   const requestedProfileId = profile.strumProfileId ?? profile.profileId
   if (
@@ -2943,7 +3120,7 @@ async function safeProfiledAutoChartResult(
   ) {
     throw new Error('The validated STRUM profile returned an invalid chart result.')
   }
-  const typedArtifacts = await inspectTypedChartArtifacts(outputDir, profile)
+  const typedArtifacts = await inspectTypedChartArtifacts(outputDir, profile, requestedInstruments)
   // Preserve generated provenance when this output is later imported as a song
   // folder. A typed run has no legacy songFolders entry for the normal marker.
   await writeFile(
@@ -3061,6 +3238,7 @@ async function runResolvedAutoChartProfile(
     break
   }
   const isTransform = profile.pipelineId === 'difficulty.transform/v1'
+  const requestedInstruments = requestedProfiledInstruments(profile, options.enabledTracks)
   if (isTransform && !options.sourceMidiPath) {
     throw new Error(
       'This learned profile needs an Expert MIDI chart. Use Transform MIDI in Training Deploy.'
@@ -3094,7 +3272,7 @@ async function runResolvedAutoChartProfile(
         model_root: profile.checkpointRoot,
         profile_id: profile.strumProfileId ?? profile.profileId,
         difficulty_policy: profile.difficultyPolicy ?? 'expert_only',
-        instruments: profile.instruments,
+        instruments: requestedInstruments,
         device
       }),
       { encoding: 'utf8', mode: 0o600, flag: 'wx' }
@@ -3115,7 +3293,7 @@ async function runResolvedAutoChartProfile(
     if (runningProfiledAutoCharts.get(options.runId)?.cancelling) {
       throw new Error('The validated STRUM profile chart run was cancelled.')
     }
-    validateProfiledChartPreflight(preflight, profile, device)
+    validateProfiledChartPreflight(preflight, profile, requestedInstruments, device)
     await writeFile(
       runRequestPath,
       JSON.stringify({
@@ -3129,7 +3307,7 @@ async function runResolvedAutoChartProfile(
     )
     broadcastAutoChartProgress({
       runId: options.runId,
-      stage: profiledChartStage(profile.instruments),
+      stage: profiledChartStage(requestedInstruments),
       percent: 25,
       message: 'Running the validated STRUM profile locally.'
     })
@@ -3142,7 +3320,8 @@ async function runResolvedAutoChartProfile(
         true
       ),
       options.outputDir,
-      profile
+      profile,
+      requestedInstruments
     )
   } catch (error) {
     await Promise.all(requestPaths.map(async (path) => await unlink(path).catch(() => undefined)))
