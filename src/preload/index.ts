@@ -475,6 +475,9 @@ const api = {
     isDefault: boolean
   }> => ipcRenderer.invoke('training:saveDiscoveredAutoChartProfile', options),
 
+  composeAutoChartProfiles: (options: { profileIds: string[] }): Promise<{ jobId: string }> =>
+    ipcRenderer.invoke('training:composeAutoChartProfiles', options),
+
   inspectTrainingCheckpoint: (
     runId: string
   ): Promise<{

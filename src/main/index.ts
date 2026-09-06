@@ -30,6 +30,7 @@ import {
   cancelTrainingJob,
   cancelDefaultAutoChartProfile,
   chooseAndRunTrainingTransform,
+  composeSavedAutoChartProfiles,
   chooseDeveloperTrainingRuntime,
   chooseInstalledTrainingRuntime,
   chooseCheckpointFolder,
@@ -1509,6 +1510,24 @@ ipcMain.handle('training:saveDiscoveredAutoChartProfile', async (_event, options
     })
   } catch {
     throw new Error('STRUM did not validate this checkpoint profile for Auto Chart.')
+  }
+})
+
+ipcMain.handle('training:composeAutoChartProfiles', async (_event, options: unknown) => {
+  if (!options || typeof options !== 'object' || Array.isArray(options)) {
+    throw new Error('Choose two to four saved STRUM profiles to compose.')
+  }
+  const profileIds = (options as Record<string, unknown>).profileIds
+  if (
+    !Array.isArray(profileIds) ||
+    !profileIds.every((profileId) => typeof profileId === 'string')
+  ) {
+    throw new Error('Choose two to four saved STRUM profiles to compose.')
+  }
+  try {
+    return await composeSavedAutoChartProfiles({ profileIds })
+  } catch {
+    throw new Error('STRUM could not compose the selected validated profiles.')
   }
 })
 

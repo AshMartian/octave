@@ -379,6 +379,7 @@ interface ChartEditorAPI {
     createdAt: string
     isDefault: boolean
   }>
+  composeAutoChartProfiles: (options: { profileIds: string[] }) => Promise<{ jobId: string }>
   inspectTrainingCheckpoint: (runId: string) => Promise<{
     runId: string
     pipelineId: string

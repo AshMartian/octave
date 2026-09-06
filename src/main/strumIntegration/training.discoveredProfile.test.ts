@@ -13,6 +13,8 @@ const manifestA = 'a'.repeat(64)
 const manifestB = 'b'.repeat(64)
 const artifactA = `strum-model-bundle/${'c'.repeat(64)}`
 const artifactB = `strum-model-bundle/${'d'.repeat(64)}`
+const artifactC = `strum-model-bundle/${'f'.repeat(64)}`
+const manifestC = 'f'.repeat(64)
 
 type CandidateOptions = {
   artifactId: string
@@ -242,6 +244,51 @@ vi.mock('child_process', () => ({
       return true
     }
     const requestPath = args[args.indexOf('--request') + 1]
+    if (args.includes('checkpoint') && args.includes('compose')) {
+      void readFile(requestPath, 'utf8').then(async (text) => {
+        const request = JSON.parse(text) as {
+          output: string
+          profiles: Array<{ model_root: string; profile_id: string }>
+        }
+        const instruments = request.profiles.map((profile) => {
+          const inspection = inspections.get(profile.model_root)
+          const declared = inspection?.profiles?.[0] as Record<string, unknown> | undefined
+          return String((declared?.instruments as string[] | undefined)?.[0])
+        })
+        const inspection = candidate({
+          artifactId: artifactC,
+          manifestSha256: manifestC,
+          profile: {
+            id: 'five-lane-composition',
+            capability: 'five-lane.composition/v1',
+            instrument: 'guitar',
+            instruments: instruments as Array<'drums' | 'guitar' | 'bass' | 'keys'>,
+            difficultyPolicy: 'expert_only'
+          }
+        })
+        inspections.set(request.output, inspection)
+        await mkdir(request.output, { recursive: true })
+        await writeFile(join(request.output, 'strum-model-bundle.json'), '{}\n')
+        child.stdout.emit(
+          'data',
+          Buffer.from(
+            `${JSON.stringify({
+              sequence: 1,
+              state: 'succeeded',
+              result: {
+                status: 'packaged',
+                profile_id: 'five-lane-composition',
+                capability: 'five-lane.composition/v1',
+                instruments,
+                manifest_sha256: manifestC
+              }
+            })}\n`
+          )
+        )
+        child.emit('close', 0)
+      })
+      return child
+    }
     if (args.includes('chart') && args.includes('preflight')) {
       if (holdPreflight) {
         child.pid = 9876
@@ -338,7 +385,8 @@ import {
   inspectDiscoveredCheckpoint,
   chooseAndRunTrainingTransform,
   runDefaultAutoChartProfile,
-  saveDiscoveredAutoChartProfile
+  saveDiscoveredAutoChartProfile,
+  composeSavedAutoChartProfiles
 } from './training'
 
 async function addBundle(folderName: string, inspection: Record<string, unknown>): Promise<string> {
@@ -406,6 +454,63 @@ describe('discovered STRUM profile boundaries', () => {
     expect(persisted.profiles).toMatchObject([
       { checkpointRoot: selectedFolder, artifactId: artifactA, manifestSha256: manifestA }
     ])
+  })
+
+  it('composes explicitly selected saved direct profiles without exposing their bundle roots', async () => {
+    runtimeCapabilities = [...typedChartCapabilities, 'checkpoint_composition']
+    const guitarRoot = await addBundle(
+      'composition-guitar',
+      candidate({ artifactId: artifactA, manifestSha256: manifestA })
+    )
+    const drumsRoot = await addBundle(
+      'composition-drums',
+      candidate({
+        artifactId: artifactB,
+        manifestSha256: manifestB,
+        profile: {
+          id: 'drums-v14-expert',
+          capability: 'drums.v14-expert/v1',
+          instrument: 'drums',
+          difficultyPolicy: 'expert_only'
+        }
+      })
+    )
+    selectedDialogPaths.push(guitarRoot, drumsRoot)
+    await chooseCheckpointFolder()
+    const guitar = await saveDiscoveredAutoChartProfile({
+      artifactId: artifactA,
+      profileId: 'guitar-hybrid-v2-rule',
+      difficultyPolicy: 'expert_only'
+    })
+    await chooseCheckpointFolder()
+    const drums = await saveDiscoveredAutoChartProfile({
+      artifactId: artifactB,
+      profileId: 'drums-v14-expert',
+      difficultyPolicy: 'expert_only'
+    })
+
+    runtimeCapabilities = ['checkpoint_composition']
+    await expect(
+      composeSavedAutoChartProfiles({ profileIds: [guitar.profileId, drums.profileId] })
+    ).rejects.toThrow('cannot compose validated profile bundles')
+
+    runtimeCapabilities = [...typedChartCapabilities, 'checkpoint_composition']
+    await composeSavedAutoChartProfiles({ profileIds: [guitar.profileId, drums.profileId] })
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    const persisted = await registry()
+    expect(persisted.defaultProfileId).toMatch(/^octave-strum-profile-/)
+    expect(persisted.profiles).toMatchObject([
+      { checkpointRoot: guitarRoot },
+      { checkpointRoot: drumsRoot },
+      {
+        strumProfileId: 'five-lane-composition',
+        artifactId: artifactC,
+        manifestSha256: manifestC
+      }
+    ])
+    expect(JSON.stringify(persisted)).toContain(guitarRoot)
+    expect(JSON.stringify(persisted)).not.toContain('model_root')
   })
 
   it.each(['chart_preflight', 'chart_run', 'typed_chart_results', 'legacy-chart-only'])(

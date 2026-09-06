@@ -2706,6 +2706,132 @@ export async function saveDiscoveredAutoChartProfile(options: {
   return publicAutoChartProfile(saved, true)
 }
 
+const COMPOSABLE_PROFILE_CAPABILITIES = new Set([
+  'guitar.hybrid-v2-rule/v1',
+  'guitar.neural-v1-expert/v1',
+  'bass.neural-v1-expert/v1',
+  'keys.neural-v1-expert/v1',
+  'drums.v14-expert/v1'
+])
+const COMPOSABLE_PROFILE_INSTRUMENTS = new Set(['guitar', 'bass', 'keys', 'drums'])
+
+/**
+ * Create a portable STRUM composition from explicit saved profiles. The
+ * renderer submits only OCTAVE profile IDs; bundle roots are resolved and
+ * re-inspected exclusively in this main-process boundary.
+ */
+export async function composeSavedAutoChartProfiles(options: {
+  profileIds: string[]
+}): Promise<{ jobId: string }> {
+  if (
+    !Array.isArray(options.profileIds) ||
+    !options.profileIds.every(isSafeContractToken) ||
+    options.profileIds.length < 2 ||
+    options.profileIds.length > 4 ||
+    new Set(options.profileIds).size !== options.profileIds.length
+  ) {
+    throw new Error('Choose two to four distinct validated Expert profiles.')
+  }
+  const runtime = await probeTrainingRuntime()
+  if (
+    !runtime.capabilities.includes('checkpoint_composition') ||
+    !supportsTypedChartExecution(runtime)
+  ) {
+    throw new Error('The selected STRUM runtime cannot compose validated profile bundles.')
+  }
+  const registry = await readRegistry()
+  const storedProfiles = options.profileIds.map((profileId) =>
+    (registry.profiles ?? []).find((profile) => profile.profileId === profileId)
+  )
+  if (storedProfiles.some((profile) => !profile)) {
+    throw new Error('One of the selected Auto Chart profiles is no longer available.')
+  }
+  const children: Array<{ model_root: string; profile_id: string }> = []
+  const instruments: string[] = []
+  for (const stored of storedProfiles as StoredAutoChartProfile[]) {
+    if (stored.difficultyPolicy !== 'expert_only') {
+      throw new Error('Only validated Expert-only STRUM profiles can be composed.')
+    }
+    const root = await resolveRegisteredProfileRoot(stored)
+    const inspection = normalizeDiscoveredCheckpoint(
+      await runWorkerJson(['checkpoint', 'inspect', '--model-root', root, '--json'])
+    )
+    const strumProfileId = stored.strumProfileId ?? stored.profileId
+    const profile = inspection?.profiles.find((entry) => entry.profileId === strumProfileId)
+    if (
+      !inspection ||
+      inspection.deploymentStatus !== 'ready' ||
+      inspection.manifestSha256 !== stored.manifestSha256 ||
+      !profile ||
+      profile.execution.status !== 'available' ||
+      !profile.execution.difficultyPolicies.includes('expert_only') ||
+      !COMPOSABLE_PROFILE_CAPABILITIES.has(profile.capability) ||
+      profile.instruments.length !== 1 ||
+      !COMPOSABLE_PROFILE_INSTRUMENTS.has(profile.instruments[0])
+    ) {
+      throw new Error('Each selected profile must be a current, direct Expert five-lane profile.')
+    }
+    children.push({ model_root: root, profile_id: strumProfileId })
+    instruments.push(profile.instruments[0])
+  }
+  if (new Set(instruments).size !== instruments.length) {
+    throw new Error('Choose one validated profile per instrument.')
+  }
+  const jobId = randomUUID()
+  const outputRoot = join(trainingRoot(), 'compositions', jobId, 'bundle')
+  await mkdir(dirname(outputRoot), { recursive: true })
+  await startJsonEventJob(
+    jobId,
+    ['checkpoint', 'compose'],
+    { output: outputRoot, profiles: children },
+    async (result) => {
+      if (
+        result.status !== 'packaged' ||
+        result.profile_id !== 'five-lane-composition' ||
+        result.capability !== 'five-lane.composition/v1' ||
+        !Array.isArray(result.instruments) ||
+        result.instruments.length !== instruments.length ||
+        result.instruments.some((instrument, index) => instrument !== instruments[index]) ||
+        typeof result.manifest_sha256 !== 'string' ||
+        !/^[a-f0-9]{64}$/.test(result.manifest_sha256)
+      ) {
+        throw new Error('STRUM returned an invalid composed profile result.')
+      }
+      const inspection = normalizeDiscoveredCheckpoint(
+        await runWorkerJson(['checkpoint', 'inspect', '--model-root', outputRoot, '--json'])
+      )
+      const composed = inspection?.profiles.find(
+        (profile) => profile.profileId === 'five-lane-composition'
+      )
+      if (
+        !inspection ||
+        inspection.deploymentStatus !== 'ready' ||
+        inspection.manifestSha256 !== result.manifest_sha256 ||
+        !composed ||
+        composed.capability !== 'five-lane.composition/v1' ||
+        composed.execution.status !== 'available' ||
+        !composed.execution.difficultyPolicies.includes('expert_only') ||
+        composed.instruments.length !== instruments.length ||
+        composed.instruments.some((instrument, index) => instrument !== instruments[index])
+      ) {
+        throw new Error('STRUM could not verify the composed profile bundle.')
+      }
+      discoveredCheckpointRoots.set(inspection.artifactId, outputRoot)
+      const saved = await saveDiscoveredAutoChartProfile({
+        artifactId: inspection.artifactId,
+        profileId: composed.profileId,
+        difficultyPolicy: 'expert_only'
+      })
+      return {
+        format: 'octave-strum-profile-composition-result/v1',
+        profile_id: saved.profileId,
+        instruments: [...composed.instruments]
+      }
+    }
+  )
+  return { jobId }
+}
+
 type ResolvedAutoChartProfile = StoredAutoChartProfile & {
   instruments: string[]
 }

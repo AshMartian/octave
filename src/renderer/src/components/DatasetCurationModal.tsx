@@ -581,6 +581,7 @@ export function TrainingModal({
   const [trainingTasks, setTrainingTasks] = useState<TrainingTask[]>([])
   const [trainingRuns, setTrainingRuns] = useState<TrainingRun[]>([])
   const [trainingProfiles, setTrainingProfiles] = useState<AutoChartProfile[]>([])
+  const [compositionProfileIds, setCompositionProfileIds] = useState<Set<string>>(new Set())
   const [selectedTaskViewId, setSelectedTaskViewId] = useState('')
   const [checkpointDiscovery, setCheckpointDiscovery] = useState<CheckpointDiscovery | null>(null)
   const [selectedArtifactId, setSelectedArtifactId] = useState('')
@@ -789,6 +790,14 @@ export function TrainingModal({
     setTrainingTasks(artifacts.tasks)
     setTrainingRuns(artifacts.runs)
     setTrainingProfiles(artifacts.profiles)
+    setCompositionProfileIds(
+      (current) =>
+        new Set(
+          [...current].filter((profileId) =>
+            artifacts.profiles.some((profile) => profile.profileId === profileId)
+          )
+        )
+    )
     setSelectedTaskViewId((current) =>
       artifacts.tasks.some((task) => task.taskViewId === current)
         ? current
@@ -858,12 +867,33 @@ export function TrainingModal({
             setActiveStep('deploy')
           }
         }
+        const composition = event.result as Record<string, unknown> | undefined
+        if (
+          composition?.format === 'octave-strum-profile-composition-result/v1' &&
+          Array.isArray(composition.instruments) &&
+          composition.instruments.every((instrument) => typeof instrument === 'string')
+        ) {
+          const supported = new Set(composition.instruments)
+          updateSettings({
+            autoChartEnabledTracks: {
+              drums: supported.has('drums'),
+              guitar: supported.has('guitar'),
+              bass: supported.has('bass'),
+              vocals: false,
+              harmonies: false,
+              keys: supported.has('keys'),
+              proKeys: false
+            }
+          })
+          setCompositionProfileIds(new Set())
+          setActiveStep('deploy')
+        }
         void refreshTrainingState()
       }
       if (event.state === 'failed') setError(event.message)
     })
     return unsubscribe
-  }, [refreshTrainingState])
+  }, [refreshTrainingState, updateSettings])
 
   useEffect(() => {
     if (
@@ -1551,6 +1581,32 @@ export function TrainingModal({
       })
     } catch {
       setError('STRUM could not start this post-training job.')
+    }
+  }
+
+  const startProfileComposition = async (): Promise<void> => {
+    if (
+      enablingTrainingRuntime ||
+      compositionProfileIds.size < 2 ||
+      compositionProfileIds.size > 4
+    ) {
+      return
+    }
+    setError(null)
+    try {
+      const started = await window.api.composeAutoChartProfiles({
+        profileIds: [...compositionProfileIds]
+      })
+      setTrainingJob({
+        jobId: started.jobId,
+        sequence: 0,
+        stage: 'checkpoint_composition',
+        state: 'queued',
+        progress: 0,
+        message: 'Composing selected validated STRUM profiles locally.'
+      })
+    } catch {
+      setError('STRUM could not compose the selected validated profiles.')
     }
   }
 
@@ -2662,7 +2718,18 @@ export function TrainingModal({
             </section>
           ) : (
             <section className="training-step-panel training-deploy-panel">
-              <h3>Deploy a validated profile</h3>
+              <div className="training-panel-heading">
+                <h3>Deploy a validated profile</h3>
+                {trainingJob &&
+                  !['succeeded', 'failed', 'cancelled'].includes(trainingJob.state ?? '') && (
+                    <button
+                      className="dataset-secondary"
+                      onClick={() => void cancelActiveTrainingJob()}
+                    >
+                      Cancel job
+                    </button>
+                  )}
+              </div>
               <p>
                 Choose a local model-bundle folder. OCTAVE asks STRUM to discover and hash-check its
                 manifests, then keeps the selected folder and bundle mapping in the main process.
@@ -2670,7 +2737,14 @@ export function TrainingModal({
               </p>
               <button
                 className="dataset-secondary"
-                disabled={discoveringCheckpoints || enablingTrainingRuntime}
+                disabled={
+                  discoveringCheckpoints ||
+                  enablingTrainingRuntime ||
+                  Boolean(
+                    trainingJob &&
+                    !['succeeded', 'failed', 'cancelled'].includes(trainingJob.state ?? '')
+                  )
+                }
                 onClick={() => void discoverCheckpointFolder()}
               >
                 {discoveringCheckpoints ? 'Discovering bundles…' : 'Choose model-bundle folder'}
@@ -2849,6 +2923,71 @@ export function TrainingModal({
                     </span>
                   ))}
                 </div>
+              )}
+              {trainingProfiles.filter((profile) =>
+                [
+                  'guitar.hybrid-v2-rule/v1',
+                  'guitar.neural-v1-expert/v1',
+                  'bass.neural-v1-expert/v1',
+                  'keys.neural-v1-expert/v1',
+                  'drums.v14-expert/v1'
+                ].includes(profile.pipelineId)
+              ).length >= 2 && (
+                <section className="training-promotion-panel">
+                  <h4>Compose selected Expert profiles</h4>
+                  <p className="training-inline-note">
+                    Choose two to four separately validated Guitar, Bass, Keys, or Drums profiles.
+                    STRUM copies, revalidates, and pins each selected bundle before saving one
+                    portable multi-instrument Auto Chart default.
+                  </p>
+                  {trainingProfiles
+                    .filter((profile) =>
+                      [
+                        'guitar.hybrid-v2-rule/v1',
+                        'guitar.neural-v1-expert/v1',
+                        'bass.neural-v1-expert/v1',
+                        'keys.neural-v1-expert/v1',
+                        'drums.v14-expert/v1'
+                      ].includes(profile.pipelineId)
+                    )
+                    .map((profile) => (
+                      <label className="training-toggle-control" key={profile.profileId}>
+                        <input
+                          type="checkbox"
+                          checked={compositionProfileIds.has(profile.profileId)}
+                          disabled={
+                            enablingTrainingRuntime ||
+                            (!compositionProfileIds.has(profile.profileId) &&
+                              compositionProfileIds.size >= 4)
+                          }
+                          onChange={(event) =>
+                            setCompositionProfileIds((current) => {
+                              const next = new Set(current)
+                              if (event.target.checked) next.add(profile.profileId)
+                              else next.delete(profile.profileId)
+                              return next
+                            })
+                          }
+                        />
+                        {profile.pipelineId} {profile.isDefault ? '· current default' : ''}
+                      </label>
+                    ))}
+                  <button
+                    className="dataset-primary"
+                    disabled={
+                      enablingTrainingRuntime ||
+                      compositionProfileIds.size < 2 ||
+                      compositionProfileIds.size > 4 ||
+                      Boolean(
+                        trainingJob &&
+                        !['succeeded', 'failed', 'cancelled'].includes(trainingJob.state ?? '')
+                      )
+                    }
+                    onClick={() => void startProfileComposition()}
+                  >
+                    Compose selected profiles
+                  </button>
+                </section>
               )}
               <button
                 className="dataset-primary"
