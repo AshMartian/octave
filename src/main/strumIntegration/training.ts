@@ -48,7 +48,10 @@ const MODEL_DISCOVERY_IGNORED_DIRECTORIES = new Set([
   '.hg',
   '.svn',
   '__pycache__',
-  'node_modules'
+  'node_modules',
+  // STRUM composition bundles retain private child bundles here for runtime
+  // provenance. The outer manifest is the only OCTAVE-selectable artifact.
+  '_composition_assets'
 ])
 const SAFE_RUNTIME_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const SAFE_STRUM_RUNTIME_FALLBACK_ID = /^strum-\d+\.\d+\.\d+\+git\.[a-f0-9]{7,64}$/
